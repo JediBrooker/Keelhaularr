@@ -55,8 +55,8 @@ interface ConnectionForm {
   maxMbPerMinuteOverride: string;
   toleranceGibOverride: string;
   includeUnmonitored: boolean;
-  mediaRootsText: string;
-  downloadRootsText: string;
+  mediaRoots: string[];
+  downloadRoots: string[];
   pathMapsText: string;
 }
 
@@ -106,8 +106,8 @@ function connectionForm(settings: ConnectionSettings): ConnectionForm {
     maxMbPerMinuteOverride: settings.maxMbPerMinuteOverride?.toString() ?? '',
     toleranceGibOverride: settings.toleranceGibOverride?.toString() ?? '',
     includeUnmonitored: settings.includeUnmonitored,
-    mediaRootsText: settings.mediaRoots.join('\n'),
-    downloadRootsText: settings.downloadRoots.join('\n'),
+    mediaRoots: settings.mediaRoots,
+    downloadRoots: settings.downloadRoots,
     pathMapsText: settings.pathMaps.map(({ from, to }) => `${from}=>${to}`).join('\n'),
   };
 }
@@ -165,6 +165,30 @@ function optionalNumeric(value: string, label: string) {
   return value.trim() ? numeric(value, label) : null;
 }
 
+function FolderList({ title, hint, values, placeholder, addLabel, emptyMessage, onChange }: {
+  title: string;
+  hint: string;
+  values: string[];
+  placeholder: string;
+  addLabel: string;
+  emptyMessage: string;
+  onChange: (next: string[]) => void;
+}) {
+  const update = (index: number, value: string) => onChange(values.map((item, itemIndex) => itemIndex === index ? value : item));
+  const remove = (index: number) => onChange(values.filter((_, itemIndex) => itemIndex !== index));
+  return (
+    <div className="folder-list wide-field">
+      <div className="folder-list-heading"><div><strong>{title}</strong><span>{hint}</span></div><button type="button" className="add-path-button" onClick={() => onChange([...values, ''])}>+ {addLabel}</button></div>
+      {values.length ? <div className="folder-rows">{values.map((value, index) => (
+        <div className="folder-row" key={`${title}-${index}`}>
+          <input value={value} onChange={(event) => update(index, event.target.value)} placeholder={placeholder} aria-label={`${title} ${index + 1}`} />
+          <button type="button" onClick={() => remove(index)} aria-label={`Remove ${title.toLowerCase()} ${index + 1}`}>Remove</button>
+        </div>
+      ))}</div> : <p className="empty-folder-list">{emptyMessage}</p>}
+    </div>
+  );
+}
+
 function ConnectionSection({ app, form, defaultMax, defaultTolerance, testing, testMessage, onChange, onTest }: {
   app: AppKind;
   form: ConnectionForm;
@@ -189,14 +213,17 @@ function ConnectionSection({ app, form, defaultMax, defaultTolerance, testing, t
       <div className="settings-grid two">
         <label className="field wide-field">Server URL<input type="url" value={form.url} onChange={(event) => update('url', event.target.value)} placeholder={`http://${app}:` + (app === 'radarr' ? '7878' : '8989')} /></label>
         <label className="field wide-field">API key<input type="password" value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} autoComplete="off" placeholder={form.apiKeyConfigured ? 'Saved — leave blank to keep it' : 'Enter API key'} /></label>
-        <label className="check-row wide-field"><input type="checkbox" checked={form.clearApiKey} onChange={(event) => update('clearApiKey', event.target.checked)} />Remove the saved {label} API key</label>
+        {form.apiKeyConfigured && <label className="check-row wide-field"><input type="checkbox" checked={form.clearApiKey} onChange={(event) => update('clearApiKey', event.target.checked)} />Remove the saved {label} API key</label>}
         <label className="field">MB/min override <span>blank uses {defaultMax}</span><input inputMode="decimal" value={form.maxMbPerMinuteOverride} onChange={(event) => update('maxMbPerMinuteOverride', event.target.value)} placeholder={defaultMax} /></label>
         <label className="field">Tolerance override (GiB) <span>blank uses {defaultTolerance}</span><input inputMode="decimal" value={form.toleranceGibOverride} onChange={(event) => update('toleranceGibOverride', event.target.value)} placeholder={defaultTolerance} /></label>
         <label className="check-row wide-field"><input type="checkbox" checked={form.includeUnmonitored} onChange={(event) => update('includeUnmonitored', event.target.checked)} />Include unmonitored media in oversize checks</label>
-        <label className="field wide-field">Media roots inside Keelhaularr <span>one absolute container path per line</span><textarea rows={3} value={form.mediaRootsText} onChange={(event) => update('mediaRootsText', event.target.value)} placeholder={app === 'radarr' ? '/movies' : '/tv'} /></label>
-        <label className="field wide-field">Completed-download roots inside Keelhaularr <span>hardlink watch · one absolute container path per line</span><textarea rows={3} value={form.downloadRootsText} onChange={(event) => update('downloadRootsText', event.target.value)} placeholder={app === 'radarr' ? '/radarr-downloads' : '/sonarr-downloads'} /></label>
-        <p className="field-hint wide-field">Files here are flagged only when their filesystem identity has no matching hardlink in this app’s media roots and they are older than the global minimum age.</p>
-        <label className="field wide-field">Path mappings <span>one /arr/path=&gt;/container/path mapping per line</span><textarea rows={3} value={form.pathMapsText} onChange={(event) => update('pathMapsText', event.target.value)} placeholder={app === 'radarr' ? '/data/media/movies=>/movies' : '/data/media/tv=>/tv'} /></label>
+        <FolderList title="Library folders" hint={`Detected automatically when you test ${label}`} values={form.mediaRoots} placeholder={app === 'radarr' ? '/data/media/movies' : '/data/media/tv'} addLabel="Add manually" emptyMessage={`Test the ${label} connection to fill this automatically.`} onChange={(next) => update('mediaRoots', next)} />
+        <FolderList title="Completed download folders" hint="Torrent folders; add Usenet only when its imports remain hardlinked" values={form.downloadRoots} placeholder={app === 'radarr' ? '/data/torrents/movies' : '/data/torrents/tv'} addLabel="Add folder" emptyMessage="No hardlink-watch folders added. This feature is optional." onChange={(next) => update('downloadRoots', next)} />
+        <p className="field-hint wide-field">Only completed files older than the minimum age and without a matching library hardlink are flagged.</p>
+        <details className="advanced-settings wide-field" open={Boolean(form.pathMapsText.trim())}>
+          <summary>Advanced path mapping <span>Most installations leave this blank</span></summary>
+          <div><p>Use this only when {label} reports one path but Keelhaularr sees the same folder under another path. Format each line as <code>/arr/path=&gt;/keelhaularr/path</code>.</p><label className="field">Mappings<textarea rows={2} value={form.pathMapsText} onChange={(event) => update('pathMapsText', event.target.value)} /></label></div>
+        </details>
       </div>
     </section>
   );
@@ -234,13 +261,13 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
         method: 'POST',
         body: JSON.stringify({ app, url: form[app].url, apiKey: form[app].apiKey }),
       });
-      const autoFilledRoots = Boolean(result.rootFolders.length && !form[app].mediaRootsText.trim());
+      const autoFilledRoots = Boolean(result.rootFolders.length && !form[app].mediaRoots.some((root) => root.trim()));
       const roots = result.rootFolders.length
         ? ` · ${result.rootFolders.join(', ')}${autoFilledRoots ? ' · added to media roots' : ''}`
         : ' · no media roots reported';
       if (autoFilledRoots) {
-        setForm((current) => current && !current[app].mediaRootsText.trim()
-          ? { ...current, [app]: { ...current[app], mediaRootsText: result.rootFolders.join('\n') } }
+        setForm((current) => current && !current[app].mediaRoots.some((root) => root.trim())
+          ? { ...current, [app]: { ...current[app], mediaRoots: result.rootFolders } }
           : current);
       }
       setTestMessages((current) => ({ ...current, [app]: `Connected${result.version ? ` · v${result.version}` : ''}${roots}` }));
@@ -265,8 +292,8 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
         maxMbPerMinuteOverride: optionalNumeric(form[app].maxMbPerMinuteOverride, `${app} MB/min override`),
         toleranceGibOverride: optionalNumeric(form[app].toleranceGibOverride, `${app} tolerance override`),
         includeUnmonitored: form[app].includeUnmonitored,
-        mediaRoots: listFromText(form[app].mediaRootsText, /\n/),
-        downloadRoots: listFromText(form[app].downloadRootsText, /\n/),
+        mediaRoots: form[app].mediaRoots.map((root) => root.trim()).filter(Boolean),
+        downloadRoots: form[app].downloadRoots.map((root) => root.trim()).filter(Boolean),
         pathMaps: pathMapsFromText(form[app].pathMapsText, app),
       });
       const result = await api<{ settings: SettingsData }>('/api/settings', {
@@ -318,7 +345,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
             <div className="settings-scroll">
               {(saveError || saved) && <div className={`notice ${saveError ? 'error' : 'success'}`} role="status">{saveError || saved}</div>}
 
-              <section className="settings-section">
+              {!onboarding && <section className="settings-section">
                 <div className="settings-section-head"><div><p className="eyebrow">ACCESS CONTROL</p><h3>Account & sessions</h3></div></div>
                 <div className="settings-grid two">
                   <label className="field">Login username<input value={form.account.username} onChange={(event) => updateSection('account', { ...form.account, username: event.target.value })} required /></label>
@@ -329,7 +356,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
                     <label className="check-row"><input type="checkbox" checked={form.account.rotateSessions} onChange={(event) => updateSection('account', { ...form.account, rotateSessions: event.target.checked })} />Sign out every other active session</label>
                   </div>
                 </div>
-              </section>
+              </section>}
 
               <section className="settings-section">
                 <div className="settings-section-head"><div><p className="eyebrow">DEFAULT SIZE RULES</p><h3>Oversize limits</h3></div></div>

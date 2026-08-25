@@ -132,7 +132,10 @@ credentials and sessions, shared and per-app size rules, Radarr/Sonarr URLs and
 API keys, unmonitored-media behavior, media roots, completed-download roots,
 hardlink minimum age, path mappings, orphan action
 and safety controls, quarantine, ignored directories, scan limits, and media
-extensions. Connection tests are available before saving.
+extensions. Connection tests are available before saving and automatically fill
+empty library-folder fields. Folders use individual add/remove rows; path
+mapping is kept in a collapsed advanced section because normal installer-based
+deployments use identical paths and do not need it.
 
 Passwords and API keys are write-only: the browser receives only a flag saying
 whether each secret exists. Saved values take effect immediately and are
