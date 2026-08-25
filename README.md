@@ -20,6 +20,7 @@ it runs.
 - Optional permanent orphan deletion with an explicit server-side enable flag
 - Built-in login, HttpOnly signed sessions, and login rate limiting
 - API keys kept server-side
+- Authenticated GUI settings with immediate apply and durable, atomic storage
 
 ## Quick start with Docker Compose
 
@@ -37,7 +38,8 @@ the login and *arr settings interactively, discovers every Radarr and Sonarr
 root folder through their APIs, starts Keelhaularr, and verifies its health
 endpoint. When an API-reported root is mounted at a different path in the LXC,
 the installer asks only for that local mapping. It is safe to rerun for updates
-and preserves existing settings.
+and preserves existing settings. After installation, all application settings
+can be changed from the protected Settings interface.
 
 For a Proxmox LXC, enable the required features on the Proxmox host before
 running the installer:
@@ -78,6 +80,8 @@ visible and writable inside it.
 4. Protect the settings and start the app:
 
    ```bash
+   mkdir -p config
+   chmod 700 config
    chmod 600 .env
    docker compose up -d --build
    ```
@@ -104,6 +108,21 @@ npm run dev
 
 The development interface is on port 3000. The production interface and API
 are both served on `PORT`, which defaults to 8787.
+
+## GUI settings
+
+After signing in, open **Settings** in the top bar. The interface manages login
+credentials and sessions, shared and per-app size rules, Radarr/Sonarr URLs and
+API keys, unmonitored-media behavior, media roots, path mappings, orphan action
+and safety controls, quarantine, ignored directories, scan limits, and media
+extensions. Connection tests are available before saving.
+
+Passwords and API keys are write-only: the browser receives only a flag saying
+whether each secret exists. Saved values take effect immediately and are
+written atomically to `config/settings.json` with mode `0600`. They override
+the bootstrap `.env` and survive container rebuilds through the `/config`
+volume. The externally published web port remains a Docker Compose deployment
+setting and is therefore shown with instructions rather than edited at runtime.
 
 ## Size rules
 
@@ -194,5 +213,5 @@ and set:
 APP_COOKIE_SECURE=true
 ```
 
-Never expose Radarr or Sonarr API keys in browser-side settings or commit `.env`
-to source control.
+Radarr and Sonarr API keys entered in Settings are never returned to the
+browser. Do not commit `.env` or `config/settings.json` to source control.

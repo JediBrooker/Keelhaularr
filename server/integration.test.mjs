@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, open, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -75,6 +75,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     const url = new URL(request.url, 'http://mock');
     let value;
     if (request.method === 'GET' && url.pathname === '/api/v3/system/status') value = { version: 'test-1.0' };
+    else if (request.method === 'GET' && url.pathname === '/api/v3/rootfolder') value = [{ path: moviesRoot }, { path: tvRoot }];
     else if (request.method === 'GET' && url.pathname === '/api/v3/movie') value = [{ id: 1, title: 'Tracked Movie', year: 2020, runtime: 120, monitored: true, hasFile: true, path: path.dirname(trackedMovie), movieFile: { id: 101, size: 12 * 1024 ** 3, relativePath: path.basename(trackedMovie), quality: { quality: { name: 'Bluray-1080p' } } } }];
     else if (request.method === 'GET' && url.pathname === '/api/v3/series') value = [{ id: 7, title: 'Show', runtime: 45, monitored: true, path: path.join(tvRoot, 'Show') }];
     else if (request.method === 'GET' && url.pathname === '/api/v3/episodefile') value = [{ id: 701, seriesId: 7, seasonNumber: 1, size: 6 * 1024 ** 3, relativePath: path.relative(path.join(tvRoot, 'Show'), trackedEpisode), quality: { quality: { name: 'WEBDL-1080p' } } }];
@@ -100,30 +101,34 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const mockPort = typeof mockAddress === 'object' && mockAddress ? mockAddress.port : 0;
   const appPort = await freePort();
 
+  const childEnvironment = {
+    ...process.env,
+    CONFIG_DIR: path.join(tempRoot, 'config'),
+    PORT: String(appPort),
+    APP_USERNAME: 'captain',
+    APP_PASSWORD: 'test-password',
+    APP_SESSION_SECRET: 'test-session-secret',
+    RADARR_URL: `http://127.0.0.1:${mockPort}`,
+    RADARR_API_KEY: 'test',
+    RADARR_MEDIA_ROOTS: moviesRoot,
+    SONARR_URL: `http://127.0.0.1:${mockPort}`,
+    SONARR_API_KEY: 'test',
+    SONARR_MEDIA_ROOTS: tvRoot,
+    MAX_MB_PER_MIN: '85',
+    OVERSIZE_TOLERANCE_GIB: '1',
+    ORPHAN_ACTION: 'quarantine',
+    ORPHAN_TRASH_DIR: quarantineRoot,
+  };
   const child = spawn(process.execPath, ['server/index.mjs'], {
     cwd: path.resolve('.'),
-    env: {
-      ...process.env,
-      PORT: String(appPort),
-      APP_USERNAME: 'captain',
-      APP_PASSWORD: 'test-password',
-      APP_SESSION_SECRET: 'test-session-secret',
-      RADARR_URL: `http://127.0.0.1:${mockPort}`,
-      RADARR_API_KEY: 'test',
-      RADARR_MEDIA_ROOTS: moviesRoot,
-      SONARR_URL: `http://127.0.0.1:${mockPort}`,
-      SONARR_API_KEY: 'test',
-      SONARR_MEDIA_ROOTS: tvRoot,
-      MAX_MB_PER_MIN: '85',
-      OVERSIZE_TOLERANCE_GIB: '1',
-      ORPHAN_ACTION: 'quarantine',
-      ORPHAN_TRASH_DIR: quarantineRoot,
-    },
+    env: childEnvironment,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  let restartedChild;
 
   context.after(async () => {
     child.kill('SIGTERM');
+    restartedChild?.kill('SIGTERM');
     mock.close();
     await rm(tempRoot, { recursive: true, force: true });
   });
@@ -139,11 +144,85 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const cookie = login.headers.get('set-cookie')?.split(';', 1)[0];
   assert.ok(cookie?.startsWith('keelhaularr_session='));
 
-  const request = (url, body = {}) => fetch(`${base}${url}`, {
-    method: 'POST',
+  const request = (url, body = {}, method = 'POST') => fetch(`${base}${url}`, {
+    method,
     headers: { 'Content-Type': 'application/json', Cookie: cookie },
     body: JSON.stringify(body),
   });
+
+  const initialSettingsResponse = await fetch(`${base}/api/settings`, { headers: { Cookie: cookie } });
+  assert.equal(initialSettingsResponse.status, 200);
+  const initialSettingsText = await initialSettingsResponse.text();
+  assert.equal(initialSettingsText.includes('test-password'), false);
+  assert.equal(initialSettingsText.includes('"apiKey":"test"'), false);
+  const initialSettings = JSON.parse(initialSettingsText).settings;
+  assert.equal(initialSettings.radarr.apiKeyConfigured, true);
+  assert.equal(initialSettings.defaults.maxMbPerMinute, 85);
+
+  const settingsUpdate = {
+    account: {
+      username: 'captain',
+      newPassword: 'yo',
+      sessionDays: 14,
+      cookieSecure: false,
+      rotateSessions: false,
+    },
+    defaults: { maxMbPerMinute: 70, toleranceGib: 0.5 },
+    radarr: {
+      url: `http://127.0.0.1:${mockPort}`,
+      apiKey: 'updated-radarr-key',
+      clearApiKey: false,
+      maxMbPerMinuteOverride: null,
+      toleranceGibOverride: null,
+      includeUnmonitored: false,
+      mediaRoots: [moviesRoot],
+      pathMaps: [],
+    },
+    sonarr: {
+      url: `http://127.0.0.1:${mockPort}`,
+      apiKey: '',
+      clearApiKey: false,
+      maxMbPerMinuteOverride: 75,
+      toleranceGibOverride: null,
+      includeUnmonitored: false,
+      mediaRoots: [tvRoot],
+      pathMaps: [],
+    },
+    orphan: {
+      action: 'quarantine',
+      trashDir: quarantineRoot,
+      allowPermanentDelete: false,
+      ignoreDirectories: ['extras', 'trailers'],
+      maxFiles: 50000,
+      mediaExtensions: ['mkv', 'mp4'],
+    },
+  };
+  const saveSettingsResponse = await request('/api/settings', settingsUpdate, 'PUT');
+  assert.equal(saveSettingsResponse.status, 200);
+  const savedSettingsText = await saveSettingsResponse.text();
+  assert.equal(savedSettingsText.includes('updated-radarr-key'), false);
+  assert.equal(savedSettingsText.includes('"newPassword"'), false);
+  const savedSettings = JSON.parse(savedSettingsText);
+  assert.equal(savedSettings.settings.defaults.maxMbPerMinute, 70);
+  assert.equal(savedSettings.settings.sonarr.maxMbPerMinuteOverride, 75);
+  assert.equal(savedSettings.config.radarr.maxMbPerMinute, 70);
+  assert.equal(savedSettings.config.sonarr.maxMbPerMinute, 75);
+
+  const persistedPath = path.join(tempRoot, 'config', 'settings.json');
+  const persisted = JSON.parse(await readFile(persistedPath, 'utf8'));
+  assert.equal(persisted.values.APP_PASSWORD, 'yo');
+  assert.equal(persisted.values.RADARR_API_KEY, 'updated-radarr-key');
+  assert.equal((await stat(persistedPath)).mode & 0o777, 0o600);
+
+  const testConnection = await request('/api/settings/test', {
+    app: 'radarr',
+    url: `http://127.0.0.1:${mockPort}`,
+    apiKey: '',
+  });
+  assert.equal(testConnection.status, 200);
+  const connectionResult = await testConnection.json();
+  assert.equal(connectionResult.version, 'test-1.0');
+  assert.deepEqual(connectionResult.rootFolders, [moviesRoot, tvRoot]);
 
   const scanResponse = await request('/api/scan');
   assert.equal(scanResponse.status, 200);
@@ -166,6 +245,39 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
 
   const unauthenticated = await fetch(`${base}/api/status`);
   assert.equal(unauthenticated.status, 401);
+  const oldPassword = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'captain', password: 'test-password' }),
+  });
+  assert.equal(oldPassword.status, 401);
+  const newPassword = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'captain', password: 'yo' }),
+  });
+  assert.equal(newPassword.status, 200);
   const ui = await fetch(base);
   assert.equal(ui.status, 200);
+
+  child.kill('SIGTERM');
+  await once(child, 'exit');
+  const restartedPort = await freePort();
+  restartedChild = spawn(process.execPath, ['server/index.mjs'], {
+    cwd: path.resolve('.'),
+    env: { ...childEnvironment, PORT: String(restartedPort) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const restartedBase = `http://127.0.0.1:${restartedPort}`;
+  await waitFor(`${restartedBase}/api/auth/status`);
+  const persistedLogin = await fetch(`${restartedBase}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'captain', password: 'yo' }),
+  });
+  assert.equal(persistedLogin.status, 200);
+  const persistedCookie = persistedLogin.headers.get('set-cookie')?.split(';', 1)[0];
+  const persistedSettingsResponse = await fetch(`${restartedBase}/api/settings`, { headers: { Cookie: persistedCookie } });
+  assert.equal(persistedSettingsResponse.status, 200);
+  assert.equal((await persistedSettingsResponse.json()).settings.defaults.maxMbPerMinute, 70);
 });

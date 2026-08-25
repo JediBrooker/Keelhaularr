@@ -300,6 +300,14 @@ fi
 
 cd "$INSTALL_DIR"
 
+install -d -m 0700 "$INSTALL_DIR/config"
+{
+  printf 'services:\n  keelhaularr:\n    environment:\n      CONFIG_DIR: /config\n'
+  printf '    volumes:\n      - type: bind\n        source: %s\n        target: /config\n' "$(yaml_quote "$INSTALL_DIR/config")"
+} >compose.settings.yml
+chmod 600 compose.settings.yml
+COMPOSE_FILES=(-f compose.yml -f compose.settings.yml)
+
 if [[ -s .env && -s compose.yml ]]; then
   info "Existing settings found; leaving .env and compose.yml unchanged."
   if ! confirm "Build and restart Keelhaularr with the existing settings?" "y"; then
@@ -430,9 +438,9 @@ else
 fi
 
 info "Building and starting Keelhaularr…"
-docker compose -f compose.yml up -d --build
+docker compose "${COMPOSE_FILES[@]}" up -d --build
 
-APP_PORT="$(docker compose -f compose.yml port keelhaularr 8787 | awk -F: 'END {print $NF}')"
+APP_PORT="$(docker compose "${COMPOSE_FILES[@]}" port keelhaularr 8787 | awk -F: 'END {print $NF}')"
 APP_PORT="${APP_PORT:-8787}"
 ready=false
 for _ in {1..60}; do
@@ -444,8 +452,8 @@ for _ in {1..60}; do
 done
 
 if [[ "$ready" != "true" ]]; then
-  docker compose -f compose.yml ps
-  docker compose -f compose.yml logs --tail=120 keelhaularr
+  docker compose "${COMPOSE_FILES[@]}" ps
+  docker compose "${COMPOSE_FILES[@]}" logs --tail=120 keelhaularr
   die "Keelhaularr did not become ready. Review the logs above."
 fi
 
@@ -456,5 +464,5 @@ printf '\n%s%sKeelhaularr is ready.%s\n' "$BOLD" "$TEAL" "$RESET"
 printf 'Open: %shttp://%s:%s%s\n' "$BOLD" "$LXC_IP" "$APP_PORT" "$RESET"
 printf 'Login as: %s\n' "${APP_USERNAME:-the username stored in $INSTALL_DIR/.env}"
 printf '\nInstall directory: %s\n' "$INSTALL_DIR"
-printf 'View logs: docker compose -f %s/compose.yml logs -f\n' "$INSTALL_DIR"
+printf 'View logs: docker compose -f %s/compose.yml -f %s/compose.settings.yml logs -f\n' "$INSTALL_DIR" "$INSTALL_DIR"
 printf 'Update later: rerun this same installer.\n'

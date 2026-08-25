@@ -2,4 +2,7 @@ node_modules
 dist
 .git
 .env
+config
+compose.yml
+compose.settings.yml
 npm-debug.log*

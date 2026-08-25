@@ -7,6 +7,12 @@ import express from 'express';
 import { applyOversized, scanArr } from './arr.mjs';
 import { getConfig, publicConfig } from './config.mjs';
 import { applyOrphans, scanOrphans } from './orphans.mjs';
+import {
+  buildSettingsOverrides,
+  getSettingsOverrides,
+  saveSettingsOverrides,
+  settingsView,
+} from './settings.mjs';
 
 const app = express();
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -20,6 +26,7 @@ app.use((request, response, next) => {
 });
 
 const failedLogins = new Map();
+const currentConfig = () => getConfig(getSettingsOverrides());
 
 function safeEqual(left, right) {
   const leftBuffer = Buffer.from(String(left));
@@ -72,7 +79,7 @@ function sessionCookie(config, token, maxAge) {
 }
 
 app.get('/api/auth/status', (request, response) => {
-  const config = getConfig();
+  const config = currentConfig();
   response.json({
     authenticated: validSession(request, config),
     setupRequired: !config.password,
@@ -80,7 +87,7 @@ app.get('/api/auth/status', (request, response) => {
 });
 
 app.post('/api/auth/login', (request, response) => {
-  const config = getConfig();
+  const config = currentConfig();
   if (!config.password) {
     response.status(503).json({ error: 'Set APP_PASSWORD in .env before signing in.' });
     return;
@@ -107,25 +114,106 @@ app.post('/api/auth/login', (request, response) => {
 });
 
 app.post('/api/auth/logout', (request, response) => {
-  const config = getConfig();
+  const config = currentConfig();
   response.setHeader('Set-Cookie', sessionCookie(config, '', 0));
   response.json({ authenticated: false });
 });
 
 app.use('/api', (request, response, next) => {
-  const config = getConfig();
+  const config = currentConfig();
   if (validSession(request, config)) return next();
   response.status(401).json({ error: 'Sign in to access the Keelhaularr deck.' });
 });
 
 app.get('/api/status', (request, response) => {
-  const config = getConfig();
+  const config = currentConfig();
   response.json({ config: publicConfig(config) });
+});
+
+app.get('/api/settings', (request, response) => {
+  response.json({ settings: settingsView(currentConfig()) });
+});
+
+app.put('/api/settings', async (request, response, next) => {
+  try {
+    const nextOverrides = buildSettingsOverrides(request.body, getSettingsOverrides());
+    const nextConfig = getConfig(nextOverrides);
+    const forwardedProtocol = (request.get('x-forwarded-proto') ?? '').split(',')[0].trim().toLowerCase();
+    if (nextConfig.cookieSecure && !request.secure && forwardedProtocol !== 'https') {
+      const error = new Error('Secure cookies can only be enabled while accessing Keelhaularr through HTTPS.');
+      error.statusCode = 400;
+      throw error;
+    }
+    await saveSettingsOverrides(nextOverrides);
+    const maxAge = Math.round(nextConfig.sessionDays * 86400);
+    response.setHeader('Set-Cookie', sessionCookie(nextConfig, signSession(nextConfig), maxAge));
+    response.json({
+      settings: settingsView(nextConfig),
+      config: publicConfig(nextConfig),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/settings/test', async (request, response, next) => {
+  try {
+    const kind = request.body?.app;
+    if (!['radarr', 'sonarr'].includes(kind)) {
+      const error = new Error('Choose Radarr or Sonarr to test.');
+      error.statusCode = 400;
+      throw error;
+    }
+    const config = currentConfig();
+    const rawUrl = typeof request.body?.url === 'string' ? request.body.url.trim().replace(/\/+$/, '') : '';
+    const apiKey = typeof request.body?.apiKey === 'string' && request.body.apiKey.trim()
+      ? request.body.apiKey.trim()
+      : config[kind].apiKey;
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(rawUrl);
+    } catch {
+      const error = new Error(`${kind} URL must be valid.`);
+      error.statusCode = 400;
+      throw error;
+    }
+    if (!['http:', 'https:'].includes(parsedUrl.protocol) || parsedUrl.username || parsedUrl.password) {
+      const error = new Error(`${kind} URL must use HTTP(S) without embedded credentials.`);
+      error.statusCode = 400;
+      throw error;
+    }
+    if (!apiKey) {
+      const error = new Error(`${kind} API key is required for a connection test.`);
+      error.statusCode = 400;
+      throw error;
+    }
+    const headers = { Accept: 'application/json', 'X-Api-Key': apiKey };
+    const [arrResponse, rootResponse] = await Promise.all([
+      fetch(`${rawUrl}/api/v3/system/status`, { signal: AbortSignal.timeout(10000), headers }),
+      fetch(`${rawUrl}/api/v3/rootfolder`, { signal: AbortSignal.timeout(10000), headers }),
+    ]);
+    if (!arrResponse.ok || !rootResponse.ok) {
+      const failed = !arrResponse.ok ? arrResponse : rootResponse;
+      const detail = (await failed.text()).slice(0, 300);
+      throw new Error(`${kind} returned HTTP ${failed.status}${detail ? `: ${detail}` : ''}`);
+    }
+    const status = await arrResponse.json();
+    const roots = await rootResponse.json();
+    response.json({
+      connected: true,
+      version: status?.version ?? null,
+      rootFolders: Array.isArray(roots)
+        ? roots.map((root) => root?.path).filter((root) => typeof root === 'string' && root)
+        : [],
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/scan', async (request, response, next) => {
   try {
-    const config = getConfig();
+    const config = currentConfig();
     const arr = await scanArr(config);
     const orphans = await scanOrphans(config, arr);
     response.json({
@@ -153,7 +241,7 @@ app.post('/api/oversized/apply', async (request, response, next) => {
       response.status(400).json({ error: 'Select between 1 and 10,000 oversized files.' });
       return;
     }
-    const config = getConfig();
+    const config = currentConfig();
     response.json(await applyOversized(config, ids));
   } catch (error) {
     next(error);
@@ -167,7 +255,7 @@ app.post('/api/orphans/apply', async (request, response, next) => {
       response.status(400).json({ error: 'Select between 1 and 10,000 orphan files.' });
       return;
     }
-    const config = getConfig();
+    const config = currentConfig();
     const arr = await scanArr(config);
     response.json(await applyOrphans(config, arr, ids));
   } catch (error) {
@@ -183,10 +271,11 @@ if (existsSync(distPath)) {
 app.use((error, request, response, next) => {
   console.error(error);
   if (response.headersSent) return next(error);
-  response.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  const status = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+  response.status(status).json({ error: error instanceof Error ? error.message : String(error) });
 });
 
-const config = getConfig();
+const config = currentConfig();
 const server = app.listen(config.port, '0.0.0.0', () => {
   console.log(`Keelhaularr API listening on http://0.0.0.0:${config.port}`);
   if (!config.password) console.warn('Setup required: set APP_PASSWORD in .env before signing in.');

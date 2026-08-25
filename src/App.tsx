@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { SettingsDialog } from './SettingsDialog';
 
 type AppKind = 'radarr' | 'sonarr';
 type Tab = 'oversized' | 'orphans';
@@ -196,6 +197,7 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [applying, setApplying] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
@@ -236,6 +238,15 @@ export default function App() {
     setAuth('signed-out');
     setScan(null);
     setConfig(null);
+  }
+
+  async function settingsSaved() {
+    const statusData = await api<{ config: PublicConfig }>('/api/status');
+    setConfig(statusData.config);
+    setScan(null);
+    setSelected(new Set());
+    setMessage('Standing orders changed. Run a fresh scan when ready.');
+    setError('');
   }
 
   async function runScan() {
@@ -309,6 +320,7 @@ export default function App() {
             <ConnectionPill app="radarr" scan={scan} configured={Boolean(config?.radarr.configured)} />
             <ConnectionPill app="sonarr" scan={scan} configured={Boolean(config?.sonarr.configured)} />
           </div>
+          <button className="text-button settings-button" onClick={() => setShowSettings(true)}>Settings</button>
           <button className="text-button" onClick={logout}>Sign out</button>
         </div>
       </header>
@@ -374,11 +386,12 @@ export default function App() {
           const item = config?.[app];
           return <article key={app}><AppBadge app={app} /><strong>{item?.maxMbPerMinute ?? '—'} MB/min</strong><span>+ {item?.toleranceGib ?? '—'} GiB tolerance</span><span>{item?.mediaRoots.length ? `${item.mediaRoots.length} media root(s)` : 'orphan scan off'}</span></article>;
         })}
-        <article><span className="app-chip orphan">Orphans</span><strong>{config?.orphanAction ?? '—'}</strong><span>configured in .env</span></article>
+        <article><span className="app-chip orphan">Orphans</span><strong>{config?.orphanAction ?? '—'}</strong><span>editable from Settings</span></article>
       </section>
 
       <footer><span>Keelhaularr</span> · No automatic deletions · Every order is revalidated server-side</footer>
       {confirming && <ConfirmDialog tab={tab} count={selectedVisible.length} action={config?.orphanAction ?? 'quarantine'} busy={applying} onCancel={() => setConfirming(false)} onConfirm={applySelection} />}
+      {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} onSaved={settingsSaved} />}
     </main>
   );
 }

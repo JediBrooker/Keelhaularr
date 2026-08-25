@@ -7,6 +7,8 @@ services:
     ports:
       - "8787:8787"
     volumes:
+      # GUI-managed settings are stored here and survive image updates.
+      - ./config:/config
       # Use the same container paths reported by Radarr and Sonarr where possible.
       - /path/on/server/movies:/movies
       - /path/on/server/tv:/tv
