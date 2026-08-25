@@ -34,13 +34,22 @@ apt-get update && apt-get install -y ca-certificates curl && curl -fsSL "https:/
 ```
 
 The installer uses Docker's official Debian repository, installs Docker Engine
-and the Compose plugin when needed, validates the media mount points, collects
-the login and *arr settings interactively, discovers every Radarr and Sonarr
-root folder through their APIs, optionally mounts completed-download folders
-for hardlink watch, starts Keelhaularr, and verifies its health endpoint. When an API-reported root is mounted at a different path in the LXC,
-the installer asks only for that local mapping. It is safe to rerun for updates
-and preserves existing settings. After installation, all application settings
-can be changed from the protected Settings interface.
+and the Compose plugin when needed, and asks only for a login username and
+password. It automatically exposes conventional storage roots such as `/data`,
+`/mnt`, `/media`, `/storage`, `/torrents`, `/usenet`, and `/downloads`, plus
+non-system mount points detected inside the LXC. It then starts Keelhaularr and
+verifies its health endpoint.
+
+Sign in at the printed URL and the **First voyage setup** screen opens
+automatically. Radarr/Sonarr URLs, API keys, independent size limits, media and
+download roots, path mappings, quarantine, and all scanner controls are entered
+there. Testing an application connection copies its API-reported media roots
+into the empty path fields. A mistake in the GUI can simply be corrected and
+saved; the terminal installer does not need to be restarted.
+
+The installer is safe to rerun for updates and preserves existing settings. If
+a new storage mount is added to the LXC later, rerun the installer once and it
+will expose the newly detected mount without repeating application setup.
 
 For a Proxmox LXC, enable the required features on the Proxmox host before
 running the installer:
@@ -49,8 +58,10 @@ running the installer:
 pct set <CTID> -features nesting=1,keyctl=1
 ```
 
-Restart the LXC afterward and ensure the movie/TV library bind mounts are
-visible and writable inside it.
+Restart the LXC afterward and ensure the movie, TV, and completed-download mount
+points are visible and writable inside it. Placing them beneath `/data` or
+`/mnt` gives the simplest browser setup because the paths remain identical
+inside Keelhaularr.
 
 ### Manual Compose installation
 
@@ -115,7 +126,8 @@ are both served on `PORT`, which defaults to 8787.
 
 ## GUI settings
 
-After signing in, open **Settings** in the top bar. The interface manages login
+On a fresh installation, **First voyage setup** opens immediately after login.
+Later, open **Settings** in the top bar. The interface manages login
 credentials and sessions, shared and per-app size rules, Radarr/Sonarr URLs and
 API keys, unmonitored-media behavior, media roots, completed-download roots,
 hardlink minimum age, path mappings, orphan action

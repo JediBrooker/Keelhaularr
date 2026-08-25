@@ -143,6 +143,7 @@ export function getConfig(overrides = {}) {
     ignoreDirectories,
     maxFiles: readNumber('ORPHAN_MAX_FILES', 100000, overrides),
     hardlinkMinAgeHours,
+    storageRoots: readRoots('STORAGE_ROOTS', overrides),
   };
 }
 

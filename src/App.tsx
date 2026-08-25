@@ -214,6 +214,7 @@ export default function App() {
         }
         const statusData = await api<{ config: PublicConfig }>('/api/status');
         setConfig(statusData.config);
+        if (!statusData.config.radarr.configured && !statusData.config.sonarr.configured) setShowSettings(true);
         setAuth('signed-in');
       })
       .catch((authError) => {
@@ -233,6 +234,7 @@ export default function App() {
   async function signedIn() {
     const statusData = await api<{ config: PublicConfig }>('/api/status');
     setConfig(statusData.config);
+    if (!statusData.config.radarr.configured && !statusData.config.sonarr.configured) setShowSettings(true);
     setAuth('signed-in');
   }
 
@@ -394,7 +396,7 @@ export default function App() {
 
       <footer><span>Keelhaularr</span> · No automatic deletions · Every order is revalidated server-side</footer>
       {confirming && <ConfirmDialog tab={tab} count={selectedVisible.length} action={config?.orphanAction ?? 'quarantine'} busy={applying} onCancel={() => setConfirming(false)} onConfirm={applySelection} />}
-      {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} onSaved={settingsSaved} />}
+      {showSettings && <SettingsDialog onboarding={!config?.radarr.configured && !config?.sonarr.configured} onClose={() => setShowSettings(false)} onSaved={settingsSaved} />}
     </main>
   );
 }

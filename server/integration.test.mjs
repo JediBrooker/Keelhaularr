@@ -134,6 +134,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     ORPHAN_ACTION: 'quarantine',
     ORPHAN_TRASH_DIR: quarantineRoot,
     HARDLINK_MIN_AGE_HOURS: '0',
+    STORAGE_ROOTS: `${moviesRoot},${tvRoot}`,
   };
   const child = spawn(process.execPath, ['server/index.mjs'], {
     cwd: path.resolve('.'),
@@ -174,6 +175,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const initialSettings = JSON.parse(initialSettingsText).settings;
   assert.equal(initialSettings.radarr.apiKeyConfigured, true);
   assert.equal(initialSettings.defaults.maxMbPerMinute, 85);
+  assert.deepEqual(initialSettings.server.storageRoots, [moviesRoot, tvRoot]);
 
   const settingsUpdate = {
     account: {

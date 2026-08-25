@@ -43,6 +43,7 @@ interface SettingsData {
   server: {
     port: number;
     portManagedByDocker: boolean;
+    storageRoots: string[];
   };
 }
 
@@ -201,7 +202,7 @@ function ConnectionSection({ app, form, defaultMax, defaultTolerance, testing, t
   );
 }
 
-export function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () => Promise<void> }) {
+export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboarding?: boolean; onClose: () => void; onSaved: () => Promise<void> }) {
   const [form, setForm] = useState<SettingsForm | null>(null);
   const [loadingError, setLoadingError] = useState('');
   const [saveError, setSaveError] = useState('');
@@ -233,7 +234,15 @@ export function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSa
         method: 'POST',
         body: JSON.stringify({ app, url: form[app].url, apiKey: form[app].apiKey }),
       });
-      const roots = result.rootFolders.length ? ` · ${result.rootFolders.join(', ')}` : ' · no media roots reported';
+      const autoFilledRoots = Boolean(result.rootFolders.length && !form[app].mediaRootsText.trim());
+      const roots = result.rootFolders.length
+        ? ` · ${result.rootFolders.join(', ')}${autoFilledRoots ? ' · added to media roots' : ''}`
+        : ' · no media roots reported';
+      if (autoFilledRoots) {
+        setForm((current) => current && !current[app].mediaRootsText.trim()
+          ? { ...current, [app]: { ...current[app], mediaRootsText: result.rootFolders.join('\n') } }
+          : current);
+      }
       setTestMessages((current) => ({ ...current, [app]: `Connected${result.version ? ` · v${result.version}` : ''}${roots}` }));
     } catch (error) {
       setTestMessages((current) => ({ ...current, [app]: error instanceof Error ? error.message : String(error) }));
@@ -301,7 +310,7 @@ export function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSa
     <div className="settings-backdrop" role="presentation">
       <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title">
         <header className="settings-header">
-          <div><p className="eyebrow gold">CAPTAIN’S CONFIGURATION</p><h2 id="settings-title">Standing orders</h2><p>Manage every Keelhaularr application setting. Secrets stay server-side.</p></div>
+          <div><p className="eyebrow gold">{onboarding ? 'FIRST VOYAGE SETUP' : 'CAPTAIN’S CONFIGURATION'}</p><h2 id="settings-title">{onboarding ? 'Connect your fleet' : 'Standing orders'}</h2><p>{onboarding ? 'Add Radarr, Sonarr, and their storage paths here. You can leave either application blank.' : 'Manage every Keelhaularr application setting. Secrets stay server-side.'}</p></div>
           <button type="button" className="settings-close" onClick={onClose} aria-label="Close settings">×</button>
         </header>
         {loadingError ? <div className="settings-loading"><p className="notice error">{loadingError}</p></div> : !form ? <div className="settings-loading">Reading the captain’s log…</div> : (
@@ -347,12 +356,12 @@ export function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSa
               </section>
 
               <section className="settings-section deployment-note">
-                <div><p className="eyebrow">DEPLOYMENT</p><h3>Web interface port</h3><p>Port <strong>{form.server.port}</strong> is published by Docker Compose. Change the host-side port in <code>compose.yml</code>, then recreate the container.</p></div>
+                <div><p className="eyebrow">DEPLOYMENT</p><h3>Container access</h3><p>Port <strong>{form.server.port}</strong> is published by Docker Compose. Storage visible to this setup: <code>{form.server.storageRoots.length ? form.server.storageRoots.join(', ') : 'none detected'}</code>.</p></div>
               </section>
             </div>
             <footer className="settings-actions">
               <span>Saved settings override the bootstrap <code>.env</code> and survive updates.</span>
-              <div><button type="button" className="ghost-button" onClick={onClose} disabled={saving}>Close</button><button type="submit" className="primary-button" disabled={saving}>{saving ? 'Saving orders…' : 'Save all settings'}</button></div>
+              <div><button type="button" className="ghost-button" onClick={onClose} disabled={saving}>{onboarding ? 'Finish later' : 'Close'}</button><button type="submit" className="primary-button" disabled={saving}>{saving ? 'Saving orders…' : onboarding ? 'Save setup' : 'Save all settings'}</button></div>
             </footer>
           </form>
         )}

@@ -210,6 +210,7 @@ export function settingsView(config) {
     server: {
       port: config.port,
       portManagedByDocker: Boolean(process.env.CONFIG_DIR),
+      storageRoots: config.storageRoots,
     },
   };
 }
