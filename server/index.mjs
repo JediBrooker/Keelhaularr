@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { scanArr } from './arr.mjs';
 import { getConfig, publicConfig } from './config.mjs';
+import { suggestDirectories } from './directories.mjs';
 import { addExclusions, filterExcluded, listExclusions, removeExclusion } from './exclusions.mjs';
 import {
   activeJobSummary,
@@ -358,6 +359,14 @@ app.delete('/api/quarantine/:id', async (request, response, next) => {
 app.get('/api/storage/health', async (request, response, next) => {
   try {
     response.json(await storageHealth(currentConfig()));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/storage/directories', async (request, response, next) => {
+  try {
+    response.json(await suggestDirectories(request.query.path ?? '', currentConfig()));
   } catch (error) {
     next(error);
   }

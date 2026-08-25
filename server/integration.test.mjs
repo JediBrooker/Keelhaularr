@@ -216,6 +216,16 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(initialSettings.defaults.maxMbPerMinute, 85);
   assert.deepEqual(initialSettings.server.storageRoots, [moviesRoot, tvRoot]);
 
+  const directoryUrl = `${base}/api/storage/directories?path=${encodeURIComponent(`${moviesRoot}/`)}`;
+  assert.equal((await fetch(directoryUrl)).status, 401);
+  const directoriesResponse = await fetch(directoryUrl, { headers: { Cookie: cookie } });
+  assert.equal(directoriesResponse.status, 200);
+  const directories = await directoriesResponse.json();
+  assert.deepEqual(directories.suggestions.map((entry) => entry.name), ['Orphan Movie', 'Tracked Movie']);
+  assert.equal(directories.current.path, moviesRoot);
+  const invalidDirectory = await fetch(`${base}/api/storage/directories?path=relative`, { headers: { Cookie: cookie } });
+  assert.equal(invalidDirectory.status, 400);
+
   const settingsUpdate = {
     account: {
       username: 'captain',

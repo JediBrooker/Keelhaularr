@@ -23,6 +23,7 @@ files; it is disabled by default.
 - Built-in login, HttpOnly signed sessions, and login rate limiting
 - API keys kept server-side
 - Authenticated GUI settings with immediate apply and durable, atomic storage
+- Server-side folder autocomplete for library, completed-download, and quarantine paths
 - Durable background jobs, restart recovery, cancellation, retries, and item history
 - Replacement search/download status tracking
 - Optional per-quality size limits read directly from Radarr and Sonarr
@@ -164,6 +165,19 @@ extensions. Connection tests are available before saving and automatically fill
 empty library-folder fields. Folders use individual add/remove rows; path
 mapping is kept in a collapsed advanced section because normal installer-based
 deployments use identical paths and do not need it.
+
+Library, completed-download, and quarantine fields discover folders as you
+type. Start with `/data/` (or another mounted path), click a suggestion to look
+inside, then choose **Use this folder**. An empty field suggests available
+storage roots. Arrow keys and Enter navigate suggestions; Tab accepts a
+highlighted folder, and Escape closes the list. Read-only folders and missing
+paths are indicated before saving. You may still enter a new quarantine path;
+browsing itself never creates directories.
+
+Suggestions come from the Keelhaularr server/container, not your browser's
+computer. A host folder must be mounted into Docker/LXC before it can appear.
+The authenticated browser lists only one directory level at a time, never file
+contents, and does not suggest symbolic links or device/process directories.
 
 Passwords and API keys are write-only: the browser receives only a flag saying
 whether each secret exists. Saved values take effect immediately and are

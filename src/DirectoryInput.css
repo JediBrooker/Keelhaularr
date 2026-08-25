@@ -1,0 +1,19 @@
+.directory-input { min-width: 0; width: 100%; }
+.directory-input > input { width: 100%; min-width: 0; }
+.folder-row > button { align-self: start; min-height: 38px; }
+.directory-picker { margin-top: 7px; overflow: hidden; border: 1px solid rgba(22,79,82,.25); border-radius: 9px; background: #fff; box-shadow: 0 5px 16px rgba(16,42,44,.06); }
+.directory-picker-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; background: #edf3ef; }
+.directory-picker-heading > span { min-width: 0; overflow: hidden; color: var(--muted); font-family: 'DM Mono', monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.directory-input .directory-picker button { border: 0; border-radius: 0; color: var(--teal); background: transparent; cursor: pointer; font-family: inherit; font-size: 10px; }
+.directory-input .directory-picker-heading button { flex: 0 0 auto; padding: 5px 7px; border-radius: 5px; background: #fff; font-weight: 800; }
+.directory-options { max-height: 190px; overflow-y: auto; overscroll-behavior: contain; }
+.directory-input .directory-option { display: grid; grid-template-columns: 16px minmax(0,1fr) auto auto; align-items: center; gap: 7px; width: 100%; padding: 10px 12px; text-align: left; }
+.directory-input .directory-option:hover,.directory-input .directory-option.active { background: #e5efeb; }
+.directory-option-name { min-width: 0; overflow: hidden; color: var(--ink); font-family: 'DM Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
+.directory-option small,.directory-use small { color: #94632b; font-size: 9px; white-space: nowrap; }
+.directory-symbol { font-size: 15px; }
+.directory-input .directory-use { display: flex; align-items: center; gap: 8px; width: 100%; padding: 10px 12px; border-top: 1px solid var(--line); background: #f3f7f3; font-weight: 800; text-align: left; }
+.directory-use > span { flex: 1; min-width: 0; overflow: hidden; font-family: 'DM Mono', monospace; font-size: 9px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.directory-input .directory-picker button:focus-visible { outline: 2px solid var(--teal); outline-offset: -2px; }
+.directory-status { margin: 0; padding: 8px 11px; border-top: 1px solid var(--line); color: var(--muted); font-size: 9px; font-weight: 500; line-height: 1.5; overflow-wrap: anywhere; }
+.directory-status.error { color: #8f3025; }

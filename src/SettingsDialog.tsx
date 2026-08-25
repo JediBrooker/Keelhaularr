@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react';
+import { DirectoryInput } from './DirectoryInput';
 
 type AppKind = 'radarr' | 'sonarr';
 
@@ -196,8 +197,9 @@ function optionalNumeric(value: string, label: string) {
   return value.trim() ? numeric(value, label) : null;
 }
 
-function FolderList({ title, hint, values, placeholder, addLabel, emptyMessage, onChange }: {
+function FolderList({ title, appLabel, hint, values, placeholder, addLabel, emptyMessage, onChange }: {
   title: string;
+  appLabel: string;
   hint: string;
   values: string[];
   placeholder: string;
@@ -209,11 +211,11 @@ function FolderList({ title, hint, values, placeholder, addLabel, emptyMessage, 
   const remove = (index: number) => onChange(values.filter((_, itemIndex) => itemIndex !== index));
   return (
     <div className="folder-list wide-field">
-      <div className="folder-list-heading"><div><strong>{title}</strong><span>{hint}</span></div><button type="button" className="add-path-button" onClick={() => onChange([...values, ''])}>+ {addLabel}</button></div>
+      <div className="folder-list-heading"><div><strong>{title}</strong><span>{hint} · Type a path to browse</span></div><button type="button" className="add-path-button" onClick={() => onChange([...values, ''])}>+ {addLabel}</button></div>
       {values.length ? <div className="folder-rows">{values.map((value, index) => (
         <div className="folder-row" key={`${title}-${index}`}>
-          <input value={value} onChange={(event) => update(index, event.target.value)} placeholder={placeholder} aria-label={`${title} ${index + 1}`} />
-          <button type="button" onClick={() => remove(index)} aria-label={`Remove ${title.toLowerCase()} ${index + 1}`}>Remove</button>
+          <DirectoryInput value={value} onChange={(next) => update(index, next)} placeholder={placeholder} label={`${appLabel} ${title.toLowerCase()} ${index + 1}`} />
+          <button type="button" onClick={() => remove(index)} aria-label={`Remove ${appLabel} ${title.toLowerCase()} ${index + 1}`}>Remove</button>
         </div>
       ))}</div> : <p className="empty-folder-list">{emptyMessage}</p>}
     </div>
@@ -249,8 +251,8 @@ function ConnectionSection({ app, form, defaultMax, defaultTolerance, testing, t
         <label className="field">MB/min fallback <span>{form.useArrQualityDefinitions ? `used when ${label} has no matching maximum` : `blank uses ${defaultMax}`}</span><input inputMode="decimal" value={form.maxMbPerMinuteOverride} onChange={(event) => update('maxMbPerMinuteOverride', event.target.value)} placeholder={defaultMax} /></label>
         <label className="field">Tolerance override (GiB) <span>blank uses {defaultTolerance}</span><input inputMode="decimal" value={form.toleranceGibOverride} onChange={(event) => update('toleranceGibOverride', event.target.value)} placeholder={defaultTolerance} /></label>
         <label className="check-row wide-field"><input type="checkbox" checked={form.includeUnmonitored} onChange={(event) => update('includeUnmonitored', event.target.checked)} />Include unmonitored media in oversize checks</label>
-        <FolderList title="Library folders" hint={`Detected automatically when you test ${label}`} values={form.mediaRoots} placeholder={app === 'radarr' ? '/data/media/movies' : '/data/media/tv'} addLabel="Add manually" emptyMessage={`Test the ${label} connection to fill this automatically.`} onChange={(next) => update('mediaRoots', next)} />
-        <FolderList title="Completed download folders" hint="Torrent folders; add Usenet only when its imports remain hardlinked" values={form.downloadRoots} placeholder={app === 'radarr' ? '/data/torrents/movies' : '/data/torrents/tv'} addLabel="Add folder" emptyMessage="No hardlink-watch folders added. This feature is optional." onChange={(next) => update('downloadRoots', next)} />
+        <FolderList title="Library folders" appLabel={label} hint={`Detected automatically when you test ${label}`} values={form.mediaRoots} placeholder={app === 'radarr' ? '/data/media/movies' : '/data/media/tv'} addLabel="Add manually" emptyMessage={`Test the ${label} connection to fill this automatically.`} onChange={(next) => update('mediaRoots', next)} />
+        <FolderList title="Completed download folders" appLabel={label} hint="Torrent folders; add Usenet only when its imports remain hardlinked" values={form.downloadRoots} placeholder={app === 'radarr' ? '/data/torrents/movies' : '/data/torrents/tv'} addLabel="Add folder" emptyMessage="No hardlink-watch folders added. This feature is optional." onChange={(next) => update('downloadRoots', next)} />
         <p className="field-hint wide-field">Only completed files older than the minimum age and without a matching library hardlink are flagged.</p>
         <details className="advanced-settings wide-field" open={Boolean(form.pathMapsText.trim())}>
           <summary>Advanced path mapping <span>Most installations leave this blank</span></summary>
@@ -415,7 +417,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
                 <div className="settings-section-head"><div><span className="app-chip orphan">Orphans</span><h3>Orphan handling</h3></div></div>
                 <div className="settings-grid two">
                   <label className="field">Action<select value={form.orphan.action} onChange={(event) => updateSection('orphan', { ...form.orphan, action: event.target.value as 'quarantine' | 'permanent' })}><option value="quarantine">Quarantine (recommended)</option><option value="permanent">Permanent deletion</option></select></label>
-                  <label className="field">Quarantine directory<input value={form.orphan.trashDir} onChange={(event) => updateSection('orphan', { ...form.orphan, trashDir: event.target.value })} placeholder="/quarantine" /></label>
+                  <div className="field"><label htmlFor="quarantine-directory">Quarantine directory</label><span>Start typing to browse server folders</span><DirectoryInput id="quarantine-directory" label="Quarantine directory" value={form.orphan.trashDir} onChange={(value) => updateSection('orphan', { ...form.orphan, trashDir: value })} placeholder="/quarantine" allowNew /></div>
                   <label className={`check-row danger-check wide-field ${form.orphan.action === 'permanent' ? 'active' : ''}`}><input type="checkbox" checked={form.orphan.allowPermanentDelete} onChange={(event) => updateSection('orphan', { ...form.orphan, allowPermanentDelete: event.target.checked })} />Explicitly allow irreversible orphan deletion</label>
                   <label className="field wide-field">Ignored directory names <span>comma separated</span><textarea rows={2} value={form.orphan.ignoreDirectoriesText} onChange={(event) => updateSection('orphan', { ...form.orphan, ignoreDirectoriesText: event.target.value })} /></label>
                   <label className="field">Maximum files per orphan scan<input type="number" min="1" max="1000000" value={form.orphan.maxFiles} onChange={(event) => updateSection('orphan', { ...form.orphan, maxFiles: event.target.value })} /></label>
