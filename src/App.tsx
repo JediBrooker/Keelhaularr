@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { OperationsDialog } from './OperationsDialog';
 import { SettingsDialog } from './SettingsDialog';
 
 type AppKind = 'radarr' | 'sonarr';
@@ -8,6 +9,7 @@ interface PublicConnectionConfig {
   configured: boolean;
   maxMbPerMinute: number;
   toleranceGib: number;
+  useArrQualityDefinitions: boolean;
   includeUnmonitored: boolean;
   mediaRoots: string[];
   downloadRoots: string[];
@@ -34,6 +36,7 @@ interface OversizedItem {
   overageBytes: number;
   runtimeMinutes: number;
   maxMbPerMinute: number;
+  limitSource: string;
 }
 
 interface OrphanItem {
@@ -201,6 +204,11 @@ export default function App() {
   const [applying, setApplying] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showOperations, setShowOperations] = useState(false);
+  const [operationsTab, setOperationsTab] = useState<'jobs' | 'brig' | 'storage' | 'exclusions' | 'schedule'>('jobs');
+  const [query, setQuery] = useState('');
+  const [minimumGib, setMinimumGib] = useState('0');
+  const [sort, setSort] = useState<'largest' | 'overage' | 'title' | 'oldest'>('largest');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
@@ -225,8 +233,20 @@ export default function App() {
 
   const visible = useMemo(() => {
     const source = tab === 'oversized' ? scan?.oversized ?? [] : scan?.orphans ?? [];
-    return filter === 'all' ? source : source.filter((item) => item.app === filter);
-  }, [filter, scan, tab]);
+    const needle = query.trim().toLowerCase();
+    const minimum = Math.max(0, Number(minimumGib) || 0) * 1024 ** 3;
+    const filtered = source.filter((item) => (
+      (filter === 'all' || item.app === filter)
+      && (!needle || `${item.title} ${item.subtitle} ${item.path}`.toLowerCase().includes(needle))
+      && (tab === 'oversized' ? (item as OversizedItem).overageBytes >= minimum : item.sizeBytes >= minimum)
+    ));
+    return [...filtered].sort((left, right) => {
+      if (sort === 'title') return left.title.localeCompare(right.title);
+      if (sort === 'oldest') return new Date((left as OrphanItem).modifiedAt ?? 0).getTime() - new Date((right as OrphanItem).modifiedAt ?? 0).getTime();
+      if (sort === 'overage') return Number((right as OversizedItem).overageBytes ?? right.sizeBytes) - Number((left as OversizedItem).overageBytes ?? left.sizeBytes);
+      return right.sizeBytes - left.sizeBytes;
+    });
+  }, [filter, minimumGib, query, scan, sort, tab]);
   const selectedVisible = visible.filter((item) => selected.has(item.id));
   const totalOversized = scan?.oversized.reduce((sum, item) => sum + item.sizeBytes, 0) ?? 0;
   const totalOrphans = scan?.orphans.reduce((sum, item) => sum + item.sizeBytes, 0) ?? 0;
@@ -289,20 +309,39 @@ export default function App() {
     });
   }
 
+  function selectFirst(count: number) {
+    setSelected(new Set(visible.slice(0, count).map((item) => item.id)));
+  }
+
+  async function excludeSelection() {
+    if (tab !== 'oversized' || !selectedVisible.length) return;
+    setApplying(true);
+    setError('');
+    try {
+      await api('/api/exclusions', { method: 'POST', body: JSON.stringify({ ids: selectedVisible.map((item) => item.id) }) });
+      setMessage(`${selectedVisible.length} item(s) excluded from future oversize scans.`);
+      await runScan();
+    } catch (excludeError) {
+      setError(excludeError instanceof Error ? excludeError.message : String(excludeError));
+    } finally {
+      setApplying(false);
+    }
+  }
+
   async function applySelection() {
     setApplying(true);
     setError('');
     try {
       const endpoint = tab === 'oversized' ? '/api/oversized/apply' : '/api/orphans/apply';
-      const result = await api<{ results: Array<{ status: string }>; matched: number }>(endpoint, {
+      const result = await api<{ job: { id: string; title: string } }>(endpoint, {
         method: 'POST',
         body: JSON.stringify({ ids: selectedVisible.map((item) => item.id) }),
       });
-      const succeeded = result.results.filter((item) => item.status !== 'failed').length;
-      const failed = result.results.length - succeeded;
-      setMessage(`${succeeded} file(s) handled${failed ? `; ${failed} failed` : ''}. Rescanning the holds…`);
+      setMessage(`${result.job.title} started. Progress is saved and can be followed in Operations → Jobs.`);
       setConfirming(false);
-      await runScan();
+      setSelected(new Set());
+      setOperationsTab('jobs');
+      setShowOperations(true);
     } catch (applyError) {
       setError(applyError instanceof Error ? applyError.message : String(applyError));
     } finally {
@@ -325,6 +364,7 @@ export default function App() {
             <ConnectionPill app="radarr" scan={scan} configured={Boolean(config?.radarr.configured)} />
             <ConnectionPill app="sonarr" scan={scan} configured={Boolean(config?.sonarr.configured)} />
           </div>
+          <button className="text-button" onClick={() => { setOperationsTab('jobs'); setShowOperations(true); }}>Operations</button>
           <button className="text-button settings-button" onClick={() => setShowSettings(true)}>Settings</button>
           <button className="text-button" onClick={logout}>Sign out</button>
         </div>
@@ -357,19 +397,25 @@ export default function App() {
             <p className="eyebrow">CARGO MANIFEST</p>
             <h3>{tab === 'oversized' ? 'Tracked files over standing orders' : 'Media not tracked by either captain'}</h3>
           </div>
-          <button className="danger-button" disabled={!selectedVisible.length || scanning} onClick={() => setConfirming(true)}>
+          <button className="danger-button" disabled={!selectedVisible.length || scanning || applying} onClick={() => setConfirming(true)}>
             {tab === 'oversized' ? 'Keelhaul' : config?.orphanAction === 'permanent' ? 'Delete' : 'Quarantine'} selected · {selectedVisible.length}
           </button>
         </div>
 
         <div className="manifest-tools">
           <div className="tabs" role="tablist">
-            <button className={tab === 'oversized' ? 'active' : ''} onClick={() => { setTab('oversized'); setSelected(new Set()); }}>Oversized <span>{scan?.oversized.length ?? 0}</span></button>
-            <button className={tab === 'orphans' ? 'active' : ''} onClick={() => { setTab('orphans'); setSelected(new Set()); }}>Orphan watch <span>{scan?.orphans.length ?? 0}</span></button>
+            <button className={tab === 'oversized' ? 'active' : ''} onClick={() => { setTab('oversized'); setSort('largest'); setSelected(new Set()); }}>Oversized <span>{scan?.oversized.length ?? 0}</span></button>
+            <button className={tab === 'orphans' ? 'active' : ''} onClick={() => { setTab('orphans'); setSort('largest'); setSelected(new Set()); }}>Orphan watch <span>{scan?.orphans.length ?? 0}</span></button>
           </div>
           <div className="filters" aria-label="Filter by application">
             {(['all', 'radarr', 'sonarr'] as const).map((value) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => setFilter(value)}>{value === 'all' ? 'Both holds' : value}</button>)}
           </div>
+        </div>
+        <div className="manifest-filters">
+          <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search title, quality or path" aria-label="Search manifest" />
+          <label>Minimum {tab === 'oversized' ? 'overage' : 'size'}<span><input inputMode="decimal" value={minimumGib} onChange={(event) => setMinimumGib(event.target.value)} /> GiB</span></label>
+          <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="largest">Largest first</option>{tab === 'oversized' && <option value="overage">Most over limit</option>}<option value="title">Title</option>{tab === 'orphans' && <option value="oldest">Oldest first</option>}</select></label>
+          <div className="batch-tools"><button onClick={() => selectFirst(25)} disabled={!visible.length}>Select first 25</button><button onClick={() => selectFirst(100)} disabled={!visible.length}>First 100</button>{tab === 'oversized' && <button onClick={excludeSelection} disabled={!selectedVisible.length || applying}>Exclude selected</button>}</div>
         </div>
 
         {!scan ? (
@@ -389,14 +435,15 @@ export default function App() {
         <div><p className="eyebrow">STANDING ORDERS</p><h3>Server-side settings</h3></div>
         {(['radarr', 'sonarr'] as AppKind[]).map((app) => {
           const item = config?.[app];
-          return <article key={app}><AppBadge app={app} /><strong>{item?.maxMbPerMinute ?? '—'} MB/min</strong><span>+ {item?.toleranceGib ?? '—'} GiB tolerance</span><span>{item?.mediaRoots.length ? `${item.mediaRoots.length} media · ${item.downloadRoots.length} download root(s)` : 'orphan scan off'}</span></article>;
+          return <article key={app}><AppBadge app={app} /><strong>{item?.useArrQualityDefinitions ? '*arr limits' : `${item?.maxMbPerMinute ?? '—'} MB/min`}</strong><span>+ {item?.toleranceGib ?? '—'} GiB tolerance</span><span>{item?.mediaRoots.length ? `${item.mediaRoots.length} media · ${item.downloadRoots.length} download root(s)` : 'orphan scan off'}</span></article>;
         })}
         <article><span className="app-chip orphan">Orphans</span><strong>{config?.orphanAction ?? '—'}</strong><span>editable from Settings</span></article>
       </section>
 
-      <footer><span>Keelhaularr</span> · No automatic deletions · Every order is revalidated server-side</footer>
+      <footer><span>Keelhaularr</span> · No automatic library deletions · Every order is revalidated server-side</footer>
       {confirming && <ConfirmDialog tab={tab} count={selectedVisible.length} action={config?.orphanAction ?? 'quarantine'} busy={applying} onCancel={() => setConfirming(false)} onConfirm={applySelection} />}
       {showSettings && <SettingsDialog onboarding={!config?.radarr.configured && !config?.sonarr.configured} onClose={() => setShowSettings(false)} onSaved={settingsSaved} />}
+      {showOperations && <OperationsDialog initialTab={operationsTab} onClose={() => { setShowOperations(false); if (scan) runScan(); }} onChanged={async () => { if (scan) await runScan(); }} />}
     </main>
   );
 }

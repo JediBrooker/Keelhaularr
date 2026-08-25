@@ -7,11 +7,13 @@ const SETTINGS_KEYS = new Set([
   'APP_USERNAME', 'APP_PASSWORD', 'APP_SESSION_SECRET', 'APP_SESSION_DAYS', 'APP_COOKIE_SECURE',
   'MAX_MB_PER_MIN', 'OVERSIZE_TOLERANCE_GIB',
   'RADARR_URL', 'RADARR_API_KEY', 'RADARR_MAX_MB_PER_MIN', 'RADARR_OVERSIZE_TOLERANCE_GIB',
-  'RADARR_INCLUDE_UNMONITORED', 'RADARR_MEDIA_ROOTS', 'RADARR_DOWNLOAD_ROOTS', 'RADARR_PATH_MAPS',
+  'RADARR_USE_ARR_QUALITY_DEFINITIONS', 'RADARR_INCLUDE_UNMONITORED', 'RADARR_MEDIA_ROOTS', 'RADARR_DOWNLOAD_ROOTS', 'RADARR_PATH_MAPS',
   'SONARR_URL', 'SONARR_API_KEY', 'SONARR_MAX_MB_PER_MIN', 'SONARR_OVERSIZE_TOLERANCE_GIB',
-  'SONARR_INCLUDE_UNMONITORED', 'SONARR_MEDIA_ROOTS', 'SONARR_DOWNLOAD_ROOTS', 'SONARR_PATH_MAPS',
+  'SONARR_USE_ARR_QUALITY_DEFINITIONS', 'SONARR_INCLUDE_UNMONITORED', 'SONARR_MEDIA_ROOTS', 'SONARR_DOWNLOAD_ROOTS', 'SONARR_PATH_MAPS',
   'ORPHAN_ACTION', 'ORPHAN_TRASH_DIR', 'ALLOW_PERMANENT_ORPHAN_DELETE',
   'ORPHAN_IGNORE_DIRECTORIES', 'ORPHAN_MAX_FILES', 'MEDIA_EXTENSIONS', 'HARDLINK_MIN_AGE_HOURS',
+  'QUARANTINE_RETENTION_DAYS', 'SCHEDULE_ENABLED', 'SCHEDULE_INTERVAL_HOURS',
+  'NOTIFICATION_TYPE', 'NOTIFICATION_WEBHOOK_URL', 'NOTIFICATION_WHEN_CLEAR',
 ]);
 
 const configDirectory = path.resolve(process.env.CONFIG_DIR || path.join(process.cwd(), 'config'));
@@ -71,6 +73,18 @@ function secretValue(value, label, { allowEmpty = false, max = 4096 } = {}) {
 function booleanValue(value, label) {
   if (typeof value !== 'boolean') inputError(`${label} must be on or off.`);
   return value;
+}
+
+function configuredBoolean(key, values, fallback = false) {
+  const raw = Object.hasOwn(values, key) ? values[key] : process.env[key];
+  if (raw === undefined || raw === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(String(raw).toLowerCase());
+}
+
+function configuredNumber(key, values, fallback) {
+  const raw = Object.hasOwn(values, key) ? values[key] : process.env[key];
+  const value = Number(raw);
+  return raw === undefined || raw === '' || !Number.isFinite(value) ? fallback : value;
 }
 
 function numberValue(value, label, { min, max, integer = false }) {
@@ -165,6 +179,10 @@ function connectionOverrides(kind, input, output) {
     { min: 0, max: 1000 },
   )?.toString() ?? '';
   output[`${prefix}_INCLUDE_UNMONITORED`] = String(booleanValue(settings.includeUnmonitored, `${label} include unmonitored`));
+  output[`${prefix}_USE_ARR_QUALITY_DEFINITIONS`] = String(booleanValue(
+    settings.useArrQualityDefinitions ?? configuredBoolean(`${prefix}_USE_ARR_QUALITY_DEFINITIONS`, output),
+    `${label} use quality definitions`,
+  ));
   output[`${prefix}_MEDIA_ROOTS`] = roots.join(',');
   output[`${prefix}_DOWNLOAD_ROOTS`] = downloadRoots.join(',');
   output[`${prefix}_PATH_MAPS`] = mappings.map(({ from, to }) => `${from}=>${to}`).join(';');
@@ -183,6 +201,7 @@ export function settingsView(config) {
     apiKeyConfigured: Boolean(value.apiKey),
     maxMbPerMinuteOverride: value.maxMbPerMinuteOverride,
     toleranceGibOverride: value.toleranceGibOverride,
+    useArrQualityDefinitions: value.useArrQualityDefinitions,
     includeUnmonitored: value.includeUnmonitored,
     mediaRoots: value.mediaRoots,
     downloadRoots: value.downloadRoots,
@@ -206,6 +225,14 @@ export function settingsView(config) {
       maxFiles: config.maxFiles,
       mediaExtensions: config.mediaExtensions,
       hardlinkMinAgeHours: config.hardlinkMinAgeHours,
+      retentionDays: config.quarantineRetentionDays,
+    },
+    schedule: {
+      enabled: config.schedule.enabled,
+      intervalHours: config.schedule.intervalHours,
+      notificationType: config.schedule.notificationType,
+      webhookConfigured: Boolean(config.schedule.webhookUrl),
+      notifyWhenClear: config.schedule.notifyWhenClear,
     },
     server: {
       port: config.port,
@@ -221,6 +248,14 @@ export function buildSettingsOverrides(input, currentOverrides) {
   const defaults = requiredObject(root.defaults, 'Default size');
   const orphan = requiredObject(root.orphan, 'Orphan');
   const output = { ...currentOverrides };
+  const schedule = root.schedule === undefined ? {
+    enabled: configuredBoolean('SCHEDULE_ENABLED', output),
+    intervalHours: configuredNumber('SCHEDULE_INTERVAL_HOURS', output, 24),
+    notificationType: output.NOTIFICATION_TYPE ?? process.env.NOTIFICATION_TYPE ?? 'generic',
+    webhookUrl: '',
+    clearWebhook: false,
+    notifyWhenClear: configuredBoolean('NOTIFICATION_WHEN_CLEAR', output),
+  } : requiredObject(root.schedule, 'Schedule');
 
   output.APP_USERNAME = stringValue(account.username, 'Login username', { max: 128 });
   output.APP_SESSION_DAYS = numberValue(account.sessionDays, 'Session lifetime', { min: 1, max: 365, integer: true }).toString();
@@ -273,6 +308,23 @@ export function buildSettingsOverrides(input, currentOverrides) {
   output.ORPHAN_MAX_FILES = numberValue(orphan.maxFiles, 'Maximum orphan scan files', { min: 1, max: 1000000, integer: true }).toString();
   output.HARDLINK_MIN_AGE_HOURS = numberValue(orphan.hardlinkMinAgeHours, 'Minimum unlinked age', { min: 0, max: 8760 }).toString();
   output.MEDIA_EXTENSIONS = extensions.join(',');
+  output.QUARANTINE_RETENTION_DAYS = numberValue(
+    orphan.retentionDays ?? configuredNumber('QUARANTINE_RETENTION_DAYS', output, 0),
+    'Quarantine retention',
+    { min: 0, max: 3650, integer: true },
+  ).toString();
+
+  output.SCHEDULE_ENABLED = String(booleanValue(schedule.enabled, 'Scheduled scans'));
+  output.SCHEDULE_INTERVAL_HOURS = numberValue(schedule.intervalHours, 'Scheduled scan interval', { min: 1, max: 8760, integer: true }).toString();
+  const notificationType = stringValue(schedule.notificationType, 'Notification type');
+  if (!['generic', 'discord', 'gotify'].includes(notificationType)) inputError('Notification type must be generic, Discord, or Gotify.');
+  output.NOTIFICATION_TYPE = notificationType;
+  output.NOTIFICATION_WHEN_CLEAR = String(booleanValue(schedule.notifyWhenClear, 'Notify when clear'));
+  const webhookUrl = urlValue(schedule.webhookUrl ?? '', 'Notification webhook URL');
+  const clearWebhook = booleanValue(schedule.clearWebhook ?? false, 'Clear notification webhook');
+  if (webhookUrl && clearWebhook) inputError('Notification webhook cannot be replaced and cleared at the same time.');
+  if (webhookUrl) output.NOTIFICATION_WEBHOOK_URL = webhookUrl;
+  if (clearWebhook) output.NOTIFICATION_WEBHOOK_URL = '';
   return output;
 }
 

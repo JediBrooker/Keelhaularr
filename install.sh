@@ -22,6 +22,13 @@ info() { printf '%s[Keelhaularr]%s %s\n' "$TEAL" "$RESET" "$*"; }
 warn() { printf '%s[Warning]%s %s\n' "$GOLD" "$RESET" "$*" >&2; }
 die() { printf '%s[Error]%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 
+ensure_no_active_job() {
+  if [[ -s "$INSTALL_DIR/config/jobs.json" && "${FORCE_UPDATE:-0}" != "1" ]] \
+    && grep -Eq '"status"[[:space:]]*:[[:space:]]*"(queued|running|cancelling)"' "$INSTALL_DIR/config/jobs.json"; then
+    die "Keelhaularr has an active file job. Let it finish or cancel it in Jobs before updating. Use FORCE_UPDATE=1 only for an emergency interruption."
+  fi
+}
+
 on_error() {
   local line="$1"
   printf '%s[Error]%s Installation stopped near line %s.\n' "$RED" "$RESET" "$line" >&2
@@ -38,6 +45,7 @@ Run as root inside a Debian 11, 12, or 13 LXC:
 
 Optional environment variable:
   INSTALL_DIR=/opt/keelhaularr
+  FORCE_UPDATE=1  (only when you intentionally want to interrupt an active job)
 
 Fresh installs ask only for the web username and password. Application setup is
 completed in the browser. The installer is safe to rerun; existing settings are kept.
@@ -281,6 +289,7 @@ install_docker() {
 }
 
 install_docker
+ensure_no_active_job
 
 if [[ -e "$INSTALL_DIR" && ! -d "$INSTALL_DIR/.git" ]]; then
   if [[ -n "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
@@ -345,7 +354,8 @@ else
     printf 'RADARR_URL=\nRADARR_API_KEY=\nRADARR_MEDIA_ROOTS=\nRADARR_DOWNLOAD_ROOTS=\nRADARR_PATH_MAPS=\nRADARR_INCLUDE_UNMONITORED=false\n'
     printf 'SONARR_URL=\nSONARR_API_KEY=\nSONARR_MEDIA_ROOTS=\nSONARR_DOWNLOAD_ROOTS=\nSONARR_PATH_MAPS=\nSONARR_INCLUDE_UNMONITORED=false\n'
     printf 'ORPHAN_ACTION=quarantine\nORPHAN_TRASH_DIR=/config/quarantine\n'
-    printf 'HARDLINK_MIN_AGE_HOURS=24\n'
+    printf 'HARDLINK_MIN_AGE_HOURS=24\nQUARANTINE_RETENTION_DAYS=0\n'
+    printf 'SCHEDULE_ENABLED=false\nSCHEDULE_INTERVAL_HOURS=24\nNOTIFICATION_TYPE=generic\nNOTIFICATION_WEBHOOK_URL=\nNOTIFICATION_WHEN_CLEAR=false\n'
     printf 'ORPHAN_IGNORE_DIRECTORIES=extras,featurettes,trailers,samples\n'
     printf 'ORPHAN_MAX_FILES=100000\nPORT=8787\n'
   } >.env
@@ -389,8 +399,11 @@ join_csv STORAGE_PATHS STORAGE_ROOTS_VALUE
 } >compose.settings.yml
 chmod 600 compose.settings.yml
 
-info "Building and starting Keelhaularr…"
-docker compose "${COMPOSE_FILES[@]}" up -d --build
+info "Building Keelhaularr…"
+docker compose "${COMPOSE_FILES[@]}" build
+ensure_no_active_job
+info "Starting Keelhaularr…"
+docker compose "${COMPOSE_FILES[@]}" up -d --no-build
 
 APP_PORT="$(docker compose "${COMPOSE_FILES[@]}" port keelhaularr 8787 | awk -F: 'END {print $NF}')"
 APP_PORT="${APP_PORT:-8787}"

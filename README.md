@@ -5,9 +5,10 @@ tracked media files above a configured MB/min limit plus an absolute oversize
 tolerance, and it can compare real library folders with both *arr databases to
 find orphaned media.
 
-Nothing is deleted automatically. Every destructive action is selected in the
-interface, confirmed with a typed phrase, and revalidated on the server before
-it runs.
+Library and download files are never deleted automatically. File actions are
+selected in the interface, confirmed, and revalidated on the server before
+they run. Optional Brig retention can automatically purge already-quarantined
+files; it is disabled by default.
 
 ## Features
 
@@ -22,6 +23,15 @@ it runs.
 - Built-in login, HttpOnly signed sessions, and login rate limiting
 - API keys kept server-side
 - Authenticated GUI settings with immediate apply and durable, atomic storage
+- Durable background jobs, restart recovery, cancellation, retries, and item history
+- Replacement search/download status tracking
+- Optional per-quality size limits read directly from Radarr and Sonarr
+- Search, sorting, minimum-overage filters, batch selection, and permanent exclusions
+- Brig interface for restoring or purging quarantined files
+- Optional automatic quarantine retention
+- Scheduled scan reports with generic, Discord, or Gotify webhooks
+- Storage access, free-space, and filesystem compatibility checks
+- Installer checks that block normal updates during active file jobs
 
 ## Quick start with Docker Compose
 
@@ -50,6 +60,24 @@ saved; the terminal installer does not need to be restarted.
 The installer is safe to rerun for updates and preserves existing settings. If
 a new storage mount is added to the LXC later, rerun the installer once and it
 will expose the newly detected mount without repeating application setup.
+
+### Update an existing installation
+
+Run the same installer command inside the LXC:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/JediBrooker/Keelhaularr/main/install.sh?v=$(date +%s)" -o /tmp/install-keelhaularr.sh && bash /tmp/install-keelhaularr.sh
+```
+
+Existing settings and the `/config` data are preserved. From version 1.1 onward,
+the installer checks for active file jobs before updating and again after the
+build, before restarting the container. Let those jobs finish, or use
+**Operations → Jobs → Cancel remaining** and wait until cancellation finishes.
+Do not start new jobs while running an update. `FORCE_UPDATE=1` bypasses the
+guard for emergency recovery; unfinished durable jobs resume after restart.
+
+Older versions did not persist in-flight actions. Let any old-version deletion
+finish before installing this release for the first time.
 
 For a Proxmox LXC, enable the required features on the Proxmox host before
 running the installer:
@@ -172,13 +200,60 @@ SONARR_MAX_MB_PER_MIN=85
 SONARR_OVERSIZE_TOLERANCE_GIB=1
 ```
 
+Each application also has a **Use quality-definition limits** toggle in Settings:
+
+```dotenv
+RADARR_USE_ARR_QUALITY_DEFINITIONS=true
+SONARR_USE_ARR_QUALITY_DEFINITIONS=true
+```
+
+When enabled, each file is checked against the maximum MB/min for its actual
+quality in that application's quality definitions. The per-app tolerance still
+applies. If there is no usable matching maximum, Keelhaularr uses its configured
+MB/min fallback; a failed quality-definition request also produces a warning.
+This does not create or modify custom formats, quality profiles, or definitions.
+
 When a selected tracked file is removed, Keelhaularr queues `MoviesSearch` in
 Radarr or `EpisodeSearch` in Sonarr. The replacement is evaluated using the
 quality profiles and definitions already configured in that application.
 
 Sonarr specials are skipped because Sonarr itself does not apply its standard
 runtime-based size check to special releases. Files with unknown runtimes are
-also skipped to avoid false positives.
+also skipped by Sonarr checks. Radarr's runtime fallback is 110 minutes.
+
+## Jobs and replacement tracking
+
+Open **Operations → Jobs** to follow confirmed actions. Work is stored in
+`config/jobs.json` before it starts and runs independently of the browser.
+Closing a tab does not stop a job. The latest 100 jobs are retained, including
+all active jobs, with per-file outcomes and errors.
+
+- **Cancel remaining** stops untouched items. An already-deleted tracked file
+  still gets its replacement search request.
+- **Retry failures** retries failed items without repeating successful ones.
+- Restarting resumes unfinished items. If a delete succeeded but its response
+  was lost, an already-missing original file is accepted and its search resumes.
+- A job is **completed** when its file actions and search requests finish, not
+  when all downloads finish. Expand item progress for separate replacement
+  statuses: searching, download queued, downloaded, no result, or search failed.
+
+Replacement monitoring runs in small rotating batches. Downloads remain under
+Radarr/Sonarr and the download client's control; Keelhaularr cannot guarantee a
+matching release exists. A crash at the moment a search is accepted can cause
+the search to be requested again, but recovery targets the original file ID,
+not a newly imported replacement. Changing an application's URL while a job is
+active withholds that job's actions until the original connection is restored.
+
+## Manifest controls and exclusions
+
+Search by title, quality, or path; filter by application; sort by size, overage,
+title, or orphan age; and set a minimum overage/size in GiB. **Select first 25**
+and **First 100** apply to the current filtered order.
+
+**Exclude selected** permanently hides selected movies or episodes from
+oversize scans, including later replacement files for the same movie/episode.
+Manage or remove these exceptions under **Operations → Exclusions**. Exclusions
+do not disable orphan checks.
 
 ## Orphan scanning
 
@@ -249,6 +324,60 @@ ALLOW_PERMANENT_ORPHAN_DELETE=true
 
 The interface clearly labels the active action and requires a stronger typed
 confirmation for permanent removal.
+
+## The Brig
+
+Open **Operations → Brig** to restore a quarantined file to its original path
+or permanently purge it. Restore refuses to overwrite an existing file. The
+original root must still be available to Keelhaularr. Metadata is retained when
+you change the quarantine folder, so existing recorded files remain manageable.
+
+Quarantine keeps all files indefinitely unless you set a retention period:
+
+```dotenv
+QUARANTINE_RETENTION_DAYS=0
+```
+
+A positive number permanently purges recorded Brig files older than that many
+days. This policy runs independently of scheduled scans. Set it only when you
+want automatic deletion of expired quarantined files. Quarantine on the same
+filesystem does not reclaim disk space until files are purged.
+
+The Brig tracks files quarantined by version 1.1 and later. Files quarantined by
+older versions are left untouched in their existing folders and are not
+automatically imported or purged.
+
+## Scheduled reports and notifications
+
+Configure these in **Settings → Scans & notifications**, then view the latest
+result or run a report now under **Operations → Schedule**:
+
+```dotenv
+SCHEDULE_ENABLED=false
+SCHEDULE_INTERVAL_HOURS=24
+NOTIFICATION_TYPE=generic
+NOTIFICATION_WEBHOOK_URL=
+NOTIFICATION_WHEN_CLEAR=false
+```
+
+Scheduled scans only report findings; they never select oversized/orphan files
+for deletion. Brig retention is a separate opt-in policy. The next run and most
+recent report persist across restarts. Webhook failures are shown in the report
+without discarding scan results.
+
+Webhook types are `generic` (JSON event and report), `discord` (Discord webhook
+URL), and `gotify` (a Gotify message endpoint including its application token).
+Webhook URLs are stored server-side and never returned to the browser. Leave
+the field blank when saving to keep the current URL, or use its removal switch.
+
+## Storage health
+
+**Operations → Storage → Run health check** shows whether each configured root
+exists and is readable/writable, plus available disk space. It also compares
+filesystem device IDs between each application's completed-download folders
+and library roots. Different devices cannot share hardlinks; matching devices
+indicate compatibility, not proof that individual files are currently linked.
+The check does not modify storage or create test files.
 
 ## Security
 

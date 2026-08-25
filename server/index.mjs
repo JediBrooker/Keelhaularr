@@ -4,15 +4,30 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { applyOversized, scanArr } from './arr.mjs';
+import { scanArr } from './arr.mjs';
 import { getConfig, publicConfig } from './config.mjs';
-import { applyOrphans, scanOrphans } from './orphans.mjs';
+import { addExclusions, filterExcluded, listExclusions, removeExclusion } from './exclusions.mjs';
+import {
+  activeJobSummary,
+  cancelJob,
+  createOrphanJob,
+  createOversizeJob,
+  getJob,
+  listJobSummaries,
+  retryJob,
+  startJobWorker,
+  stopJobWorker,
+} from './jobs.mjs';
+import { scanOrphans } from './orphans.mjs';
+import { listQuarantine, purgeQuarantine, reconcileQuarantine, restoreQuarantine } from './quarantine.mjs';
+import { runScheduledScan, scheduleStatus, startScheduler, stopScheduler } from './scheduler.mjs';
 import {
   buildSettingsOverrides,
   getSettingsOverrides,
   saveSettingsOverrides,
   settingsView,
 } from './settings.mjs';
+import { storageHealth } from './storage-health.mjs';
 
 const app = express();
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -127,7 +142,7 @@ app.use('/api', (request, response, next) => {
 
 app.get('/api/status', (request, response) => {
   const config = currentConfig();
-  response.json({ config: publicConfig(config) });
+  response.json({ config: publicConfig(config), jobs: activeJobSummary(), schedule: scheduleStatus(config) });
 });
 
 app.get('/api/settings', (request, response) => {
@@ -216,6 +231,7 @@ app.post('/api/scan', async (request, response, next) => {
     const config = currentConfig();
     const arr = await scanArr(config);
     const orphans = await scanOrphans(config, arr);
+    const oversized = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
     response.json({
       scannedAt: new Date().toISOString(),
       config: publicConfig(config),
@@ -223,8 +239,7 @@ app.post('/api/scan', async (request, response, next) => {
         radarr: { status: arr.radarr.status, version: arr.radarr.version, error: arr.radarr.error },
         sonarr: { status: arr.sonarr.status, version: arr.sonarr.version, error: arr.sonarr.error },
       },
-      oversized: [...arr.radarr.candidates, ...arr.sonarr.candidates]
-        .sort((a, b) => b.overageBytes - a.overageBytes),
+      oversized: oversized.sort((a, b) => b.overageBytes - a.overageBytes),
       orphans: orphans.candidates.sort((a, b) => b.sizeBytes - a.sizeBytes),
       roots: orphans.roots,
       warnings: [...arr.radarr.warnings, ...arr.sonarr.warnings, ...orphans.warnings],
@@ -242,7 +257,8 @@ app.post('/api/oversized/apply', async (request, response, next) => {
       return;
     }
     const config = currentConfig();
-    response.json(await applyOversized(config, ids));
+    const job = await createOversizeJob(config, ids);
+    response.status(202).json({ job });
   } catch (error) {
     next(error);
   }
@@ -255,12 +271,112 @@ app.post('/api/orphans/apply', async (request, response, next) => {
       response.status(400).json({ error: 'Select between 1 and 10,000 orphan files.' });
       return;
     }
-    const config = currentConfig();
-    const arr = await scanArr(config);
-    response.json(await applyOrphans(config, arr, ids));
+    const job = await createOrphanJob(currentConfig(), ids);
+    response.status(202).json({ job });
   } catch (error) {
     next(error);
   }
+});
+
+app.get('/api/jobs', (request, response) => {
+  response.json({ jobs: listJobSummaries() });
+});
+
+app.get('/api/jobs/:id', (request, response) => {
+  const job = getJob(request.params.id);
+  if (!job) return response.status(404).json({ error: 'Job not found.' });
+  response.json({ job });
+});
+
+app.post('/api/jobs/:id/cancel', async (request, response, next) => {
+  try {
+    response.json({ job: await cancelJob(request.params.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/jobs/:id/retry', async (request, response, next) => {
+  try {
+    response.json({ job: await retryJob(request.params.id) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/exclusions', (request, response) => {
+  response.json({ exclusions: listExclusions() });
+});
+
+app.post('/api/exclusions', async (request, response, next) => {
+  try {
+    const ids = Array.isArray(request.body?.ids) ? request.body.ids.filter((id) => typeof id === 'string') : [];
+    if (!ids.length || ids.length > 10000) return response.status(400).json({ error: 'Select between 1 and 10,000 files to exclude.' });
+    const arr = await scanArr(currentConfig());
+    const requested = new Set(ids);
+    const candidates = [...arr.radarr.candidates, ...arr.sonarr.candidates].filter((candidate) => requested.has(candidate.id));
+    if (!candidates.length) return response.status(409).json({ error: 'None of the selected files are still oversized.' });
+    response.json({ exclusions: await addExclusions(candidates) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/exclusions/:id', async (request, response, next) => {
+  try {
+    if (!await removeExclusion(request.params.id)) return response.status(404).json({ error: 'Exclusion not found.' });
+    response.json({ exclusions: listExclusions() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/quarantine', (request, response) => {
+  response.json({ records: listQuarantine() });
+});
+
+app.post('/api/quarantine/:id/restore', async (request, response, next) => {
+  try {
+    const record = await restoreQuarantine(request.params.id);
+    if (!record) return response.status(404).json({ error: 'Quarantine record not found.' });
+    response.json({ record, records: listQuarantine() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/quarantine/:id', async (request, response, next) => {
+  try {
+    const record = await purgeQuarantine(request.params.id);
+    if (!record) return response.status(404).json({ error: 'Quarantine record not found.' });
+    response.json({ record, records: listQuarantine() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/storage/health', async (request, response, next) => {
+  try {
+    response.json(await storageHealth(currentConfig()));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/schedule', (request, response) => {
+  response.json(scheduleStatus(currentConfig()));
+});
+
+app.post('/api/schedule/run', async (request, response, next) => {
+  try {
+    response.json({ report: await runScheduledScan(currentConfig(), 'manual') });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.use('/api', (request, response) => {
+  response.status(404).json({ error: 'API endpoint not found.' });
 });
 
 if (existsSync(distPath)) {
@@ -281,6 +397,14 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   if (!config.password) console.warn('Setup required: set APP_PASSWORD in .env before signing in.');
 });
 
+startJobWorker(currentConfig);
+startScheduler(currentConfig);
+reconcileQuarantine().catch((error) => console.error('Quarantine reconciliation failed:', error));
+
 for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => server.close(() => process.exit(0)));
+  process.on(signal, () => {
+    stopScheduler();
+    stopJobWorker();
+    server.close(() => process.exit(0));
+  });
 }

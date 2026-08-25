@@ -37,6 +37,7 @@ async function walk(root, config, output) {
         sizeBytes: Number(fileStat.size),
         modifiedAt: new Date(Number(fileStat.mtimeMs)).toISOString(),
         identity: `${fileStat.dev}:${fileStat.ino}`,
+        linkCount: Number(fileStat.nlink),
       });
       if (output.length > config.maxFiles) {
         throw new Error(`Orphan scan stopped after exceeding ORPHAN_MAX_FILES=${config.maxFiles}`);
@@ -88,6 +89,7 @@ export async function scanOrphans(config, arrResults) {
           sizeBytes: file.sizeBytes,
           modifiedAt: file.modifiedAt,
           identity: file.identity,
+          linkCount: file.linkCount,
           source: 'library',
         });
       }
@@ -130,6 +132,7 @@ export async function scanOrphans(config, arrResults) {
           sizeBytes: file.sizeBytes,
           modifiedAt: file.modifiedAt,
           identity: file.identity,
+          linkCount: file.linkCount,
           source: 'download',
         });
       }
@@ -150,19 +153,34 @@ async function nextAvailablePath(destination) {
   return `${base}-${Date.now()}${extension}`;
 }
 
-async function quarantineFile(config, candidate) {
-  const timestamp = new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-');
+export function quarantineDestination(config, candidate, token = new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-')) {
   const trashRoot = config.orphanTrashDir ?? path.join(candidate.root, '.keelhaularr-trash');
-  const destination = await nextAvailablePath(
-    path.join(trashRoot, timestamp, candidate.app, candidate.relativePath),
-  );
+  return path.join(trashRoot, token, candidate.app, candidate.relativePath);
+}
+
+async function quarantineFile(config, candidate, requestedDestination = null) {
+  const timestamp = new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-');
+  const destination = requestedDestination ?? await nextAvailablePath(quarantineDestination(config, candidate, timestamp));
   await mkdir(path.dirname(destination), { recursive: true });
   try {
     await rename(candidate.path, destination);
   } catch (error) {
     if (error.code !== 'EXDEV') throw error;
-    await copyFile(candidate.path, destination, constants.COPYFILE_EXCL);
-    await unlink(candidate.path);
+    const partial = `${destination}.keelhaularr-partial`;
+    await unlink(partial).catch((unlinkError) => {
+      if (unlinkError.code !== 'ENOENT') throw unlinkError;
+    });
+    try {
+      await copyFile(candidate.path, partial, constants.COPYFILE_EXCL);
+      const copied = await stat(partial);
+      if (copied.size !== candidate.sizeBytes) throw new Error('Cross-filesystem quarantine copy did not match the source size.');
+      await rename(partial, destination);
+      await unlink(candidate.path);
+    } finally {
+      await unlink(partial).catch((unlinkError) => {
+        if (unlinkError.code !== 'ENOENT') throw unlinkError;
+      });
+    }
   }
   return destination;
 }
@@ -187,26 +205,12 @@ export async function applyOrphans(config, arrResults, requestedIds) {
 
   for (const candidate of selected) {
     try {
-      const resolved = path.resolve(candidate.path);
-      if (!isWithin(candidate.root, resolved)) throw new Error('File escaped its configured scan root');
-      const currentStat = await stat(resolved, { bigint: true });
-      const currentIdentity = `${currentStat.dev}:${currentStat.ino}`;
-      if (currentIdentity !== candidate.identity || Number(currentStat.size) !== candidate.sizeBytes) {
-        throw new Error('File changed after revalidation and was withheld');
-      }
-      let destination = null;
-      if (config.orphanAction === 'permanent') {
-        await unlink(resolved);
-      } else {
-        destination = await quarantineFile(config, candidate);
-      }
-      await removeEmptyParents(candidate);
+      const result = await applyOrphanCandidate(config, candidate);
       results.push({
         id: candidate.id,
         title: candidate.title,
         app: candidate.app,
-        status: config.orphanAction === 'permanent' ? 'deleted' : 'quarantined',
-        destination,
+        ...result,
       });
     } catch (error) {
       results.push({
@@ -220,4 +224,27 @@ export async function applyOrphans(config, arrResults, requestedIds) {
   }
 
   return { requested: requested.size, matched: selected.length, results };
+}
+
+export async function applyOrphanCandidate(config, candidate, requestedDestination = null) {
+  const resolved = path.resolve(candidate.path);
+  if (!isWithin(candidate.root, resolved)) throw new Error('File escaped its configured scan root');
+  const currentStat = await stat(resolved, { bigint: true });
+  const currentIdentity = `${currentStat.dev}:${currentStat.ino}`;
+  if (currentIdentity !== candidate.identity || Number(currentStat.size) !== candidate.sizeBytes
+    || (candidate.linkCount !== undefined && Number(currentStat.nlink) !== candidate.linkCount)
+    || new Date(Number(currentStat.mtimeMs)).toISOString() !== candidate.modifiedAt) {
+    throw new Error('File changed after revalidation and was withheld');
+  }
+  let destination = null;
+  if (config.orphanAction === 'permanent') {
+    await unlink(resolved);
+  } else {
+    destination = await quarantineFile(config, candidate, requestedDestination);
+  }
+  await removeEmptyParents(candidate);
+  return {
+    status: config.orphanAction === 'permanent' ? 'deleted' : 'quarantined',
+    destination,
+  };
 }

@@ -12,6 +12,7 @@ interface ConnectionSettings {
   apiKeyConfigured: boolean;
   maxMbPerMinuteOverride: number | null;
   toleranceGibOverride: number | null;
+  useArrQualityDefinitions: boolean;
   includeUnmonitored: boolean;
   mediaRoots: string[];
   downloadRoots: string[];
@@ -39,6 +40,14 @@ interface SettingsData {
     maxFiles: number;
     mediaExtensions: string[];
     hardlinkMinAgeHours: number;
+    retentionDays: number;
+  };
+  schedule: {
+    enabled: boolean;
+    intervalHours: number;
+    notificationType: 'generic' | 'discord' | 'gotify';
+    webhookConfigured: boolean;
+    notifyWhenClear: boolean;
   };
   server: {
     port: number;
@@ -54,6 +63,7 @@ interface ConnectionForm {
   clearApiKey: boolean;
   maxMbPerMinuteOverride: string;
   toleranceGibOverride: string;
+  useArrQualityDefinitions: boolean;
   includeUnmonitored: boolean;
   mediaRoots: string[];
   downloadRoots: string[];
@@ -83,6 +93,16 @@ interface SettingsForm {
     maxFiles: string;
     mediaExtensionsText: string;
     hardlinkMinAgeHours: string;
+    retentionDays: string;
+  };
+  schedule: {
+    enabled: boolean;
+    intervalHours: string;
+    notificationType: 'generic' | 'discord' | 'gotify';
+    webhookUrl: string;
+    webhookConfigured: boolean;
+    clearWebhook: boolean;
+    notifyWhenClear: boolean;
   };
   server: SettingsData['server'];
 }
@@ -105,6 +125,7 @@ function connectionForm(settings: ConnectionSettings): ConnectionForm {
     clearApiKey: false,
     maxMbPerMinuteOverride: settings.maxMbPerMinuteOverride?.toString() ?? '',
     toleranceGibOverride: settings.toleranceGibOverride?.toString() ?? '',
+    useArrQualityDefinitions: settings.useArrQualityDefinitions,
     includeUnmonitored: settings.includeUnmonitored,
     mediaRoots: settings.mediaRoots,
     downloadRoots: settings.downloadRoots,
@@ -136,6 +157,16 @@ function formFromSettings(settings: SettingsData): SettingsForm {
       maxFiles: settings.orphan.maxFiles.toString(),
       mediaExtensionsText: settings.orphan.mediaExtensions.join(', '),
       hardlinkMinAgeHours: settings.orphan.hardlinkMinAgeHours.toString(),
+      retentionDays: settings.orphan.retentionDays.toString(),
+    },
+    schedule: {
+      enabled: settings.schedule.enabled,
+      intervalHours: settings.schedule.intervalHours.toString(),
+      notificationType: settings.schedule.notificationType,
+      webhookUrl: '',
+      webhookConfigured: settings.schedule.webhookConfigured,
+      clearWebhook: false,
+      notifyWhenClear: settings.schedule.notifyWhenClear,
     },
     server: settings.server,
   };
@@ -214,7 +245,8 @@ function ConnectionSection({ app, form, defaultMax, defaultTolerance, testing, t
         <label className="field wide-field">Server URL<input type="url" value={form.url} onChange={(event) => update('url', event.target.value)} placeholder={`http://${app}:` + (app === 'radarr' ? '7878' : '8989')} /></label>
         <label className="field wide-field">API key<input type="password" value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} autoComplete="off" placeholder={form.apiKeyConfigured ? 'Saved — leave blank to keep it' : 'Enter API key'} /></label>
         {form.apiKeyConfigured && <label className="check-row wide-field"><input type="checkbox" checked={form.clearApiKey} onChange={(event) => update('clearApiKey', event.target.checked)} />Remove the saved {label} API key</label>}
-        <label className="field">MB/min override <span>blank uses {defaultMax}</span><input inputMode="decimal" value={form.maxMbPerMinuteOverride} onChange={(event) => update('maxMbPerMinuteOverride', event.target.value)} placeholder={defaultMax} /></label>
+        <label className="check-row wide-field feature-toggle"><input type="checkbox" checked={form.useArrQualityDefinitions} onChange={(event) => update('useArrQualityDefinitions', event.target.checked)} /><span><strong>Use {label} quality-definition limits</strong><small>Reads the maximum MB/min for each file’s actual quality.</small></span></label>
+        <label className="field">MB/min fallback <span>{form.useArrQualityDefinitions ? `used when ${label} has no matching maximum` : `blank uses ${defaultMax}`}</span><input inputMode="decimal" value={form.maxMbPerMinuteOverride} onChange={(event) => update('maxMbPerMinuteOverride', event.target.value)} placeholder={defaultMax} /></label>
         <label className="field">Tolerance override (GiB) <span>blank uses {defaultTolerance}</span><input inputMode="decimal" value={form.toleranceGibOverride} onChange={(event) => update('toleranceGibOverride', event.target.value)} placeholder={defaultTolerance} /></label>
         <label className="check-row wide-field"><input type="checkbox" checked={form.includeUnmonitored} onChange={(event) => update('includeUnmonitored', event.target.checked)} />Include unmonitored media in oversize checks</label>
         <FolderList title="Library folders" hint={`Detected automatically when you test ${label}`} values={form.mediaRoots} placeholder={app === 'radarr' ? '/data/media/movies' : '/data/media/tv'} addLabel="Add manually" emptyMessage={`Test the ${label} connection to fill this automatically.`} onChange={(next) => update('mediaRoots', next)} />
@@ -244,7 +276,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
       .catch((error) => setLoadingError(error instanceof Error ? error.message : String(error)));
   }, []);
 
-  function updateSection<K extends 'account' | 'defaults' | 'orphan'>(section: K, next: SettingsForm[K]) {
+  function updateSection<K extends 'account' | 'defaults' | 'orphan' | 'schedule'>(section: K, next: SettingsForm[K]) {
     setForm((current) => current ? { ...current, [section]: next } : current);
   }
 
@@ -291,6 +323,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
         clearApiKey: form[app].clearApiKey,
         maxMbPerMinuteOverride: optionalNumeric(form[app].maxMbPerMinuteOverride, `${app} MB/min override`),
         toleranceGibOverride: optionalNumeric(form[app].toleranceGibOverride, `${app} tolerance override`),
+        useArrQualityDefinitions: form[app].useArrQualityDefinitions,
         includeUnmonitored: form[app].includeUnmonitored,
         mediaRoots: form[app].mediaRoots.map((root) => root.trim()).filter(Boolean),
         downloadRoots: form[app].downloadRoots.map((root) => root.trim()).filter(Boolean),
@@ -320,6 +353,15 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
             maxFiles: numeric(form.orphan.maxFiles, 'Maximum orphan scan files'),
             hardlinkMinAgeHours: numeric(form.orphan.hardlinkMinAgeHours, 'Minimum unlinked age'),
             mediaExtensions: listFromText(form.orphan.mediaExtensionsText, /[,\n]/),
+            retentionDays: numeric(form.orphan.retentionDays, 'Quarantine retention'),
+          },
+          schedule: {
+            enabled: form.schedule.enabled,
+            intervalHours: numeric(form.schedule.intervalHours, 'Scheduled scan interval'),
+            notificationType: form.schedule.notificationType,
+            webhookUrl: form.schedule.webhookUrl,
+            clearWebhook: form.schedule.clearWebhook,
+            notifyWhenClear: form.schedule.notifyWhenClear,
           },
         }),
       });
@@ -379,6 +421,19 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
                   <label className="field">Maximum files per orphan scan<input type="number" min="1" max="1000000" value={form.orphan.maxFiles} onChange={(event) => updateSection('orphan', { ...form.orphan, maxFiles: event.target.value })} /></label>
                   <label className="field">Minimum unlinked age (hours) <span>allows completed imports to settle</span><input type="number" min="0" max="8760" step="0.5" value={form.orphan.hardlinkMinAgeHours} onChange={(event) => updateSection('orphan', { ...form.orphan, hardlinkMinAgeHours: event.target.value })} /></label>
                   <label className="field">Media extensions <span>comma separated</span><input value={form.orphan.mediaExtensionsText} onChange={(event) => updateSection('orphan', { ...form.orphan, mediaExtensionsText: event.target.value })} /></label>
+                  <label className="field">Quarantine retention (days) <span>0 keeps files; a positive value automatically deletes expired Brig files</span><input type="number" min="0" max="3650" value={form.orphan.retentionDays} onChange={(event) => updateSection('orphan', { ...form.orphan, retentionDays: event.target.value })} /></label>
+                </div>
+              </section>
+
+              <section className="settings-section">
+                <div className="settings-section-head"><div><p className="eyebrow">WATCH SCHEDULE</p><h3>Scans & notifications</h3></div></div>
+                <div className="settings-grid two">
+                  <label className="check-row feature-toggle wide-field"><input type="checkbox" checked={form.schedule.enabled} onChange={(event) => updateSection('schedule', { ...form.schedule, enabled: event.target.checked })} /><span><strong>Run scheduled scans</strong><small>Reports findings only. Automatic Brig retention is a separate policy.</small></span></label>
+                  <label className="field">Scan every (hours)<input type="number" min="1" max="8760" value={form.schedule.intervalHours} onChange={(event) => updateSection('schedule', { ...form.schedule, intervalHours: event.target.value })} /></label>
+                  <label className="field">Webhook type<select value={form.schedule.notificationType} onChange={(event) => updateSection('schedule', { ...form.schedule, notificationType: event.target.value as SettingsForm['schedule']['notificationType'] })}><option value="generic">Generic JSON</option><option value="discord">Discord</option><option value="gotify">Gotify</option></select></label>
+                  <label className="field wide-field">Notification webhook URL<input type="url" value={form.schedule.webhookUrl} onChange={(event) => updateSection('schedule', { ...form.schedule, webhookUrl: event.target.value })} placeholder={form.schedule.webhookConfigured ? 'Saved — leave blank to keep it' : 'https://…'} /></label>
+                  {form.schedule.webhookConfigured && <label className="check-row"><input type="checkbox" checked={form.schedule.clearWebhook} onChange={(event) => updateSection('schedule', { ...form.schedule, clearWebhook: event.target.checked })} />Remove saved webhook</label>}
+                  <label className="check-row"><input type="checkbox" checked={form.schedule.notifyWhenClear} onChange={(event) => updateSection('schedule', { ...form.schedule, notifyWhenClear: event.target.checked })} />Notify even when no files are found</label>
                 </div>
               </section>
 

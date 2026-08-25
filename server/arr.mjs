@@ -32,7 +32,7 @@ export function mapArrPath(input, pathMaps) {
   return path.resolve(input);
 }
 
-async function arrRequest(connection, endpoint, init = {}) {
+export async function arrRequest(connection, endpoint, init = {}) {
   const response = await fetch(`${connection.url}/api/v3/${endpoint.replace(/^\//, '')}`, {
     ...init,
     signal: AbortSignal.timeout(30000),
@@ -45,11 +45,26 @@ async function arrRequest(connection, endpoint, init = {}) {
   });
   if (!response.ok) {
     const detail = (await response.text()).slice(0, 500);
-    throw new Error(`${connection.kind} returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
+    const error = new Error(`${connection.kind} returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
+    error.statusCode = response.status;
+    throw error;
   }
   if (response.status === 204) return null;
   const text = await response.text();
   return text ? JSON.parse(text) : null;
+}
+
+function qualityMaximum(connection, mediaFile, definitions) {
+  if (!connection.useArrQualityDefinitions) {
+    return { maxMbPerMinute: connection.maxMbPerMinute, limitSource: 'keelhaularr' };
+  }
+  const qualityId = Number(mediaFile?.quality?.quality?.id ?? mediaFile?.quality?.id);
+  const definition = definitions.find((item) => Number(item?.quality?.id) === qualityId);
+  const maximum = Number(definition?.maxSize);
+  if (Number.isFinite(maximum) && maximum > 0) {
+    return { maxMbPerMinute: maximum, limitSource: 'arr-quality-definition' };
+  }
+  return { maxMbPerMinute: connection.maxMbPerMinute, limitSource: 'keelhaularr-fallback' };
 }
 
 async function mapLimit(values, limit, work) {
@@ -82,9 +97,15 @@ export async function scanRadarr(connection) {
   if (!connection.configured) return result;
 
   try {
-    const [movies, status] = await Promise.all([
+    const [movies, status, definitions] = await Promise.all([
       arrRequest(connection, 'movie'),
       arrRequest(connection, 'system/status'),
+      connection.useArrQualityDefinitions
+        ? arrRequest(connection, 'qualitydefinition').catch((error) => {
+          result.warnings.push(`Radarr quality definitions could not be read; using the Keelhaularr fallback limit: ${error.message}`);
+          return [];
+        })
+        : Promise.resolve([]),
     ]);
     result.status = 'connected';
     result.version = status?.version ?? null;
@@ -98,7 +119,8 @@ export async function scanRadarr(connection) {
 
       if (!connection.includeUnmonitored && !movie.monitored) continue;
       const runtimeMinutes = Number(movie.runtime) || 110;
-      const configuredLimitBytes = Math.round(connection.maxMbPerMinute * MIB) * runtimeMinutes;
+      const { maxMbPerMinute, limitSource } = qualityMaximum(connection, mediaFile, definitions);
+      const configuredLimitBytes = Math.round(maxMbPerMinute * MIB) * runtimeMinutes;
       const toleranceBytes = Math.round(connection.toleranceGib * GIB);
       const limitBytes = configuredLimitBytes + toleranceBytes;
       const sizeBytes = Number(mediaFile.size) || 0;
@@ -109,6 +131,7 @@ export async function scanRadarr(connection) {
         app: 'radarr',
         fileId: Number(mediaFile.id),
         searchIds: [Number(movie.id)],
+        exclusionKeys: [`radarr:movie:${movie.id}`],
         title: movie.title ?? 'Unknown movie',
         subtitle: [movie.year, qualityName(mediaFile)].filter(Boolean).join(' · '),
         path: arrPath,
@@ -118,7 +141,8 @@ export async function scanRadarr(connection) {
         limitBytes,
         overageBytes: sizeBytes - limitBytes,
         runtimeMinutes,
-        maxMbPerMinute: connection.maxMbPerMinute,
+        maxMbPerMinute,
+        limitSource,
       });
     }
   } catch (error) {
@@ -141,9 +165,15 @@ export async function scanSonarr(connection) {
   if (!connection.configured) return result;
 
   try {
-    const [seriesList, status] = await Promise.all([
+    const [seriesList, status, definitions] = await Promise.all([
       arrRequest(connection, 'series'),
       arrRequest(connection, 'system/status'),
+      connection.useArrQualityDefinitions
+        ? arrRequest(connection, 'qualitydefinition').catch((error) => {
+          result.warnings.push(`Sonarr quality definitions could not be read; using the Keelhaularr fallback limit: ${error.message}`);
+          return [];
+        })
+        : Promise.resolve([]),
     ]);
     result.status = 'connected';
     result.version = status?.version ?? null;
@@ -186,7 +216,8 @@ export async function scanSonarr(connection) {
           continue;
         }
         const runtimeMinutes = runtimes.reduce((sum, runtime) => sum + runtime, 0);
-        const configuredLimitBytes = Math.round(connection.maxMbPerMinute * MIB) * runtimeMinutes;
+        const { maxMbPerMinute, limitSource } = qualityMaximum(connection, mediaFile, definitions);
+        const configuredLimitBytes = Math.round(maxMbPerMinute * MIB) * runtimeMinutes;
         const toleranceBytes = Math.round(connection.toleranceGib * GIB);
         const limitBytes = configuredLimitBytes + toleranceBytes;
         const sizeBytes = Number(mediaFile.size) || 0;
@@ -199,6 +230,7 @@ export async function scanSonarr(connection) {
           app: 'sonarr',
           fileId: Number(mediaFile.id),
           searchIds: fileEpisodes.map((episode) => Number(episode.id)),
+          exclusionKeys: fileEpisodes.map((episode) => `sonarr:episode:${episode.id}`),
           title: `${series.title ?? 'Unknown series'} · ${code}`,
           subtitle: [firstTitle, qualityName(mediaFile)].filter(Boolean).join(' · '),
           path: arrPath,
@@ -208,7 +240,8 @@ export async function scanSonarr(connection) {
           limitBytes,
           overageBytes: sizeBytes - limitBytes,
           runtimeMinutes,
-          maxMbPerMinute: connection.maxMbPerMinute,
+          maxMbPerMinute,
+          limitSource,
         });
       }
     }
@@ -230,17 +263,54 @@ export async function scanArr(config) {
   return { radarr, sonarr };
 }
 
-async function deleteOne(connection, candidate) {
+export async function deleteCandidate(connection, candidate) {
   const endpoint = candidate.app === 'radarr' ? 'moviefile' : 'episodefile';
   await arrRequest(connection, `${endpoint}/${candidate.fileId}`, { method: 'DELETE' });
 }
 
-async function queueSearch(connection, kind, ids) {
+export async function queueSearch(connection, kind, ids) {
   if (!ids.length) return null;
   const body = kind === 'radarr'
     ? { name: 'MoviesSearch', movieIds: ids }
     : { name: 'EpisodeSearch', episodeIds: ids };
   return arrRequest(connection, 'command', { method: 'POST', body: JSON.stringify(body) });
+}
+
+export async function replacementProgress(connection, candidate, commandId) {
+  let command;
+  try {
+    command = await arrRequest(connection, `command/${commandId}`);
+  } catch (error) {
+    if (error.statusCode !== 404) throw error;
+  }
+  const commandStatus = String(command?.status ?? '').toLowerCase();
+  if (['failed', 'aborted', 'cancelled'].includes(commandStatus)) {
+    return { status: 'search_failed', detail: command?.message ?? command?.errorMessage ?? 'Search command failed.' };
+  }
+  if (command && !['completed', 'complete'].includes(commandStatus)) {
+    return { status: 'searching', detail: commandStatus || 'queued' };
+  }
+
+  const queue = await arrRequest(connection, 'queue/details?all=true').catch(() => []);
+  const records = Array.isArray(queue) ? queue : (queue?.records ?? []);
+  const searchIds = new Set(candidate.searchIds.map(Number));
+  const queued = records.some((record) => candidate.app === 'radarr'
+    ? searchIds.has(Number(record.movieId))
+    : searchIds.has(Number(record.episodeId)) || (record.episodeIds ?? []).some((id) => searchIds.has(Number(id))));
+  if (queued) return { status: 'download_queued', detail: 'A replacement is in the download queue.' };
+
+  if (candidate.app === 'radarr') {
+    const movie = await arrRequest(connection, `movie/${candidate.searchIds[0]}`).catch(() => null);
+    if (movie?.hasFile) return { status: 'downloaded', detail: 'A replacement file is present.' };
+  } else {
+    const episodes = await Promise.all(candidate.searchIds.map((id) => arrRequest(connection, `episode/${id}`).catch(() => null)));
+    if (episodes.length && episodes.every((episode) => episode?.hasFile)) {
+      return { status: 'downloaded', detail: 'Replacement episode file(s) are present.' };
+    }
+  }
+  return command
+    ? { status: 'no_result', detail: 'Search completed with no replacement currently queued.' }
+    : { status: 'unknown', detail: 'No replacement is present and the search command is no longer in history.' };
 }
 
 export async function applyOversized(config, requestedIds) {
@@ -254,7 +324,7 @@ export async function applyOversized(config, requestedIds) {
   for (const candidate of selected) {
     const connection = config[candidate.app];
     try {
-      await deleteOne(connection, candidate);
+      await deleteCandidate(connection, candidate);
       candidate.searchIds.forEach((id) => searchIds[candidate.app].add(id));
       results.push({ id: candidate.id, title: candidate.title, app: candidate.app, status: 'deleted' });
     } catch (error) {

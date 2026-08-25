@@ -79,6 +79,7 @@ function connection(kind, defaults, overrides) {
     maxMbPerMinuteOverride,
     toleranceGib,
     toleranceGibOverride,
+    useArrQualityDefinitions: readBoolean(`${prefix}_USE_ARR_QUALITY_DEFINITIONS`, false, overrides),
     includeUnmonitored: readBoolean(`${prefix}_INCLUDE_UNMONITORED`, false, overrides),
     mediaRoots: readRoots(`${prefix}_MEDIA_ROOTS`, overrides),
     downloadRoots: readRoots(`${prefix}_DOWNLOAD_ROOTS`, overrides),
@@ -121,6 +122,16 @@ export function getConfig(overrides = {}) {
   if (hardlinkMinAgeHours < 0) {
     throw new Error('HARDLINK_MIN_AGE_HOURS cannot be negative');
   }
+  const quarantineRetentionDays = readNumber('QUARANTINE_RETENTION_DAYS', 0, overrides);
+  if (quarantineRetentionDays < 0 || !Number.isInteger(quarantineRetentionDays)) {
+    throw new Error('QUARANTINE_RETENTION_DAYS must be a whole number of zero or more');
+  }
+  const scheduleIntervalHours = readNumber('SCHEDULE_INTERVAL_HOURS', 24, overrides);
+  if (scheduleIntervalHours < 1) throw new Error('SCHEDULE_INTERVAL_HOURS must be at least one hour');
+  const notificationType = (envValue('NOTIFICATION_TYPE', overrides) ?? 'generic').toLowerCase();
+  if (!['generic', 'discord', 'gotify'].includes(notificationType)) {
+    throw new Error('NOTIFICATION_TYPE must be generic, discord, or gotify');
+  }
 
   return {
     port: readNumber('PORT', 8787, overrides),
@@ -143,6 +154,14 @@ export function getConfig(overrides = {}) {
     ignoreDirectories,
     maxFiles: readNumber('ORPHAN_MAX_FILES', 100000, overrides),
     hardlinkMinAgeHours,
+    quarantineRetentionDays,
+    schedule: {
+      enabled: readBoolean('SCHEDULE_ENABLED', false, overrides),
+      intervalHours: scheduleIntervalHours,
+      notificationType,
+      webhookUrl: envValue('NOTIFICATION_WEBHOOK_URL', overrides) ?? '',
+      notifyWhenClear: readBoolean('NOTIFICATION_WHEN_CLEAR', false, overrides),
+    },
     storageRoots: readRoots('STORAGE_ROOTS', overrides),
   };
 }
@@ -152,6 +171,7 @@ export function publicConfig(config) {
     configured: connectionConfig.configured,
     maxMbPerMinute: connectionConfig.maxMbPerMinute,
     toleranceGib: connectionConfig.toleranceGib,
+    useArrQualityDefinitions: connectionConfig.useArrQualityDefinitions,
     includeUnmonitored: connectionConfig.includeUnmonitored,
     mediaRoots: connectionConfig.mediaRoots,
     downloadRoots: connectionConfig.downloadRoots,
@@ -162,6 +182,13 @@ export function publicConfig(config) {
     sonarr: expose(config.sonarr),
     orphanAction: config.orphanAction,
     hardlinkMinAgeHours: config.hardlinkMinAgeHours,
+    quarantineRetentionDays: config.quarantineRetentionDays,
+    schedule: {
+      enabled: config.schedule.enabled,
+      intervalHours: config.schedule.intervalHours,
+      notificationType: config.schedule.notificationType,
+      webhookConfigured: Boolean(config.schedule.webhookUrl),
+    },
     protected: Boolean(config.password),
   };
 }
