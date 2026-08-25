@@ -262,3 +262,22 @@ APP_COOKIE_SECURE=true
 
 Radarr and Sonarr API keys entered in Settings are never returned to the
 browser. Do not commit `.env` or `config/settings.json` to source control.
+
+## Uninstall
+
+Run this inside the Debian LXC:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/JediBrooker/Keelhaularr/main/uninstall.sh?v=$(date +%s)" -o /tmp/uninstall-keelhaularr.sh && bash /tmp/uninstall-keelhaularr.sh
+```
+
+By default, the service, container, network, and locally built image are
+removed, then `/opt/keelhaularr` is moved to a timestamped backup so settings
+and any locally stored quarantine remain recoverable. Docker Engine, other
+containers, mounted media, and external quarantine folders are untouched.
+
+To permanently remove the installation and its local settings instead:
+
+```bash
+bash /tmp/uninstall-keelhaularr.sh --purge
+```
