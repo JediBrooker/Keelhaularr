@@ -28,14 +28,16 @@ it runs.
 Inside a fresh Debian 11, 12, or 13 LXC, paste:
 
 ```bash
-apt-get update && apt-get install -y ca-certificates curl && curl -fsSL https://raw.githubusercontent.com/JediBrooker/Keelhaularr/main/install.sh -o /tmp/install-keelhaularr.sh && bash /tmp/install-keelhaularr.sh
+apt-get update && apt-get install -y ca-certificates curl && curl -fsSL "https://raw.githubusercontent.com/JediBrooker/Keelhaularr/main/install.sh?v=$(date +%s)" -o /tmp/install-keelhaularr.sh && bash /tmp/install-keelhaularr.sh
 ```
 
 The installer uses Docker's official Debian repository, installs Docker Engine
 and the Compose plugin when needed, validates the media mount points, collects
-the login and *arr settings interactively, starts Keelhaularr, and verifies its
-health endpoint. It is safe to rerun for updates and preserves existing
-settings.
+the login and *arr settings interactively, discovers every Radarr and Sonarr
+root folder through their APIs, starts Keelhaularr, and verifies its health
+endpoint. When an API-reported root is mounted at a different path in the LXC,
+the installer asks only for that local mapping. It is safe to rerun for updates
+and preserves existing settings.
 
 For a Proxmox LXC, enable the required features on the Proxmox host before
 running the installer:

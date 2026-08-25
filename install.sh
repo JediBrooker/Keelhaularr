@@ -116,6 +116,70 @@ paths_overlap() {
   [[ "$first" == "$second" || "$first" == "$second"/* || "$second" == "$first"/* ]]
 }
 
+discover_arr_roots() {
+  local label="$1" url="$2" api_key="$3"
+  local -n discovered_roots="$4"
+  local response root
+
+  response="$(curl -fsS --connect-timeout 10 -H "X-Api-Key: $api_key" "${url%/}/api/v3/rootfolder")" || die "Could not read $label root folders. Check its URL, API key, and network access."
+  jq -e 'type == "array"' <<<"$response" >/dev/null || die "$label returned an unexpected root-folder response."
+  mapfile -t discovered_roots < <(jq -r '[.[] | .path? | select(type == "string" and length > 0)] | unique[]' <<<"$response")
+  (( ${#discovered_roots[@]} > 0 )) || die "$label has no configured root folders. Add a media root in $label, then rerun this installer."
+
+  info "$label reported ${#discovered_roots[@]} media root(s):"
+  for root in "${discovered_roots[@]}"; do
+    printf '  %s\n' "$root"
+  done
+}
+
+configure_local_roots() {
+  local label="$1" container_base="$2"
+  local -n reported_roots="$3"
+  local -n local_roots="$4"
+  local -n container_roots="$5"
+  local index arr_root lxc_root docker_root
+
+  local_roots=()
+  container_roots=()
+  for index in "${!reported_roots[@]}"; do
+    arr_root="${reported_roots[$index]}"
+    if [[ "$arr_root" == /* && -d "$arr_root" && -r "$arr_root" && -w "$arr_root" ]]; then
+      lxc_root="$arr_root"
+      info "Using $arr_root directly; it is visible and writable inside this LXC."
+    else
+      LOCAL_MEDIA_PATH=""
+      read_value LOCAL_MEDIA_PATH "$label reports '$arr_root'. Matching library path inside this LXC"
+      lxc_root="$LOCAL_MEDIA_PATH"
+      require_absolute_directory "$label media path" "$lxc_root"
+    fi
+
+    if (( ${#reported_roots[@]} == 1 )); then
+      docker_root="/$container_base"
+    else
+      docker_root="/$container_base-$((index + 1))"
+    fi
+    local_roots+=("$lxc_root")
+    container_roots+=("$docker_root")
+  done
+}
+
+compose_path_settings() {
+  local -n reported_roots="$1"
+  local -n container_roots="$2"
+  local -n roots_result="$3"
+  local -n maps_result="$4"
+  local index separator=''
+
+  roots_result=''
+  maps_result=''
+  for index in "${!reported_roots[@]}"; do
+    roots_result+="${separator}${container_roots[$index]}"
+    maps_result+="${separator}${reported_roots[$index]}=>${container_roots[$index]}"
+    separator=';'
+  done
+  roots_result="${roots_result//;/,}"
+}
+
 is_lxc=false
 if command -v systemd-detect-virt >/dev/null 2>&1 && [[ "$(systemd-detect-virt --container 2>/dev/null || true)" == "lxc" ]]; then
   is_lxc=true
@@ -180,14 +244,14 @@ install_docker() {
   export DEBIAN_FRONTEND=noninteractive
   info "Installing required system tools…"
   apt-get update
-  apt-get install -y ca-certificates curl git openssl
+  apt-get install -y ca-certificates curl git jq openssl
 
   if ! command -v docker >/dev/null 2>&1; then
     info "Installing Docker Engine from Docker's official Debian repository…"
     remove_conflicting_docker_packages || true
     configure_docker_repository
     apt-get update
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin git openssl
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin git jq openssl
   else
     info "Docker CLI is already installed."
   fi
@@ -263,47 +327,47 @@ else
   confirm "Configure Sonarr?" "y" && ENABLE_SONARR=true || ENABLE_SONARR=false
   [[ "$ENABLE_RADARR" == "true" || "$ENABLE_SONARR" == "true" ]] || die "At least one *arr application must be configured."
 
-  RADARR_URL="" RADARR_API_KEY="" RADARR_MEDIA_PATH="" RADARR_REPORTED_PATH=""
-  SONARR_URL="" SONARR_API_KEY="" SONARR_MEDIA_PATH="" SONARR_REPORTED_PATH=""
+  RADARR_URL="" RADARR_API_KEY="" RADARR_MEDIA_ROOTS_VALUE="" RADARR_PATH_MAPS_VALUE=""
+  SONARR_URL="" SONARR_API_KEY="" SONARR_MEDIA_ROOTS_VALUE="" SONARR_PATH_MAPS_VALUE=""
+  declare -a RADARR_REPORTED_PATHS=() RADARR_MEDIA_PATHS=() RADARR_CONTAINER_PATHS=()
+  declare -a SONARR_REPORTED_PATHS=() SONARR_MEDIA_PATHS=() SONARR_CONTAINER_PATHS=()
 
   if [[ "$ENABLE_RADARR" == "true" ]]; then
     printf '\n%sRadarr%s\n' "$BOLD" "$RESET"
     read_value RADARR_URL "Radarr URL reachable from this LXC and Docker (for example http://10.0.0.21:7878)"
     read_value RADARR_API_KEY "Radarr API key: " "" true
-    read_value RADARR_MEDIA_PATH "Movie library path inside this LXC" "/mnt/media/movies"
-    read_value RADARR_REPORTED_PATH "Movie root path as Radarr reports it" "/movies"
     validate_url "Radarr URL" "$RADARR_URL"
     [[ -n "$RADARR_API_KEY" ]] || die "Radarr API key cannot be empty."
-    require_absolute_directory "Radarr media path" "$RADARR_MEDIA_PATH"
-    [[ "$RADARR_REPORTED_PATH" == /* ]] || die "Radarr's reported path must be absolute."
     curl -fsS --connect-timeout 10 -H "X-Api-Key: $RADARR_API_KEY" "${RADARR_URL%/}/api/v3/system/status" >/dev/null || die "Could not authenticate with Radarr from this LXC. Check its URL, API key, and network access."
+    discover_arr_roots "Radarr" "$RADARR_URL" "$RADARR_API_KEY" RADARR_REPORTED_PATHS
+    configure_local_roots "Radarr" "movies" RADARR_REPORTED_PATHS RADARR_MEDIA_PATHS RADARR_CONTAINER_PATHS
+    compose_path_settings RADARR_REPORTED_PATHS RADARR_CONTAINER_PATHS RADARR_MEDIA_ROOTS_VALUE RADARR_PATH_MAPS_VALUE
   fi
 
   if [[ "$ENABLE_SONARR" == "true" ]]; then
     printf '\n%sSonarr%s\n' "$BOLD" "$RESET"
     read_value SONARR_URL "Sonarr URL reachable from this LXC and Docker (for example http://10.0.0.22:8989)"
     read_value SONARR_API_KEY "Sonarr API key: " "" true
-    read_value SONARR_MEDIA_PATH "TV library path inside this LXC" "/mnt/media/tv"
-    read_value SONARR_REPORTED_PATH "TV root path as Sonarr reports it" "/tv"
     validate_url "Sonarr URL" "$SONARR_URL"
     [[ -n "$SONARR_API_KEY" ]] || die "Sonarr API key cannot be empty."
-    require_absolute_directory "Sonarr media path" "$SONARR_MEDIA_PATH"
-    [[ "$SONARR_REPORTED_PATH" == /* ]] || die "Sonarr's reported path must be absolute."
     curl -fsS --connect-timeout 10 -H "X-Api-Key: $SONARR_API_KEY" "${SONARR_URL%/}/api/v3/system/status" >/dev/null || die "Could not authenticate with Sonarr from this LXC. Check its URL, API key, and network access."
+    discover_arr_roots "Sonarr" "$SONARR_URL" "$SONARR_API_KEY" SONARR_REPORTED_PATHS
+    configure_local_roots "Sonarr" "tv" SONARR_REPORTED_PATHS SONARR_MEDIA_PATHS SONARR_CONTAINER_PATHS
+    compose_path_settings SONARR_REPORTED_PATHS SONARR_CONTAINER_PATHS SONARR_MEDIA_ROOTS_VALUE SONARR_PATH_MAPS_VALUE
   fi
 
-  if [[ -n "$RADARR_MEDIA_PATH" && -n "$SONARR_MEDIA_PATH" ]]; then
-    paths_overlap "$RADARR_MEDIA_PATH" "$SONARR_MEDIA_PATH" && die "Radarr and Sonarr media roots must be separate and cannot contain one another."
-  fi
+  ALL_MEDIA_PATHS=("${RADARR_MEDIA_PATHS[@]}" "${SONARR_MEDIA_PATHS[@]}")
+  for ((first_index = 0; first_index < ${#ALL_MEDIA_PATHS[@]}; first_index++)); do
+    for ((second_index = first_index + 1; second_index < ${#ALL_MEDIA_PATHS[@]}; second_index++)); do
+      paths_overlap "${ALL_MEDIA_PATHS[$first_index]}" "${ALL_MEDIA_PATHS[$second_index]}" && die "Media roots must be separate and cannot contain one another: ${ALL_MEDIA_PATHS[$first_index]} and ${ALL_MEDIA_PATHS[$second_index]}"
+    done
+  done
 
   read_value QUARANTINE_PATH "Quarantine path inside this LXC" "/mnt/keelhaularr-quarantine"
   [[ "$QUARANTINE_PATH" == /* && "$QUARANTINE_PATH" != "/" ]] || die "Quarantine must be an absolute path other than /."
-  if [[ -n "$RADARR_MEDIA_PATH" ]]; then
-    paths_overlap "$QUARANTINE_PATH" "$RADARR_MEDIA_PATH" && die "Quarantine cannot be inside, contain, or equal the Radarr media root."
-  fi
-  if [[ -n "$SONARR_MEDIA_PATH" ]]; then
-    paths_overlap "$QUARANTINE_PATH" "$SONARR_MEDIA_PATH" && die "Quarantine cannot be inside, contain, or equal the Sonarr media root."
-  fi
+  for media_path in "${ALL_MEDIA_PATHS[@]}"; do
+    paths_overlap "$QUARANTINE_PATH" "$media_path" && die "Quarantine cannot be inside, contain, or equal a media root: $media_path"
+  done
   install -d -m 0750 "$QUARANTINE_PATH"
   [[ -w "$QUARANTINE_PATH" ]] || die "Quarantine path is not writable: $QUARANTINE_PATH"
 
@@ -321,7 +385,7 @@ else
     printf 'RADARR_URL=%s\n' "$(env_quote "$RADARR_URL")"
     printf 'RADARR_API_KEY=%s\n' "$(env_quote "$RADARR_API_KEY")"
     if [[ "$ENABLE_RADARR" == "true" ]]; then
-      printf 'RADARR_MEDIA_ROOTS=/movies\nRADARR_PATH_MAPS=%s\n' "$(env_quote "${RADARR_REPORTED_PATH}=>/movies")"
+      printf 'RADARR_MEDIA_ROOTS=%s\nRADARR_PATH_MAPS=%s\n' "$(env_quote "$RADARR_MEDIA_ROOTS_VALUE")" "$(env_quote "$RADARR_PATH_MAPS_VALUE")"
     else
       printf 'RADARR_MEDIA_ROOTS=\nRADARR_PATH_MAPS=\n'
     fi
@@ -329,7 +393,7 @@ else
     printf 'SONARR_URL=%s\n' "$(env_quote "$SONARR_URL")"
     printf 'SONARR_API_KEY=%s\n' "$(env_quote "$SONARR_API_KEY")"
     if [[ "$ENABLE_SONARR" == "true" ]]; then
-      printf 'SONARR_MEDIA_ROOTS=/tv\nSONARR_PATH_MAPS=%s\n' "$(env_quote "${SONARR_REPORTED_PATH}=>/tv")"
+      printf 'SONARR_MEDIA_ROOTS=%s\nSONARR_PATH_MAPS=%s\n' "$(env_quote "$SONARR_MEDIA_ROOTS_VALUE")" "$(env_quote "$SONARR_PATH_MAPS_VALUE")"
     else
       printf 'SONARR_MEDIA_ROOTS=\nSONARR_PATH_MAPS=\n'
     fi
@@ -348,10 +412,14 @@ else
     printf '    security_opt:\n      - no-new-privileges:true\n'
     printf '    volumes:\n'
     if [[ "$ENABLE_RADARR" == "true" ]]; then
-      printf '      - type: bind\n        source: %s\n        target: /movies\n' "$(yaml_quote "$RADARR_MEDIA_PATH")"
+      for index in "${!RADARR_MEDIA_PATHS[@]}"; do
+        printf '      - type: bind\n        source: %s\n        target: %s\n' "$(yaml_quote "${RADARR_MEDIA_PATHS[$index]}")" "$(yaml_quote "${RADARR_CONTAINER_PATHS[$index]}")"
+      done
     fi
     if [[ "$ENABLE_SONARR" == "true" ]]; then
-      printf '      - type: bind\n        source: %s\n        target: /tv\n' "$(yaml_quote "$SONARR_MEDIA_PATH")"
+      for index in "${!SONARR_MEDIA_PATHS[@]}"; do
+        printf '      - type: bind\n        source: %s\n        target: %s\n' "$(yaml_quote "${SONARR_MEDIA_PATHS[$index]}")" "$(yaml_quote "${SONARR_CONTAINER_PATHS[$index]}")"
+      done
     fi
     printf '      - type: bind\n        source: %s\n        target: /quarantine\n' "$(yaml_quote "$QUARANTINE_PATH")"
     printf '    healthcheck:\n      test: [CMD, wget, -q, --spider, http://127.0.0.1:8787/api/auth/status]\n'
