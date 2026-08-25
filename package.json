@@ -1,0 +1,32 @@
+{
+  "name": "keelhaularr",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A pirate-themed cargo control deck for oversized and orphaned Radarr/Sonarr media.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n web,api -c cyan,magenta \"vite --host 0.0.0.0\" \"node --watch server/index.mjs\"",
+    "build": "tsc --noEmit && vite build",
+    "start": "node server/index.mjs",
+    "test": "node --test server/*.test.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@openai/sites-vite-plugin": "^0.2.0",
+    "@types/node": "^22.18.0",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.4",
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.2",
+    "vite": "^8.0.13"
+  }
+}

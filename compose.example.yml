@@ -1,0 +1,13 @@
+services:
+  keelhaularr:
+    build: .
+    container_name: keelhaularr
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8787:8787"
+    volumes:
+      # Use the same container paths reported by Radarr and Sonarr where possible.
+      - /path/on/server/movies:/movies
+      - /path/on/server/tv:/tv
+      - /path/on/server/keelhaularr-quarantine:/quarantine
