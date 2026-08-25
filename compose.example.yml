@@ -12,4 +12,7 @@ services:
       # Use the same container paths reported by Radarr and Sonarr where possible.
       - /path/on/server/movies:/movies
       - /path/on/server/tv:/tv
+      # Use separate completed folders for each app. Do not mount incomplete downloads.
+      - /path/on/server/torrents/movies:/radarr-downloads
+      - /path/on/server/torrents/tv:/sonarr-downloads
       - /path/on/server/keelhaularr-quarantine:/quarantine

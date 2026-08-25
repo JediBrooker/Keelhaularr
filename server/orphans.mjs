@@ -31,8 +31,13 @@ async function walk(root, config, output) {
         continue;
       }
       if (!entry.isFile() || !config.extensions.has(path.extname(entry.name).toLowerCase())) continue;
-      const fileStat = await stat(fullPath);
-      output.push({ path: path.resolve(fullPath), sizeBytes: fileStat.size, modifiedAt: fileStat.mtime.toISOString() });
+      const fileStat = await stat(fullPath, { bigint: true });
+      output.push({
+        path: path.resolve(fullPath),
+        sizeBytes: Number(fileStat.size),
+        modifiedAt: new Date(Number(fileStat.mtimeMs)).toISOString(),
+        identity: `${fileStat.dev}:${fileStat.ino}`,
+      });
       if (output.length > config.maxFiles) {
         throw new Error(`Orphan scan stopped after exceeding ORPHAN_MAX_FILES=${config.maxFiles}`);
       }
@@ -48,13 +53,14 @@ export async function scanOrphans(config, arrResults) {
   for (const app of ['radarr', 'sonarr']) {
     const connection = config[app];
     const arrResult = arrResults[app];
-    if (!connection.mediaRoots.length) continue;
+    if (!connection.mediaRoots.length && !connection.downloadRoots.length) continue;
     if (arrResult.status !== 'connected') {
       warnings.push(`${app} orphan scan withheld because ${app} is not connected.`);
       continue;
     }
 
     const known = new Set([...arrResult.knownPaths].map((knownPath) => path.resolve(knownPath)));
+    const libraryIdentities = new Set();
     for (const configuredRoot of connection.mediaRoots) {
       let root;
       try {
@@ -67,8 +73,9 @@ export async function scanOrphans(config, arrResults) {
 
       const files = [];
       await walk(root, config, files);
-      roots.push({ app, path: root, filesScanned: files.length });
+      roots.push({ app, kind: 'library', path: root, filesScanned: files.length });
       for (const file of files) {
+        libraryIdentities.add(file.identity);
         if (known.has(file.path)) continue;
         candidates.push({
           id: orphanId(app, file.path),
@@ -80,6 +87,50 @@ export async function scanOrphans(config, arrResults) {
           root,
           sizeBytes: file.sizeBytes,
           modifiedAt: file.modifiedAt,
+          identity: file.identity,
+          source: 'library',
+        });
+      }
+    }
+
+    const minimumModifiedAt = Date.now() - config.hardlinkMinAgeHours * 60 * 60 * 1000;
+    for (const configuredRoot of connection.downloadRoots) {
+      let root;
+      try {
+        await access(configuredRoot, constants.R_OK);
+        root = path.resolve(configuredRoot);
+      } catch {
+        warnings.push(`${app} download root is not readable: ${configuredRoot}`);
+        continue;
+      }
+
+      const overlapsLibrary = connection.mediaRoots.some((mediaRoot) => {
+        const resolvedMediaRoot = path.resolve(mediaRoot);
+        return root === resolvedMediaRoot || isWithin(root, resolvedMediaRoot) || isWithin(resolvedMediaRoot, root);
+      });
+      if (overlapsLibrary) {
+        warnings.push(`${app} download root overlaps a media root and was skipped: ${root}`);
+        continue;
+      }
+
+      const files = [];
+      await walk(root, config, files);
+      roots.push({ app, kind: 'download', path: root, filesScanned: files.length });
+      for (const file of files) {
+        if (libraryIdentities.has(file.identity)) continue;
+        if (new Date(file.modifiedAt).getTime() > minimumModifiedAt) continue;
+        candidates.push({
+          id: orphanId(app, file.path),
+          app,
+          title: path.basename(file.path),
+          subtitle: `No ${app === 'radarr' ? 'Radarr' : 'Sonarr'} library hardlink`,
+          path: file.path,
+          relativePath: path.relative(root, file.path),
+          root,
+          sizeBytes: file.sizeBytes,
+          modifiedAt: file.modifiedAt,
+          identity: file.identity,
+          source: 'download',
         });
       }
     }
@@ -137,7 +188,12 @@ export async function applyOrphans(config, arrResults, requestedIds) {
   for (const candidate of selected) {
     try {
       const resolved = path.resolve(candidate.path);
-      if (!isWithin(candidate.root, resolved)) throw new Error('File escaped its configured media root');
+      if (!isWithin(candidate.root, resolved)) throw new Error('File escaped its configured scan root');
+      const currentStat = await stat(resolved, { bigint: true });
+      const currentIdentity = `${currentStat.dev}:${currentStat.ino}`;
+      if (currentIdentity !== candidate.identity || Number(currentStat.size) !== candidate.sizeBytes) {
+        throw new Error('File changed after revalidation and was withheld');
+      }
       let destination = null;
       if (config.orphanAction === 'permanent') {
         await unlink(resolved);

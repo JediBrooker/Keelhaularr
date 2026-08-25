@@ -14,6 +14,7 @@ interface ConnectionSettings {
   toleranceGibOverride: number | null;
   includeUnmonitored: boolean;
   mediaRoots: string[];
+  downloadRoots: string[];
   pathMaps: PathMap[];
 }
 
@@ -37,6 +38,7 @@ interface SettingsData {
     ignoreDirectories: string[];
     maxFiles: number;
     mediaExtensions: string[];
+    hardlinkMinAgeHours: number;
   };
   server: {
     port: number;
@@ -53,6 +55,7 @@ interface ConnectionForm {
   toleranceGibOverride: string;
   includeUnmonitored: boolean;
   mediaRootsText: string;
+  downloadRootsText: string;
   pathMapsText: string;
 }
 
@@ -78,6 +81,7 @@ interface SettingsForm {
     ignoreDirectoriesText: string;
     maxFiles: string;
     mediaExtensionsText: string;
+    hardlinkMinAgeHours: string;
   };
   server: SettingsData['server'];
 }
@@ -102,6 +106,7 @@ function connectionForm(settings: ConnectionSettings): ConnectionForm {
     toleranceGibOverride: settings.toleranceGibOverride?.toString() ?? '',
     includeUnmonitored: settings.includeUnmonitored,
     mediaRootsText: settings.mediaRoots.join('\n'),
+    downloadRootsText: settings.downloadRoots.join('\n'),
     pathMapsText: settings.pathMaps.map(({ from, to }) => `${from}=>${to}`).join('\n'),
   };
 }
@@ -129,6 +134,7 @@ function formFromSettings(settings: SettingsData): SettingsForm {
       ignoreDirectoriesText: settings.orphan.ignoreDirectories.join(', '),
       maxFiles: settings.orphan.maxFiles.toString(),
       mediaExtensionsText: settings.orphan.mediaExtensions.join(', '),
+      hardlinkMinAgeHours: settings.orphan.hardlinkMinAgeHours.toString(),
     },
     server: settings.server,
   };
@@ -187,6 +193,8 @@ function ConnectionSection({ app, form, defaultMax, defaultTolerance, testing, t
         <label className="field">Tolerance override (GiB) <span>blank uses {defaultTolerance}</span><input inputMode="decimal" value={form.toleranceGibOverride} onChange={(event) => update('toleranceGibOverride', event.target.value)} placeholder={defaultTolerance} /></label>
         <label className="check-row wide-field"><input type="checkbox" checked={form.includeUnmonitored} onChange={(event) => update('includeUnmonitored', event.target.checked)} />Include unmonitored media in oversize checks</label>
         <label className="field wide-field">Media roots inside Keelhaularr <span>one absolute container path per line</span><textarea rows={3} value={form.mediaRootsText} onChange={(event) => update('mediaRootsText', event.target.value)} placeholder={app === 'radarr' ? '/movies' : '/tv'} /></label>
+        <label className="field wide-field">Completed-download roots inside Keelhaularr <span>hardlink watch · one absolute container path per line</span><textarea rows={3} value={form.downloadRootsText} onChange={(event) => update('downloadRootsText', event.target.value)} placeholder={app === 'radarr' ? '/radarr-downloads' : '/sonarr-downloads'} /></label>
+        <p className="field-hint wide-field">Files here are flagged only when their filesystem identity has no matching hardlink in this app’s media roots and they are older than the global minimum age.</p>
         <label className="field wide-field">Path mappings <span>one /arr/path=&gt;/container/path mapping per line</span><textarea rows={3} value={form.pathMapsText} onChange={(event) => update('pathMapsText', event.target.value)} placeholder={app === 'radarr' ? '/data/media/movies=>/movies' : '/data/media/tv=>/tv'} /></label>
       </div>
     </section>
@@ -249,6 +257,7 @@ export function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSa
         toleranceGibOverride: optionalNumeric(form[app].toleranceGibOverride, `${app} tolerance override`),
         includeUnmonitored: form[app].includeUnmonitored,
         mediaRoots: listFromText(form[app].mediaRootsText, /\n/),
+        downloadRoots: listFromText(form[app].downloadRootsText, /\n/),
         pathMaps: pathMapsFromText(form[app].pathMapsText, app),
       });
       const result = await api<{ settings: SettingsData }>('/api/settings', {
@@ -273,6 +282,7 @@ export function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSa
             allowPermanentDelete: form.orphan.allowPermanentDelete,
             ignoreDirectories: listFromText(form.orphan.ignoreDirectoriesText, /[,\n]/),
             maxFiles: numeric(form.orphan.maxFiles, 'Maximum orphan scan files'),
+            hardlinkMinAgeHours: numeric(form.orphan.hardlinkMinAgeHours, 'Minimum unlinked age'),
             mediaExtensions: listFromText(form.orphan.mediaExtensionsText, /[,\n]/),
           },
         }),
@@ -331,6 +341,7 @@ export function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSa
                   <label className={`check-row danger-check wide-field ${form.orphan.action === 'permanent' ? 'active' : ''}`}><input type="checkbox" checked={form.orphan.allowPermanentDelete} onChange={(event) => updateSection('orphan', { ...form.orphan, allowPermanentDelete: event.target.checked })} />Explicitly allow irreversible orphan deletion</label>
                   <label className="field wide-field">Ignored directory names <span>comma separated</span><textarea rows={2} value={form.orphan.ignoreDirectoriesText} onChange={(event) => updateSection('orphan', { ...form.orphan, ignoreDirectoriesText: event.target.value })} /></label>
                   <label className="field">Maximum files per orphan scan<input type="number" min="1" max="1000000" value={form.orphan.maxFiles} onChange={(event) => updateSection('orphan', { ...form.orphan, maxFiles: event.target.value })} /></label>
+                  <label className="field">Minimum unlinked age (hours) <span>allows completed imports to settle</span><input type="number" min="0" max="8760" step="0.5" value={form.orphan.hardlinkMinAgeHours} onChange={(event) => updateSection('orphan', { ...form.orphan, hardlinkMinAgeHours: event.target.value })} /></label>
                   <label className="field">Media extensions <span>comma separated</span><input value={form.orphan.mediaExtensionsText} onChange={(event) => updateSection('orphan', { ...form.orphan, mediaExtensionsText: event.target.value })} /></label>
                 </div>
               </section>

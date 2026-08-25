@@ -16,6 +16,7 @@ it runs.
 - Multi-episode Sonarr runtime calculations
 - Fresh Radarr/Sonarr searches after tracked files are removed
 - Filesystem orphan scanning against the files actually tracked by each app
+- Inode-based hardlink integrity checks for completed torrent/download folders
 - Recoverable orphan quarantine by default
 - Optional permanent orphan deletion with an explicit server-side enable flag
 - Built-in login, HttpOnly signed sessions, and login rate limiting
@@ -35,8 +36,8 @@ apt-get update && apt-get install -y ca-certificates curl && curl -fsSL "https:/
 The installer uses Docker's official Debian repository, installs Docker Engine
 and the Compose plugin when needed, validates the media mount points, collects
 the login and *arr settings interactively, discovers every Radarr and Sonarr
-root folder through their APIs, starts Keelhaularr, and verifies its health
-endpoint. When an API-reported root is mounted at a different path in the LXC,
+root folder through their APIs, optionally mounts completed-download folders
+for hardlink watch, starts Keelhaularr, and verifies its health endpoint. When an API-reported root is mounted at a different path in the LXC,
 the installer asks only for that local mapping. It is safe to rerun for updates
 and preserves existing settings. After installation, all application settings
 can be changed from the protected Settings interface.
@@ -66,6 +67,9 @@ visible and writable inside it.
    - `RADARR_URL` and `RADARR_API_KEY`
    - `SONARR_URL` and `SONARR_API_KEY`
    - `RADARR_MEDIA_ROOTS` and `SONARR_MEDIA_ROOTS`
+
+   To check completed downloads for broken or stale hardlinks, also set
+   `RADARR_DOWNLOAD_ROOTS` and `SONARR_DOWNLOAD_ROOTS`.
 
 3. Copy and edit the Compose example:
 
@@ -113,7 +117,8 @@ are both served on `PORT`, which defaults to 8787.
 
 After signing in, open **Settings** in the top bar. The interface manages login
 credentials and sessions, shared and per-app size rules, Radarr/Sonarr URLs and
-API keys, unmonitored-media behavior, media roots, path mappings, orphan action
+API keys, unmonitored-media behavior, media roots, completed-download roots,
+hardlink minimum age, path mappings, orphan action
 and safety controls, quarantine, ignored directories, scan limits, and media
 extensions. Connection tests are available before saving.
 
@@ -182,6 +187,36 @@ SONARR_PATH_MAPS=/data/tv=>/tv
 ```
 
 Multiple mappings are separated by semicolons.
+
+### Completed downloads and broken hardlinks
+
+Keelhaularr can also inspect completed torrent or download folders:
+
+```dotenv
+RADARR_DOWNLOAD_ROOTS=/radarr-downloads
+SONARR_DOWNLOAD_ROOTS=/sonarr-downloads
+HARDLINK_MIN_AGE_HOURS=24
+```
+
+The comparison uses the filesystem device and inode—not filenames. A healthy
+hardlink therefore has the same identity and exact size in both the completed
+download folder and the matching application library. If a 35 GiB torrent file
+and a 3.6 GiB Radarr library file have different sizes, they cannot currently
+be hardlinks; the larger file will be shown as a broken-hardlink orphan when no
+other file with its identity exists in the Radarr media roots.
+
+Point these settings only at completed, app-specific folders such as
+`/torrents/movies` and `/torrents/tv`, never an incomplete download directory.
+Newly modified unlinked files are withheld for 24 hours by default so Radarr or
+Sonarr has time to import them. The age is configurable in Settings. A selected
+file is fully rescanned and its inode and size are checked again immediately
+before quarantine or deletion; if a library hardlink appeared in the meantime,
+the download copy is withheld.
+
+Docker can only see host paths that are bind-mounted into it. For installer
+deployments, rerun the one-command installer to add or change completed-download
+mounts. You can then edit their container paths and every other scanner setting
+from the GUI.
 
 The default orphan action is recoverable quarantine:
 

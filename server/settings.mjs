@@ -7,11 +7,11 @@ const SETTINGS_KEYS = new Set([
   'APP_USERNAME', 'APP_PASSWORD', 'APP_SESSION_SECRET', 'APP_SESSION_DAYS', 'APP_COOKIE_SECURE',
   'MAX_MB_PER_MIN', 'OVERSIZE_TOLERANCE_GIB',
   'RADARR_URL', 'RADARR_API_KEY', 'RADARR_MAX_MB_PER_MIN', 'RADARR_OVERSIZE_TOLERANCE_GIB',
-  'RADARR_INCLUDE_UNMONITORED', 'RADARR_MEDIA_ROOTS', 'RADARR_PATH_MAPS',
+  'RADARR_INCLUDE_UNMONITORED', 'RADARR_MEDIA_ROOTS', 'RADARR_DOWNLOAD_ROOTS', 'RADARR_PATH_MAPS',
   'SONARR_URL', 'SONARR_API_KEY', 'SONARR_MAX_MB_PER_MIN', 'SONARR_OVERSIZE_TOLERANCE_GIB',
-  'SONARR_INCLUDE_UNMONITORED', 'SONARR_MEDIA_ROOTS', 'SONARR_PATH_MAPS',
+  'SONARR_INCLUDE_UNMONITORED', 'SONARR_MEDIA_ROOTS', 'SONARR_DOWNLOAD_ROOTS', 'SONARR_PATH_MAPS',
   'ORPHAN_ACTION', 'ORPHAN_TRASH_DIR', 'ALLOW_PERMANENT_ORPHAN_DELETE',
-  'ORPHAN_IGNORE_DIRECTORIES', 'ORPHAN_MAX_FILES', 'MEDIA_EXTENSIONS',
+  'ORPHAN_IGNORE_DIRECTORIES', 'ORPHAN_MAX_FILES', 'MEDIA_EXTENSIONS', 'HARDLINK_MIN_AGE_HOURS',
 ]);
 
 const configDirectory = path.resolve(process.env.CONFIG_DIR || path.join(process.cwd(), 'config'));
@@ -134,11 +134,20 @@ function pathMappings(value, label) {
   });
 }
 
+function pathsOverlap(first, second) {
+  const relative = path.relative(first, second);
+  const reverse = path.relative(second, first);
+  return relative === ''
+    || (!relative.startsWith('..') && !path.isAbsolute(relative))
+    || (!reverse.startsWith('..') && !path.isAbsolute(reverse));
+}
+
 function connectionOverrides(kind, input, output) {
   const label = kind === 'radarr' ? 'Radarr' : 'Sonarr';
   const prefix = kind.toUpperCase();
   const settings = requiredObject(input, label);
   const roots = mediaRoots(settings.mediaRoots, `${label} media roots`);
+  const downloadRoots = mediaRoots(settings.downloadRoots, `${label} completed-download roots`);
   const mappings = pathMappings(settings.pathMaps, `${label} path maps`);
   const apiKey = stringValue(settings.apiKey ?? '', `${label} API key`, { allowEmpty: true, max: 1024 });
   const clearApiKey = booleanValue(settings.clearApiKey ?? false, `${label} clear API key`);
@@ -157,9 +166,11 @@ function connectionOverrides(kind, input, output) {
   )?.toString() ?? '';
   output[`${prefix}_INCLUDE_UNMONITORED`] = String(booleanValue(settings.includeUnmonitored, `${label} include unmonitored`));
   output[`${prefix}_MEDIA_ROOTS`] = roots.join(',');
+  output[`${prefix}_DOWNLOAD_ROOTS`] = downloadRoots.join(',');
   output[`${prefix}_PATH_MAPS`] = mappings.map(({ from, to }) => `${from}=>${to}`).join(';');
   if (apiKey) output[`${prefix}_API_KEY`] = apiKey;
   if (clearApiKey) output[`${prefix}_API_KEY`] = '';
+  return { mediaRoots: roots, downloadRoots };
 }
 
 export function getSettingsOverrides() {
@@ -174,6 +185,7 @@ export function settingsView(config) {
     toleranceGibOverride: value.toleranceGibOverride,
     includeUnmonitored: value.includeUnmonitored,
     mediaRoots: value.mediaRoots,
+    downloadRoots: value.downloadRoots,
     pathMaps: value.pathMaps,
   });
   return {
@@ -193,6 +205,7 @@ export function settingsView(config) {
       ignoreDirectories: config.customIgnoreDirectories,
       maxFiles: config.maxFiles,
       mediaExtensions: config.mediaExtensions,
+      hardlinkMinAgeHours: config.hardlinkMinAgeHours,
     },
     server: {
       port: config.port,
@@ -219,8 +232,21 @@ export function buildSettingsOverrides(input, currentOverrides) {
 
   output.MAX_MB_PER_MIN = numberValue(defaults.maxMbPerMinute, 'Default maximum MB/min', { min: 0.01, max: 10000 }).toString();
   output.OVERSIZE_TOLERANCE_GIB = numberValue(defaults.toleranceGib, 'Default oversize tolerance', { min: 0, max: 1000 }).toString();
-  connectionOverrides('radarr', root.radarr, output);
-  connectionOverrides('sonarr', root.sonarr, output);
+  const radarrPaths = connectionOverrides('radarr', root.radarr, output);
+  const sonarrPaths = connectionOverrides('sonarr', root.sonarr, output);
+  const scanRoots = [
+    ...radarrPaths.mediaRoots.map((value) => ({ label: 'Radarr media root', value })),
+    ...radarrPaths.downloadRoots.map((value) => ({ label: 'Radarr completed-download root', value })),
+    ...sonarrPaths.mediaRoots.map((value) => ({ label: 'Sonarr media root', value })),
+    ...sonarrPaths.downloadRoots.map((value) => ({ label: 'Sonarr completed-download root', value })),
+  ];
+  for (let first = 0; first < scanRoots.length; first += 1) {
+    for (let second = first + 1; second < scanRoots.length; second += 1) {
+      if (pathsOverlap(scanRoots[first].value, scanRoots[second].value)) {
+        inputError(`${scanRoots[first].label} and ${scanRoots[second].label} must be separate and cannot contain one another.`);
+      }
+    }
+  }
 
   const action = stringValue(orphan.action, 'Orphan action');
   if (!['quarantine', 'permanent'].includes(action)) inputError('Orphan action must be quarantine or permanent.');
@@ -244,6 +270,7 @@ export function buildSettingsOverrides(input, currentOverrides) {
   output.ORPHAN_TRASH_DIR = trashDir;
   output.ORPHAN_IGNORE_DIRECTORIES = ignoreDirectories.join(',');
   output.ORPHAN_MAX_FILES = numberValue(orphan.maxFiles, 'Maximum orphan scan files', { min: 1, max: 1000000, integer: true }).toString();
+  output.HARDLINK_MIN_AGE_HOURS = numberValue(orphan.hardlinkMinAgeHours, 'Minimum unlinked age', { min: 0, max: 8760 }).toString();
   output.MEDIA_EXTENSIONS = extensions.join(',');
   return output;
 }

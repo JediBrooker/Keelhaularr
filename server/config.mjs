@@ -81,6 +81,7 @@ function connection(kind, defaults, overrides) {
     toleranceGibOverride,
     includeUnmonitored: readBoolean(`${prefix}_INCLUDE_UNMONITORED`, false, overrides),
     mediaRoots: readRoots(`${prefix}_MEDIA_ROOTS`, overrides),
+    downloadRoots: readRoots(`${prefix}_DOWNLOAD_ROOTS`, overrides),
     pathMaps: readPathMaps(`${prefix}_PATH_MAPS`, overrides),
   };
 }
@@ -116,6 +117,10 @@ export function getConfig(overrides = {}) {
     '@eadir',
     ...customIgnoreDirectories,
   ]);
+  const hardlinkMinAgeHours = readNumber('HARDLINK_MIN_AGE_HOURS', 24, overrides);
+  if (hardlinkMinAgeHours < 0) {
+    throw new Error('HARDLINK_MIN_AGE_HOURS cannot be negative');
+  }
 
   return {
     port: readNumber('PORT', 8787, overrides),
@@ -137,6 +142,7 @@ export function getConfig(overrides = {}) {
     customIgnoreDirectories,
     ignoreDirectories,
     maxFiles: readNumber('ORPHAN_MAX_FILES', 100000, overrides),
+    hardlinkMinAgeHours,
   };
 }
 
@@ -147,12 +153,14 @@ export function publicConfig(config) {
     toleranceGib: connectionConfig.toleranceGib,
     includeUnmonitored: connectionConfig.includeUnmonitored,
     mediaRoots: connectionConfig.mediaRoots,
+    downloadRoots: connectionConfig.downloadRoots,
   });
 
   return {
     radarr: expose(config.radarr),
     sonarr: expose(config.sonarr),
     orphanAction: config.orphanAction,
+    hardlinkMinAgeHours: config.hardlinkMinAgeHours,
     protected: Boolean(config.password),
   };
 }

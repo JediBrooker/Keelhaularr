@@ -10,12 +10,14 @@ interface PublicConnectionConfig {
   toleranceGib: number;
   includeUnmonitored: boolean;
   mediaRoots: string[];
+  downloadRoots: string[];
 }
 
 interface PublicConfig {
   radarr: PublicConnectionConfig;
   sonarr: PublicConnectionConfig;
   orphanAction: 'quarantine' | 'permanent';
+  hardlinkMinAgeHours: number;
   protected: boolean;
 }
 
@@ -44,6 +46,7 @@ interface OrphanItem {
   root: string;
   sizeBytes: number;
   modifiedAt: string;
+  source: 'library' | 'download';
 }
 
 interface ScanData {
@@ -52,7 +55,7 @@ interface ScanData {
   connections: Record<AppKind, { status: string; version: string | null; error: string | null }>;
   oversized: OversizedItem[];
   orphans: OrphanItem[];
-  roots: Array<{ app: AppKind; path: string; filesScanned: number }>;
+  roots: Array<{ app: AppKind; kind: 'library' | 'download'; path: string; filesScanned: number }>;
   warnings: string[];
 }
 
@@ -384,7 +387,7 @@ export default function App() {
         <div><p className="eyebrow">STANDING ORDERS</p><h3>Server-side settings</h3></div>
         {(['radarr', 'sonarr'] as AppKind[]).map((app) => {
           const item = config?.[app];
-          return <article key={app}><AppBadge app={app} /><strong>{item?.maxMbPerMinute ?? '—'} MB/min</strong><span>+ {item?.toleranceGib ?? '—'} GiB tolerance</span><span>{item?.mediaRoots.length ? `${item.mediaRoots.length} media root(s)` : 'orphan scan off'}</span></article>;
+          return <article key={app}><AppBadge app={app} /><strong>{item?.maxMbPerMinute ?? '—'} MB/min</strong><span>+ {item?.toleranceGib ?? '—'} GiB tolerance</span><span>{item?.mediaRoots.length ? `${item.mediaRoots.length} media · ${item.downloadRoots.length} download root(s)` : 'orphan scan off'}</span></article>;
         })}
         <article><span className="app-chip orphan">Orphans</span><strong>{config?.orphanAction ?? '—'}</strong><span>editable from Settings</span></article>
       </section>
@@ -406,5 +409,5 @@ function OversizedTable({ items, selected, onToggle, onToggleAll }: { items: Ove
 }
 
 function OrphanTable({ items, selected, onToggle, onToggleAll, action }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; action: string }) {
-  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked media</th><th>Hold</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title">{item.title}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell">{new Date(item.modifiedAt).toLocaleDateString()}</td><td><span className={`action-chip ${action}`}>{action}</span></td></tr>)}</tbody></table></div>;
+  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked media</th><th>Hold</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title">{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell">{new Date(item.modifiedAt).toLocaleDateString()}</td><td><span className={`action-chip ${action}`}>{action}</span></td></tr>)}</tbody></table></div>;
 }

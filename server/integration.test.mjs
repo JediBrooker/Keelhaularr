@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { link, mkdtemp, mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -56,17 +56,30 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-test-'));
   const moviesRoot = path.join(tempRoot, 'movies');
   const tvRoot = path.join(tempRoot, 'tv');
+  const movieDownloadsRoot = path.join(tempRoot, 'torrents', 'movies');
+  const tvDownloadsRoot = path.join(tempRoot, 'torrents', 'tv');
   const quarantineRoot = path.join(tempRoot, 'quarantine');
   const trackedMovie = path.join(moviesRoot, 'Tracked Movie', 'Tracked.Movie.mkv');
   const orphanMovie = path.join(moviesRoot, 'Orphan Movie', 'Orphan.Movie.mkv');
   const trackedEpisode = path.join(tvRoot, 'Show', 'Season 01', 'Show.S01E01.mkv');
   const orphanEpisode = path.join(tvRoot, 'Lost Show', 'Lost.Show.S01E01.mkv');
+  const linkedMovieDownload = path.join(movieDownloadsRoot, 'Tracked.Movie.Release.mkv');
+  const linkedEpisodeDownload = path.join(tvDownloadsRoot, 'Show.S01E01.Release.mkv');
+  const staleMovieDownload = path.join(movieDownloadsRoot, 'Avatar.Fire.And.Ash.2160p.mkv');
+  const relinkedBeforeApply = path.join(movieDownloadsRoot, 'Relinked.Before.Apply.mkv');
   await Promise.all([
     sparseFile(trackedMovie, 12 * 1024 ** 3),
     sparseFile(orphanMovie, 2 * 1024 ** 2),
     sparseFile(trackedEpisode, 6 * 1024 ** 3),
     sparseFile(orphanEpisode, 3 * 1024 ** 2),
+    sparseFile(staleMovieDownload, 35 * 1024 ** 3),
+    sparseFile(relinkedBeforeApply, 4 * 1024 ** 2),
+    mkdir(tvDownloadsRoot, { recursive: true }),
     mkdir(quarantineRoot, { recursive: true }),
+  ]);
+  await Promise.all([
+    link(trackedMovie, linkedMovieDownload),
+    link(trackedEpisode, linkedEpisodeDownload),
   ]);
 
   const commands = [];
@@ -111,13 +124,16 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     RADARR_URL: `http://127.0.0.1:${mockPort}`,
     RADARR_API_KEY: 'test',
     RADARR_MEDIA_ROOTS: moviesRoot,
+    RADARR_DOWNLOAD_ROOTS: movieDownloadsRoot,
     SONARR_URL: `http://127.0.0.1:${mockPort}`,
     SONARR_API_KEY: 'test',
     SONARR_MEDIA_ROOTS: tvRoot,
+    SONARR_DOWNLOAD_ROOTS: tvDownloadsRoot,
     MAX_MB_PER_MIN: '85',
     OVERSIZE_TOLERANCE_GIB: '1',
     ORPHAN_ACTION: 'quarantine',
     ORPHAN_TRASH_DIR: quarantineRoot,
+    HARDLINK_MIN_AGE_HOURS: '0',
   };
   const child = spawn(process.execPath, ['server/index.mjs'], {
     cwd: path.resolve('.'),
@@ -176,6 +192,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
       toleranceGibOverride: null,
       includeUnmonitored: false,
       mediaRoots: [moviesRoot],
+      downloadRoots: [movieDownloadsRoot],
       pathMaps: [],
     },
     sonarr: {
@@ -186,6 +203,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
       toleranceGibOverride: null,
       includeUnmonitored: false,
       mediaRoots: [tvRoot],
+      downloadRoots: [tvDownloadsRoot],
       pathMaps: [],
     },
     orphan: {
@@ -194,6 +212,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
       allowPermanentDelete: false,
       ignoreDirectories: ['extras', 'trailers'],
       maxFiles: 50000,
+      hardlinkMinAgeHours: 0,
       mediaExtensions: ['mkv', 'mp4'],
     },
   };
@@ -228,7 +247,15 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(scanResponse.status, 200);
   const scan = await scanResponse.json();
   assert.deepEqual(scan.oversized.map((item) => item.app).sort(), ['radarr', 'sonarr']);
-  assert.deepEqual(scan.orphans.map((item) => item.title).sort(), ['Lost.Show.S01E01.mkv', 'Orphan.Movie.mkv']);
+  assert.deepEqual(scan.orphans.map((item) => item.title).sort(), [
+    'Avatar.Fire.And.Ash.2160p.mkv',
+    'Lost.Show.S01E01.mkv',
+    'Orphan.Movie.mkv',
+    'Relinked.Before.Apply.mkv',
+  ]);
+  assert.equal(scan.orphans.find((item) => item.title === 'Avatar.Fire.And.Ash.2160p.mkv').source, 'download');
+  assert.equal(scan.orphans.some((item) => item.title === 'Tracked.Movie.Release.mkv'), false);
+  assert.equal(scan.orphans.some((item) => item.title === 'Show.S01E01.Release.mkv'), false);
 
   const oversized = await request('/api/oversized/apply', { ids: scan.oversized.map((item) => item.id) });
   const oversizedResult = await oversized.json();
@@ -237,11 +264,15 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(deletes.length, 2);
   assert.deepEqual(commands.map((command) => command.name).sort(), ['EpisodeSearch', 'MoviesSearch']);
 
+  const recoveredLibraryPath = path.join(moviesRoot, 'Recovered', 'Relinked.Before.Apply.mkv');
+  await mkdir(path.dirname(recoveredLibraryPath), { recursive: true });
+  await link(relinkedBeforeApply, recoveredLibraryPath);
   const orphans = await request('/api/orphans/apply', { ids: scan.orphans.map((item) => item.id) });
   const orphanResult = await orphans.json();
-  assert.equal(orphanResult.matched, 2);
+  assert.equal(orphanResult.matched, 3);
   assert.equal(orphanResult.results.every((result) => result.status === 'quarantined'), true);
-  assert.equal((await collectFiles(quarantineRoot)).length, 2);
+  assert.equal((await collectFiles(quarantineRoot)).length, 3);
+  assert.equal((await stat(relinkedBeforeApply)).nlink, 2);
 
   const unauthenticated = await fetch(`${base}/api/status`);
   assert.equal(unauthenticated.status, 401);

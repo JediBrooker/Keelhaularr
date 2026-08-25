@@ -31,6 +31,7 @@ yarn-error.log*
 !.env.example
 compose.yml
 compose.settings.yml
+/.installer-download-roots
 /config/
 
 # deployment and generated files

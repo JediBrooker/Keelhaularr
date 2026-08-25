@@ -10,7 +10,7 @@
 .settings-form{display:flex;min-height:0;flex:1;flex-direction:column}.settings-scroll{padding:24px 28px;overflow-y:auto}
 .settings-section{margin-bottom:18px;padding:22px;border:1px solid var(--line);border-radius:15px;background:rgba(255,255,255,.58)}
 .settings-section-head{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:18px}.settings-section-head>div>h3,.deployment-note h3{margin:6px 0 0;font-family:'Fraunces',Georgia,serif;font-size:23px}.settings-section-head .app-chip+h3{display:inline;margin-left:10px;vertical-align:middle}
-.settings-grid{display:grid;gap:16px}.settings-grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}.wide-field{grid-column:1/-1}
+.settings-grid{display:grid;gap:16px}.settings-grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}.wide-field{grid-column:1/-1}.field-hint{margin:-5px 0 0;color:var(--muted);font-size:10px;line-height:1.5}
 .field{display:flex;min-width:0;flex-direction:column;gap:7px;color:#536462;font-size:11px;font-weight:750}.field>span{color:#87918f;font-size:9px;font-weight:600}
 .field input,.field textarea,.field select{width:100%;padding:11px 12px;border:1px solid rgba(16,42,44,.2);border-radius:9px;outline:none;color:var(--ink);background:#fff;font:inherit;font-weight:500}.field textarea{resize:vertical;font-family:'DM Mono',monospace;font-size:11px;line-height:1.5}.field input:focus,.field textarea:focus,.field select:focus{border-color:var(--teal);box-shadow:0 0 0 3px rgba(22,79,82,.1)}
 .check-stack{display:flex;flex-direction:column;justify-content:center;gap:12px}.check-row{display:flex;align-items:center;gap:9px;color:#536462;font-size:11px;font-weight:700}.check-row input{flex:0 0 auto}

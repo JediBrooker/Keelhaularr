@@ -76,11 +76,81 @@ confirm() {
 
 require_absolute_directory() {
   local label="$1" directory="$2"
+  [[ "$directory" != *$'\n'* && "$directory" != *$'\r'* && "$directory" != *$'\t'* && "$directory" != *,* ]] || die "$label cannot contain line breaks, tabs, or commas."
   [[ "$directory" == /* ]] || die "$label must be an absolute path."
   [[ "$directory" != "/" ]] || die "$label cannot be the filesystem root."
   [[ -d "$directory" ]] || die "$label does not exist: $directory. Add the Proxmox mount point, then rerun the installer."
   [[ -r "$directory" ]] || die "$label is not readable: $directory"
   [[ -w "$directory" ]] || die "$label is not writable: $directory. Write access is required for orphan handling."
+}
+
+configure_download_roots() {
+  local label="$1" container_base="$2"
+  local -n local_roots="$3"
+  local -n container_roots="$4"
+  local download_root docker_root
+
+  confirm "Scan completed $label download folders for broken library hardlinks?" "y" || return 0
+  while :; do
+    DOWNLOAD_ROOT=""
+    read_value DOWNLOAD_ROOT "$label completed-download path inside this LXC"
+    download_root="$DOWNLOAD_ROOT"
+    require_absolute_directory "$label completed-download path" "$download_root"
+    if (( ${#local_roots[@]} == 0 )); then
+      docker_root="/$container_base"
+    else
+      docker_root="/$container_base-$(( ${#local_roots[@]} + 1 ))"
+    fi
+    local_roots+=("$download_root")
+    container_roots+=("$docker_root")
+    confirm "Add another $label completed-download folder?" "n" || break
+  done
+}
+
+join_csv() {
+  local -n values="$1"
+  local -n result="$2"
+  local old_ifs="$IFS"
+  IFS=,
+  result="${values[*]}"
+  IFS="$old_ifs"
+}
+
+validate_separate_paths() {
+  local -n values="$1"
+  local first second
+  for ((first = 0; first < ${#values[@]}; first++)); do
+    for ((second = first + 1; second < ${#values[@]}; second++)); do
+      paths_overlap "${values[$first]}" "${values[$second]}" && die "Scan roots must be separate and cannot contain one another: ${values[$first]} and ${values[$second]}"
+    done
+  done
+}
+
+load_download_root_state() {
+  local state_path="$1" kind source target
+  [[ -s "$state_path" ]] || return 0
+  while IFS=$'\t' read -r kind source target; do
+    [[ -n "$kind" && -n "$source" && -n "$target" ]] || continue
+    require_absolute_directory "Saved $kind completed-download path" "$source"
+    case "$kind" in
+      radarr) RADARR_DOWNLOAD_PATHS+=("$source"); RADARR_DOWNLOAD_CONTAINER_PATHS+=("$target") ;;
+      sonarr) SONARR_DOWNLOAD_PATHS+=("$source"); SONARR_DOWNLOAD_CONTAINER_PATHS+=("$target") ;;
+      *) die "Invalid entry in $state_path" ;;
+    esac
+  done <"$state_path"
+}
+
+save_download_root_state() {
+  local state_path="$1" index
+  {
+    for index in "${!RADARR_DOWNLOAD_PATHS[@]}"; do
+      printf 'radarr\t%s\t%s\n' "${RADARR_DOWNLOAD_PATHS[$index]}" "${RADARR_DOWNLOAD_CONTAINER_PATHS[$index]}"
+    done
+    for index in "${!SONARR_DOWNLOAD_PATHS[@]}"; do
+      printf 'sonarr\t%s\t%s\n' "${SONARR_DOWNLOAD_PATHS[$index]}" "${SONARR_DOWNLOAD_CONTAINER_PATHS[$index]}"
+    done
+  } >"$state_path"
+  chmod 600 "$state_path"
 }
 
 validate_url() {
@@ -301,15 +371,28 @@ fi
 cd "$INSTALL_DIR"
 
 install -d -m 0700 "$INSTALL_DIR/config"
-{
-  printf 'services:\n  keelhaularr:\n    environment:\n      CONFIG_DIR: /config\n'
-  printf '    volumes:\n      - type: bind\n        source: %s\n        target: /config\n' "$(yaml_quote "$INSTALL_DIR/config")"
-} >compose.settings.yml
-chmod 600 compose.settings.yml
+DOWNLOAD_STATE_PATH="$INSTALL_DIR/.installer-download-roots"
+declare -a RADARR_DOWNLOAD_PATHS=() RADARR_DOWNLOAD_CONTAINER_PATHS=()
+declare -a SONARR_DOWNLOAD_PATHS=() SONARR_DOWNLOAD_CONTAINER_PATHS=()
+load_download_root_state "$DOWNLOAD_STATE_PATH"
 COMPOSE_FILES=(-f compose.yml -f compose.settings.yml)
 
 if [[ -s .env && -s compose.yml ]]; then
   info "Existing settings found; leaving .env and compose.yml unchanged."
+  if (( ${#RADARR_DOWNLOAD_PATHS[@]} + ${#SONARR_DOWNLOAD_PATHS[@]} > 0 )); then
+    info "Reusing saved completed-download mounts."
+    change_download_roots=false
+    confirm "Change the completed-download mounts used by hardlink watch?" "n" && change_download_roots=true
+  else
+    change_download_roots=false
+    confirm "Configure completed-download mounts for hardlink watch?" "y" && change_download_roots=true
+  fi
+  if [[ "$change_download_roots" == "true" ]]; then
+    RADARR_DOWNLOAD_PATHS=() RADARR_DOWNLOAD_CONTAINER_PATHS=()
+    SONARR_DOWNLOAD_PATHS=() SONARR_DOWNLOAD_CONTAINER_PATHS=()
+    configure_download_roots "Radarr" "radarr-downloads" RADARR_DOWNLOAD_PATHS RADARR_DOWNLOAD_CONTAINER_PATHS
+    configure_download_roots "Sonarr" "sonarr-downloads" SONARR_DOWNLOAD_PATHS SONARR_DOWNLOAD_CONTAINER_PATHS
+  fi
   if ! confirm "Build and restart Keelhaularr with the existing settings?" "y"; then
     exit 0
   fi
@@ -350,6 +433,7 @@ else
     discover_arr_roots "Radarr" "$RADARR_URL" "$RADARR_API_KEY" RADARR_REPORTED_PATHS
     configure_local_roots "Radarr" "movies" RADARR_REPORTED_PATHS RADARR_MEDIA_PATHS RADARR_CONTAINER_PATHS
     compose_path_settings RADARR_REPORTED_PATHS RADARR_CONTAINER_PATHS RADARR_MEDIA_ROOTS_VALUE RADARR_PATH_MAPS_VALUE
+    configure_download_roots "Radarr" "radarr-downloads" RADARR_DOWNLOAD_PATHS RADARR_DOWNLOAD_CONTAINER_PATHS
   fi
 
   if [[ "$ENABLE_SONARR" == "true" ]]; then
@@ -362,19 +446,17 @@ else
     discover_arr_roots "Sonarr" "$SONARR_URL" "$SONARR_API_KEY" SONARR_REPORTED_PATHS
     configure_local_roots "Sonarr" "tv" SONARR_REPORTED_PATHS SONARR_MEDIA_PATHS SONARR_CONTAINER_PATHS
     compose_path_settings SONARR_REPORTED_PATHS SONARR_CONTAINER_PATHS SONARR_MEDIA_ROOTS_VALUE SONARR_PATH_MAPS_VALUE
+    configure_download_roots "Sonarr" "sonarr-downloads" SONARR_DOWNLOAD_PATHS SONARR_DOWNLOAD_CONTAINER_PATHS
   fi
 
   ALL_MEDIA_PATHS=("${RADARR_MEDIA_PATHS[@]}" "${SONARR_MEDIA_PATHS[@]}")
-  for ((first_index = 0; first_index < ${#ALL_MEDIA_PATHS[@]}; first_index++)); do
-    for ((second_index = first_index + 1; second_index < ${#ALL_MEDIA_PATHS[@]}; second_index++)); do
-      paths_overlap "${ALL_MEDIA_PATHS[$first_index]}" "${ALL_MEDIA_PATHS[$second_index]}" && die "Media roots must be separate and cannot contain one another: ${ALL_MEDIA_PATHS[$first_index]} and ${ALL_MEDIA_PATHS[$second_index]}"
-    done
-  done
+  ALL_SCAN_PATHS=("${ALL_MEDIA_PATHS[@]}" "${RADARR_DOWNLOAD_PATHS[@]}" "${SONARR_DOWNLOAD_PATHS[@]}")
+  validate_separate_paths ALL_SCAN_PATHS
 
   read_value QUARANTINE_PATH "Quarantine path inside this LXC" "/mnt/keelhaularr-quarantine"
   [[ "$QUARANTINE_PATH" == /* && "$QUARANTINE_PATH" != "/" ]] || die "Quarantine must be an absolute path other than /."
-  for media_path in "${ALL_MEDIA_PATHS[@]}"; do
-    paths_overlap "$QUARANTINE_PATH" "$media_path" && die "Quarantine cannot be inside, contain, or equal a media root: $media_path"
+  for media_path in "${ALL_SCAN_PATHS[@]}"; do
+    paths_overlap "$QUARANTINE_PATH" "$media_path" && die "Quarantine cannot be inside, contain, or equal a scan root: $media_path"
   done
   install -d -m 0750 "$QUARANTINE_PATH"
   [[ -w "$QUARANTINE_PATH" ]] || die "Quarantine path is not writable: $QUARANTINE_PATH"
@@ -407,6 +489,7 @@ else
     fi
     printf 'SONARR_INCLUDE_UNMONITORED=false\n'
     printf 'ORPHAN_ACTION=quarantine\nORPHAN_TRASH_DIR=/quarantine\n'
+    printf 'HARDLINK_MIN_AGE_HOURS=24\n'
     printf 'ORPHAN_IGNORE_DIRECTORIES=extras,featurettes,trailers,samples\n'
     printf 'ORPHAN_MAX_FILES=100000\nPORT=8787\n'
   } >.env
@@ -436,6 +519,26 @@ else
   } >compose.yml
   chmod 600 compose.yml
 fi
+
+ALL_DOWNLOAD_PATHS=("${RADARR_DOWNLOAD_PATHS[@]}" "${SONARR_DOWNLOAD_PATHS[@]}")
+validate_separate_paths ALL_DOWNLOAD_PATHS
+save_download_root_state "$DOWNLOAD_STATE_PATH"
+RADARR_DOWNLOAD_ROOTS_VALUE="" SONARR_DOWNLOAD_ROOTS_VALUE=""
+join_csv RADARR_DOWNLOAD_CONTAINER_PATHS RADARR_DOWNLOAD_ROOTS_VALUE
+join_csv SONARR_DOWNLOAD_CONTAINER_PATHS SONARR_DOWNLOAD_ROOTS_VALUE
+{
+  printf 'services:\n  keelhaularr:\n    environment:\n      CONFIG_DIR: /config\n'
+  printf '      RADARR_DOWNLOAD_ROOTS: %s\n' "$(yaml_quote "$RADARR_DOWNLOAD_ROOTS_VALUE")"
+  printf '      SONARR_DOWNLOAD_ROOTS: %s\n' "$(yaml_quote "$SONARR_DOWNLOAD_ROOTS_VALUE")"
+  printf '    volumes:\n      - type: bind\n        source: %s\n        target: /config\n' "$(yaml_quote "$INSTALL_DIR/config")"
+  for index in "${!RADARR_DOWNLOAD_PATHS[@]}"; do
+    printf '      - type: bind\n        source: %s\n        target: %s\n' "$(yaml_quote "${RADARR_DOWNLOAD_PATHS[$index]}")" "$(yaml_quote "${RADARR_DOWNLOAD_CONTAINER_PATHS[$index]}")"
+  done
+  for index in "${!SONARR_DOWNLOAD_PATHS[@]}"; do
+    printf '      - type: bind\n        source: %s\n        target: %s\n' "$(yaml_quote "${SONARR_DOWNLOAD_PATHS[$index]}")" "$(yaml_quote "${SONARR_DOWNLOAD_CONTAINER_PATHS[$index]}")"
+  done
+} >compose.settings.yml
+chmod 600 compose.settings.yml
 
 info "Building and starting Keelhaularr…"
 docker compose "${COMPOSE_FILES[@]}" up -d --build
