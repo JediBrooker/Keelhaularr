@@ -246,7 +246,7 @@ else
   read_value APP_USERNAME "Login username" "captain"
   while :; do
     read_value APP_PASSWORD "Login password: " "" true
-    [[ ${#APP_PASSWORD} -ge 12 ]] || { warn "Use at least 12 characters."; APP_PASSWORD=""; continue; }
+    [[ -n "$APP_PASSWORD" ]] || { warn "Password cannot be empty."; APP_PASSWORD=""; continue; }
     read_value APP_PASSWORD_CONFIRM "Confirm login password: " "" true
     [[ "$APP_PASSWORD" == "$APP_PASSWORD_CONFIRM" ]] && break
     warn "Passwords did not match."
