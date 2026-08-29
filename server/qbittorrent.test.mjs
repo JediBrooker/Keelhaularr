@@ -272,6 +272,92 @@ test('path mapping uses the longest matching prefix and normalizes Windows separ
   );
 });
 
+test('metadata-pending torrents are described without counting as unmapped while other missing paths fail closed', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (input) => {
+    const endpoint = new URL(input).pathname;
+    if (endpoint === '/api/v2/auth/login') return new Response('Ok.', { headers: { 'Set-Cookie': 'SID=test' } });
+    if (endpoint === '/api/v2/app/version') return new Response('5.2.0');
+    if (endpoint === '/api/v2/torrents/info') return Response.json([
+      { hash: 'metadata-hash', name: 'Fetching metadata', state: 'metaDL', progress: 0, amount_left: 1 },
+      { hash: 'forced-metadata-hash', name: 'Forced metadata', state: 'forcedMetaDL', progress: 0, amount_left: 1 },
+      { hash: 'missing-path-hash', name: 'Queued without a path', state: 'queuedDL', progress: 0.2, amount_left: 80 },
+      { hash: 'mapped-hash', name: 'Mapped download', state: 'downloading', progress: 0.4, amount_left: 60, content_path: '/remote/downloads/mapped' },
+    ]);
+    if (endpoint === '/api/v2/auth/logout') return new Response('');
+    return new Response(null, { status: 404 });
+  };
+
+  const snapshot = await inspectQbittorrent(connection());
+
+  assert.equal(snapshot.incompleteTorrentCount, 4);
+  assert.deepEqual(snapshot.incompletePaths, [path.resolve('/data/downloads/mapped')]);
+  assert.equal(snapshot.metadataPendingCount, 2);
+  assert.deepEqual(snapshot.metadataPendingTorrents, [
+    {
+      name: 'Fetching metadata',
+      hash: 'metadata-hash',
+      hashPrefix: 'metadata-has',
+      state: 'metaDL',
+      reason: 'metadata-pending',
+      rawPath: null,
+    },
+    {
+      name: 'Forced metadata',
+      hash: 'forced-metadata-hash',
+      hashPrefix: 'forced-metad',
+      state: 'forcedMetaDL',
+      reason: 'metadata-pending',
+      rawPath: null,
+    },
+  ]);
+  assert.equal(snapshot.metadataPendingOmittedCount, 0);
+  assert.equal(snapshot.unmappedIncompleteCount, 1);
+  assert.deepEqual(snapshot.unresolvedIncompleteTorrents, [{
+    name: 'Queued without a path',
+    hash: 'missing-path-hash',
+    hashPrefix: 'missing-path',
+    state: 'queuedDL',
+    reason: 'missing-content-path',
+    rawPath: null,
+  }]);
+});
+
+test('unresolved inspection details are bounded and strip control characters', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  const torrents = Array.from({ length: 103 }, (_, index) => ({
+    hash: `${index}\u0000${'h'.repeat(200)}`,
+    name: `Unsafe\nname ${index} ${'n'.repeat(300)}`,
+    state: `queuedDL\t${'s'.repeat(100)}`,
+    progress: 0.1,
+    amount_left: 90,
+    ...(index === 0 ? { content_path: `relative\n${'p'.repeat(5000)}` } : {}),
+  }));
+  globalThis.fetch = async (input) => {
+    const endpoint = new URL(input).pathname;
+    if (endpoint === '/api/v2/auth/login') return new Response('Ok.', { headers: { 'Set-Cookie': 'SID=test' } });
+    if (endpoint === '/api/v2/app/version') return new Response('5.2.0');
+    if (endpoint === '/api/v2/torrents/info') return Response.json(torrents);
+    if (endpoint === '/api/v2/auth/logout') return new Response('');
+    return new Response(null, { status: 404 });
+  };
+
+  const snapshot = await inspectQbittorrent(connection());
+  const first = snapshot.unresolvedIncompleteTorrents[0];
+
+  assert.equal(snapshot.unmappedIncompleteCount, 103);
+  assert.equal(snapshot.unresolvedIncompleteTorrents.length, snapshot.detailLimit);
+  assert.equal(snapshot.unresolvedIncompleteOmittedCount, 3);
+  assert.equal(first.reason, 'unmappable-content-path');
+  assert.equal(first.name.length, 256);
+  assert.equal(first.hash.length, 128);
+  assert.equal(first.state.length, 64);
+  assert.equal(first.rawPath.length, 4096);
+  assert.doesNotMatch(`${first.name}${first.hash}${first.state}${first.rawPath}`, /[\u0000-\u001f\u007f]/);
+});
+
 test('malformed torrent progress is treated as incomplete and fails closed without a content path', async (context) => {
   const originalFetch = globalThis.fetch;
   context.after(() => { globalThis.fetch = originalFetch; });

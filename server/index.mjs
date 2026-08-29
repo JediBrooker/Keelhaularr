@@ -202,6 +202,31 @@ app.get('/api/settings/qbittorrent/categories', async (request, response, next) 
   }
 });
 
+app.get('/api/qbittorrent/status', async (request, response, next) => {
+  try {
+    const connection = currentConfig().qbittorrent;
+    if (!connection.configured) {
+      const error = new Error('qBittorrent is not configured.');
+      error.statusCode = 400;
+      throw error;
+    }
+    const snapshot = await inspectQbittorrent(connection);
+    const version = typeof snapshot.version === 'string'
+      ? snapshot.version.replace(/[\u0000-\u001f\u007f]/g, '�').slice(0, 64)
+      : null;
+    response.json({
+      status: snapshot.status,
+      version,
+      totalTorrentCount: snapshot.totalTorrentCount,
+      incompleteTorrentCount: snapshot.incompleteTorrentCount,
+      metadataPendingCount: snapshot.metadataPendingCount,
+      unresolvedIncompleteCount: snapshot.unmappedIncompleteCount,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/qbittorrent/recovery/status', (request, response) => {
   response.json(qbittorrentRecoveryStatus(currentConfig()));
 });
@@ -310,6 +335,7 @@ app.post('/api/scan', async (request, response, next) => {
       oversized: oversized.sort((a, b) => b.overageBytes - a.overageBytes),
       orphans: orphans.candidates.sort((a, b) => b.sizeBytes - a.sizeBytes),
       roots: orphans.roots,
+      qbittorrentSafety: orphans.qbittorrentSafety,
       warnings: [...arr.radarr.warnings, ...arr.sonarr.warnings, ...orphans.warnings],
     });
   } catch (error) {

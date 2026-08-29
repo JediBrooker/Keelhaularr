@@ -106,6 +106,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const deletes = [];
   const notifications = [];
   const qbittorrentLogins = [];
+  let qbittorrentTorrents = [];
   const commandStates = new Map();
   let nextCommandId = 54;
   let movieDeleted = false;
@@ -136,7 +137,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
         'Kids Movies': { savePath: '/downloads/kids' },
         'do-not-touch': { savePath: '' },
       };
-    } else if (request.method === 'GET' && url.pathname === '/api/v2/torrents/info') value = [];
+    } else if (request.method === 'GET' && url.pathname === '/api/v2/torrents/info') value = qbittorrentTorrents;
     else if (request.method === 'POST' && url.pathname === '/api/v2/auth/logout') {
       response.writeHead(204).end();
       return;
@@ -251,6 +252,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   });
   assert.deepEqual(initialSettings.server.storageRoots, [moviesRoot, tvRoot]);
   assert.equal((await fetch(`${base}/api/settings/qbittorrent/categories`)).status, 401);
+  assert.equal((await fetch(`${base}/api/qbittorrent/status`)).status, 401);
   assert.equal((await fetch(`${base}/api/qbittorrent/recovery/status`)).status, 401);
 
   const directoryUrl = `${base}/api/storage/directories?path=${encodeURIComponent(`${moviesRoot}/`)}`;
@@ -463,6 +465,42 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     { name: 'do-not-touch', savePath: '' },
   ]);
 
+  qbittorrentTorrents = [
+    {
+      hash: 'integration-metadata-hash',
+      name: 'Integration metadata release',
+      category: 'Kids Movies',
+      state: 'metaDL',
+      dlspeed: 0,
+      progress: 0,
+      amount_left: 1,
+      added_on: 1,
+      last_activity: 1,
+    },
+    {
+      hash: 'integration-forced-metadata-hash',
+      name: 'Integration forced metadata release',
+      category: 'Kids Movies',
+      state: 'forcedMetaDL',
+      dlspeed: 0,
+      progress: 0,
+      amount_left: 1,
+      added_on: 1,
+      last_activity: 1,
+    },
+  ];
+  const qbittorrentStatusResponse = await fetch(`${base}/api/qbittorrent/status`, {
+    headers: { Cookie: cookie },
+  });
+  assert.equal(qbittorrentStatusResponse.status, 200);
+  assert.deepEqual(await qbittorrentStatusResponse.json(), {
+    status: 'connected',
+    version: '5.2.0',
+    totalTorrentCount: 2,
+    incompleteTorrentCount: 2,
+    metadataPendingCount: 2,
+    unresolvedIncompleteCount: 0,
+  });
   const scanResponse = await request('/api/scan');
   assert.equal(scanResponse.status, 200);
   const scan = await scanResponse.json();
@@ -478,6 +516,28 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(scan.orphans.find((item) => item.title === 'Avatar.Fire.And.Ash.2160p.mkv').source, 'download');
   assert.equal(scan.orphans.some((item) => item.title === 'Tracked.Movie.Release.mkv'), false);
   assert.equal(scan.orphans.some((item) => item.title === 'Show.S01E01.Release.mkv'), false);
+  assert.equal(scan.qbittorrentSafety.checked, true);
+  assert.equal(scan.qbittorrentSafety.metadataPendingCount, 2);
+  assert.equal(scan.qbittorrentSafety.unresolvedIncompleteCount, 0);
+  assert.deepEqual(scan.qbittorrentSafety.metadataPendingTorrents.map(({ name, hash, hashPrefix, state, reason, rawPath }) => ({ name, hash, hashPrefix, state, reason, rawPath })), [
+    {
+      name: 'Integration metadata release',
+      hash: 'integration-metadata-hash',
+      hashPrefix: 'integration-',
+      state: 'metaDL',
+      reason: 'metadata-pending',
+      rawPath: null,
+    },
+    {
+      name: 'Integration forced metadata release',
+      hash: 'integration-forced-metadata-hash',
+      hashPrefix: 'integration-',
+      state: 'forcedMetaDL',
+      reason: 'metadata-pending',
+      rawPath: null,
+    },
+  ]);
+  assert.equal(scan.warnings.some((warning) => /qBittorrent/.test(warning)), false);
 
   const exclusionResponse = await request('/api/exclusions', { ids: [scan.oversized[0].id] });
   assert.equal(exclusionResponse.status, 200);

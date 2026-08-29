@@ -1,5 +1,12 @@
 import path from 'node:path';
 
+const MAX_INSPECTION_DETAILS = 100;
+const MAX_TORRENT_NAME_LENGTH = 256;
+const MAX_TORRENT_HASH_LENGTH = 128;
+const MAX_TORRENT_STATE_LENGTH = 64;
+const MAX_TORRENT_PATH_LENGTH = 4096;
+const METADATA_PENDING_STATES = new Set(['metaDL', 'forcedMetaDL']);
+
 const REQUEST_TIMEOUT_MS = 15000;
 
 function apiError(message, statusCode) {
@@ -213,6 +220,28 @@ function torrentContentPath(torrent) {
   return null;
 }
 
+function inspectionText(value, maximumLength) {
+  if (typeof value !== 'string') return null;
+  const sanitized = value.replace(/[\u0000-\u001f\u007f]/g, '�').trim();
+  return sanitized ? sanitized.slice(0, maximumLength) : null;
+}
+
+function inspectionDetail(torrent, reason, rawPath = null) {
+  const hash = inspectionText(torrent?.hash, MAX_TORRENT_HASH_LENGTH);
+  return {
+    name: inspectionText(torrent?.name, MAX_TORRENT_NAME_LENGTH),
+    hash,
+    hashPrefix: hash?.slice(0, 12) ?? null,
+    state: inspectionText(torrent?.state, MAX_TORRENT_STATE_LENGTH),
+    reason,
+    rawPath: inspectionText(rawPath, MAX_TORRENT_PATH_LENGTH),
+  };
+}
+
+function appendInspectionDetail(details, torrent, reason, rawPath = null) {
+  if (details.length < MAX_INSPECTION_DETAILS) details.push(inspectionDetail(torrent, reason, rawPath));
+}
+
 function isIncomplete(torrent) {
   const amountLeft = torrent?.amount_left;
   const progress = torrent?.progress;
@@ -230,6 +259,12 @@ export async function inspectQbittorrent(connection) {
       incompleteTorrentCount: 0,
       incompletePaths: [],
       unmappedIncompleteCount: 0,
+      metadataPendingCount: 0,
+      metadataPendingTorrents: [],
+      metadataPendingOmittedCount: 0,
+      unresolvedIncompleteTorrents: [],
+      unresolvedIncompleteOmittedCount: 0,
+      detailLimit: MAX_INSPECTION_DETAILS,
     };
   }
 
@@ -245,10 +280,28 @@ export async function inspectQbittorrent(connection) {
     const incomplete = torrents.filter(isIncomplete);
     const mappedPaths = [];
     let unmappedIncompleteCount = 0;
+    let metadataPendingCount = 0;
+    const metadataPendingTorrents = [];
+    const unresolvedIncompleteTorrents = [];
     for (const torrent of incomplete) {
-      const mapped = mapQbittorrentPath(torrentContentPath(torrent), connection.pathMaps);
+      const rawPath = torrentContentPath(torrent);
+      if (!rawPath && METADATA_PENDING_STATES.has(torrent?.state)) {
+        metadataPendingCount += 1;
+        appendInspectionDetail(metadataPendingTorrents, torrent, 'metadata-pending');
+        continue;
+      }
+
+      const mapped = mapQbittorrentPath(rawPath, connection.pathMaps);
       if (mapped) mappedPaths.push(mapped);
-      else unmappedIncompleteCount += 1;
+      else {
+        unmappedIncompleteCount += 1;
+        appendInspectionDetail(
+          unresolvedIncompleteTorrents,
+          torrent,
+          rawPath ? 'unmappable-content-path' : 'missing-content-path',
+          rawPath,
+        );
+      }
     }
 
     return {
@@ -258,6 +311,12 @@ export async function inspectQbittorrent(connection) {
       incompleteTorrentCount: incomplete.length,
       incompletePaths: [...new Set(mappedPaths)],
       unmappedIncompleteCount,
+      metadataPendingCount,
+      metadataPendingTorrents,
+      metadataPendingOmittedCount: Math.max(0, metadataPendingCount - metadataPendingTorrents.length),
+      unresolvedIncompleteTorrents,
+      unresolvedIncompleteOmittedCount: Math.max(0, unmappedIncompleteCount - unresolvedIncompleteTorrents.length),
+      detailLimit: MAX_INSPECTION_DETAILS,
     };
   });
 }

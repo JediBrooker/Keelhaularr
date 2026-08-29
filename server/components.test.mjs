@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { after } from 'node:test';
 import { replacementProgress } from './arr.mjs';
-import { applyOrphanCandidate, assertCandidateUnchanged, scanOrphans } from './orphans.mjs';
+import { applyOrphanCandidate, assertCandidateUnchanged, assertQbittorrentSafe, scanOrphans } from './orphans.mjs';
 
 const testRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-components-'));
 process.env.CONFIG_DIR = path.join(testRoot, 'config');
@@ -158,6 +158,136 @@ test('qBittorrent failure withholds download roots while library orphan scanning
   assert.match(scan.warnings.join(' '), /safety check failed.*withheld/i);
 });
 
+test('metadata-pending qBittorrent torrents do not block scans but are rechecked before a file change', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  const mediaRoot = path.join(testRoot, 'qbit-metadata-media');
+  const downloadRoot = path.join(testRoot, 'qbit-metadata-downloads');
+  await mkdir(mediaRoot);
+  await mkdir(downloadRoot);
+  const libraryOrphan = path.join(mediaRoot, 'library-orphan.mkv');
+  const downloadOrphan = path.join(downloadRoot, 'completed-download.mkv');
+  await writeFile(libraryOrphan, 'unknown library file');
+  await writeFile(downloadOrphan, 'completed download file');
+  let torrentState = 'metadata';
+  globalThis.fetch = async (input) => {
+    const endpoint = new URL(input).pathname;
+    if (endpoint === '/api/v2/auth/login') return new Response('Ok.', { headers: { 'Set-Cookie': 'SID=test-session' } });
+    if (endpoint === '/api/v2/app/version') return new Response('5.2.0');
+    if (endpoint === '/api/v2/torrents/info') {
+      if (torrentState === 'metadata') return Response.json([
+        { hash: 'metadata-hash', name: 'Metadata release', state: 'metaDL', progress: 0, amount_left: 1 },
+        { hash: 'forced-metadata-hash', name: 'Forced metadata release', state: 'forcedMetaDL', progress: 0, amount_left: 1 },
+      ]);
+      return Response.json([{
+        hash: 'metadata-hash',
+        name: 'Metadata release',
+        state: 'downloading',
+        progress: 0.1,
+        amount_left: 90,
+        ...(torrentState === 'mapped' ? { content_path: downloadOrphan } : {}),
+      }]);
+    }
+    if (endpoint === '/api/v2/auth/logout') return new Response('');
+    return new Response(null, { status: 404 });
+  };
+  const config = {
+    radarr: { mediaRoots: [mediaRoot], downloadRoots: [downloadRoot] },
+    sonarr: { mediaRoots: [], downloadRoots: [] },
+    qbittorrent: { configured: true, url: 'http://qbit.test', username: 'admin', password: 'secret', pathMaps: [] },
+    ignoreDirectories: new Set(),
+    extensions: new Set(['.mkv']),
+    maxFiles: 100,
+    hardlinkMinAgeHours: 0,
+  };
+  const arr = {
+    radarr: { status: 'connected', knownPaths: new Set() },
+    sonarr: { status: 'not-configured', knownPaths: new Set() },
+  };
+
+  const scan = await scanOrphans(config, arr);
+
+  assert.deepEqual(scan.candidates.map((candidate) => candidate.path).sort(), [downloadOrphan, libraryOrphan].sort());
+  assert.deepEqual(scan.warnings, []);
+  assert.equal(scan.qbittorrentSafety.checked, true);
+  assert.equal(scan.qbittorrentSafety.metadataPendingCount, 2);
+  assert.deepEqual(scan.qbittorrentSafety.metadataPendingTorrents.map(({ name, hash, state, reason }) => ({ name, hash, state, reason })), [
+    { name: 'Metadata release', hash: 'metadata-hash', state: 'metaDL', reason: 'metadata-pending' },
+    { name: 'Forced metadata release', hash: 'forced-metadata-hash', state: 'forcedMetaDL', reason: 'metadata-pending' },
+  ]);
+  assert.equal(scan.qbittorrentSafety.unresolvedIncompleteCount, 0);
+  const downloadCandidate = scan.candidates.find((candidate) => candidate.path === downloadOrphan);
+  assert.ok(downloadCandidate);
+  await assert.doesNotReject(assertQbittorrentSafe(config, downloadCandidate));
+
+  torrentState = 'mapped';
+  await assert.rejects(assertQbittorrentSafe(config, downloadCandidate), /part of an incomplete torrent/i);
+  torrentState = 'missing';
+  await assert.rejects(assertQbittorrentSafe(config, downloadCandidate), /incomplete torrent path that could not be mapped/i);
+});
+
+test('unresolved incomplete qBittorrent paths explain that download roots were withheld while library scanning continues', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  const mediaRoot = path.join(testRoot, 'qbit-unresolved-media');
+  const downloadRoot = path.join(testRoot, 'qbit-unresolved-downloads');
+  await mkdir(mediaRoot);
+  await mkdir(downloadRoot);
+  const libraryOrphan = path.join(mediaRoot, 'library-orphan.mkv');
+  const unsafeDownload = path.join(downloadRoot, 'active-download.mkv');
+  await writeFile(libraryOrphan, 'unknown library file');
+  await writeFile(unsafeDownload, 'active download file');
+  globalThis.fetch = async (input) => {
+    const endpoint = new URL(input).pathname;
+    if (endpoint === '/api/v2/auth/login') return new Response('Ok.', { headers: { 'Set-Cookie': 'SID=test-session' } });
+    if (endpoint === '/api/v2/app/version') return new Response('5.2.0');
+    if (endpoint === '/api/v2/torrents/info') return Response.json([
+      { hash: 'empty-path-hash', name: 'Empty path', state: 'downloading', content_path: '', progress: 0.5, amount_left: 50 },
+      { hash: 'missing-path-hash', name: 'Missing path', state: 'queuedDL', progress: 0.25, amount_left: 75 },
+    ]);
+    if (endpoint === '/api/v2/auth/logout') return new Response('');
+    return new Response(null, { status: 404 });
+  };
+  const config = {
+    radarr: { mediaRoots: [mediaRoot], downloadRoots: [downloadRoot] },
+    sonarr: { mediaRoots: [], downloadRoots: [] },
+    qbittorrent: { configured: true, url: 'http://qbit.test', username: 'admin', password: 'secret', pathMaps: [] },
+    ignoreDirectories: new Set(),
+    extensions: new Set(['.mkv']),
+    maxFiles: 100,
+    hardlinkMinAgeHours: 0,
+  };
+  const arr = {
+    radarr: { status: 'connected', knownPaths: new Set() },
+    sonarr: { status: 'not-configured', knownPaths: new Set() },
+  };
+
+  const scan = await scanOrphans(config, arr);
+
+  assert.deepEqual(scan.candidates.map((candidate) => candidate.path), [libraryOrphan]);
+  assert.deepEqual(scan.roots.map(({ kind, path: rootPath }) => ({ kind, path: rootPath })), [
+    { kind: 'library', path: mediaRoot },
+  ]);
+  assert.deepEqual(scan.warnings, [
+    'qBittorrent is connected, but 2 incomplete torrent paths could not be resolved. Completed-download folders were skipped to protect active downloads; this qBittorrent issue did not block library-folder scanning. Check Settings → Connections → qBittorrent → Path mapping.',
+  ]);
+  assert.equal(scan.qbittorrentSafety.checked, true);
+  assert.equal(scan.qbittorrentSafety.metadataPendingCount, 0);
+  assert.equal(scan.qbittorrentSafety.unresolvedIncompleteCount, 2);
+  assert.equal(scan.qbittorrentSafety.warning, scan.warnings[0]);
+  assert.deepEqual(scan.qbittorrentSafety.unresolvedIncompleteTorrents.map(({ name, hash, state, reason, rawPath }) => ({ name, hash, state, reason, rawPath })), [
+    { name: 'Empty path', hash: 'empty-path-hash', state: 'downloading', reason: 'missing-content-path', rawPath: null },
+    { name: 'Missing path', hash: 'missing-path-hash', state: 'queuedDL', reason: 'missing-content-path', rawPath: null },
+  ]);
+
+  const disconnectedScan = await scanOrphans(config, {
+    ...arr,
+    radarr: { status: 'error', knownPaths: new Set() },
+  });
+  assert.match(disconnectedScan.qbittorrentSafety.warning, /did not block library-folder scanning/i);
+  assert.doesNotMatch(disconnectedScan.qbittorrentSafety.warning, /library folders were still scanned/i);
+});
+
 test('one incomplete qBittorrent path outside monitored roots withholds all download candidates', async (context) => {
   const originalFetch = globalThis.fetch;
   context.after(() => { globalThis.fetch = originalFetch; });
@@ -197,7 +327,7 @@ test('one incomplete qBittorrent path outside monitored roots withholds all down
   assert.match(scan.warnings.join(' '), /outside the configured completed-download roots.*withheld/i);
 });
 
-test('a newly incomplete torrent is preserved by the immediate pre-change check', async (context) => {
+test('a metadata-pending torrent that gains a content path is preserved by the immediate pre-change check', async (context) => {
   const originalFetch = globalThis.fetch;
   context.after(() => { globalThis.fetch = originalFetch; });
   const mediaRoot = path.join(testRoot, 'qbit-race-media');
@@ -206,14 +336,25 @@ test('a newly incomplete torrent is preserved by the immediate pre-change check'
   await mkdir(downloadRoot);
   const source = path.join(downloadRoot, 'started-later.mkv');
   await writeFile(source, 'torrent file');
-  let incomplete = false;
+  let fetchingMetadata = true;
   globalThis.fetch = async (input) => {
     const endpoint = new URL(input).pathname;
     if (endpoint === '/api/v2/auth/login') return new Response(null, { status: 204, headers: { 'Set-Cookie': 'QBT_SID_8080=test-session; Path=/' } });
     if (endpoint === '/api/v2/app/version') return new Response('5.2.0');
-    if (endpoint === '/api/v2/torrents/info') return Response.json([
-      { content_path: source, progress: incomplete ? 0.2 : 1, amount_left: incomplete ? 100 : 0 },
-    ]);
+    if (endpoint === '/api/v2/torrents/info') return Response.json(fetchingMetadata ? [{
+      hash: 'metadata-race-hash',
+      name: 'Metadata race release',
+      state: 'metaDL',
+      progress: 0,
+      amount_left: 1,
+    }] : [{
+      hash: 'metadata-race-hash',
+      name: 'Metadata race release',
+      state: 'downloading',
+      content_path: source,
+      progress: 0.2,
+      amount_left: 100,
+    }]);
     if (endpoint === '/api/v2/auth/logout') return new Response(null, { status: 204 });
     return new Response(null, { status: 404 });
   };
@@ -233,7 +374,7 @@ test('a newly incomplete torrent is preserved by the immediate pre-change check'
   };
   const candidate = (await scanOrphans(config, arr)).candidates[0];
   assert.equal(candidate.path, source);
-  incomplete = true;
+  fetchingMetadata = false;
   await assert.rejects(applyOrphanCandidate(config, candidate), /incomplete torrent.*preserved/i);
   assert.equal(await readFile(source, 'utf8'), 'torrent file');
 });

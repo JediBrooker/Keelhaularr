@@ -6,6 +6,7 @@ import { SettingsDialog } from './SettingsDialog';
 
 type AppKind = 'radarr' | 'sonarr';
 type Tab = 'oversized' | 'orphans';
+type ConnectionState = 'checking' | 'connected' | 'error' | 'configured' | 'not-configured';
 const manifestTabs: Tab[] = ['oversized', 'orphans'];
 
 function skipToMain(event: MouseEvent<HTMLAnchorElement> | KeyboardEvent<HTMLAnchorElement>) {
@@ -61,14 +62,46 @@ interface OrphanItem {
   source: 'library' | 'download';
 }
 
+interface QBittorrentPathDetail {
+  name: string | null;
+  hash: string | null;
+  hashPrefix: string | null;
+  state: string | null;
+  reason: 'metadata-pending' | 'missing-content-path' | 'unmappable-content-path';
+  rawPath: string | null;
+}
+
+interface QBittorrentSafety {
+  checked: boolean;
+  metadataPendingCount: number;
+  metadataPendingTorrents: QBittorrentPathDetail[];
+  metadataPendingOmittedCount: number;
+  unresolvedIncompleteCount: number;
+  unresolvedIncompleteTorrents: QBittorrentPathDetail[];
+  unresolvedIncompleteOmittedCount: number;
+  detailLimit: number;
+  warning: string | null;
+}
+
 interface ScanData {
   scannedAt: string;
   config: PublicConfig;
-  connections: Record<AppKind, { status: string; version: string | null; error: string | null }>;
+  connections: Record<AppKind, { status: 'connected' | 'error' | 'not-configured'; version: string | null; error: string | null }>;
   oversized: OversizedItem[];
   orphans: OrphanItem[];
   roots: Array<{ app: AppKind; kind: 'library' | 'download'; path: string; filesScanned: number }>;
+  qbittorrentSafety: QBittorrentSafety;
   warnings: string[];
+}
+
+class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
 }
 
 async function api<T>(url: string, options?: RequestInit): Promise<T> {
@@ -76,8 +109,11 @@ async function api<T>(url: string, options?: RequestInit): Promise<T> {
     ...options,
     headers: { 'Content-Type': 'application/json', ...(options?.headers ?? {}) },
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error ?? `Request failed with HTTP ${response.status}`);
+  const data = await response.json().catch(() => ({})) as { error?: unknown };
+  if (!response.ok) {
+    const message = typeof data.error === 'string' ? data.error : `Request failed with HTTP ${response.status}`;
+    throw new ApiError(message, response.status);
+  }
   return data as T;
 }
 
@@ -148,17 +184,75 @@ function Login({ setupRequired, onLogin }: { setupRequired: boolean; onLogin: ()
   );
 }
 
-function ConnectionPill({ app, scan, configured }: {
-  app: AppKind;
-  scan: ScanData | null;
-  configured: boolean;
+function ConnectionPill({ name, state, error }: {
+  name: string;
+  state: ConnectionState;
+  error?: string | null;
 }) {
-  const state = scan?.connections[app]?.status ?? (configured ? 'configured' : 'not-configured');
-  const label = state === 'connected' ? 'Connected' : state === 'error' ? 'Error' : state === 'configured' ? 'Configured' : 'Not set';
+  const label = state === 'connected'
+    ? 'Connected'
+    : state === 'error'
+      ? 'Not connected'
+      : state === 'checking'
+        ? 'Checking'
+        : state === 'configured'
+          ? 'Configured'
+          : 'Not set';
   return (
-    <div className={`status-pill ${state}`} title={scan?.connections[app]?.error ?? undefined}>
-      <span /> {app === 'radarr' ? 'Radarr' : 'Sonarr'} <em>{label}</em>
+    <div className={`status-pill ${state}`} title={error ?? undefined}>
+      <span aria-hidden="true" /><strong>{name}</strong><em>{label}</em>
     </div>
+  );
+}
+
+function QBittorrentTorrentList({ items, omittedCount }: { items: QBittorrentPathDetail[]; omittedCount: number }) {
+  const reasonLabel = (reason: QBittorrentPathDetail['reason']) => reason === 'metadata-pending'
+    ? 'Fetching metadata; no content path yet'
+    : reason === 'missing-content-path'
+      ? 'No content path reported'
+      : 'Content path does not match a safe mapping';
+  return (
+    <div className="qb-safety-details">
+      <ul>
+        {items.map((item, index) => (
+          <li key={`${item.hash ?? item.name ?? 'torrent'}-${index}`}>
+            <strong>{item.name ?? 'Unnamed torrent'}</strong>
+            <span>
+              {item.hashPrefix ? <code title={item.hash ?? undefined}>{item.hashPrefix}</code> : 'No hash reported'}
+              {' · '}{item.state ? <code>{item.state}</code> : 'Unknown state'}
+              {' · '}{reasonLabel(item.reason)}
+            </span>
+            {item.rawPath && <code className="qb-raw-path">{item.rawPath}</code>}
+          </li>
+        ))}
+      </ul>
+      {omittedCount > 0 && <p>{omittedCount} additional torrent{omittedCount === 1 ? '' : 's'} omitted from this bounded detail list.</p>}
+    </div>
+  );
+}
+
+function QBittorrentSafetyNotices({ safety }: { safety: QBittorrentSafety }) {
+  return (
+    <>
+      {safety.metadataPendingCount > 0 && (
+        <details className="notice info qb-safety-notice">
+          <summary>
+            {safety.metadataPendingCount} qBittorrent torrent{safety.metadataPendingCount === 1 ? ' is' : 's are'} fetching metadata
+          </summary>
+          <p>These torrents do not have content paths yet, so they did not block this scan. Keelhaularr checks qBittorrent again immediately before changing a download file.</p>
+          <QBittorrentTorrentList items={safety.metadataPendingTorrents} omittedCount={safety.metadataPendingOmittedCount} />
+        </details>
+      )}
+      {safety.unresolvedIncompleteCount > 0 && (
+        <details className="notice warning qb-safety-notice">
+          <summary>
+            {safety.unresolvedIncompleteCount} incomplete qBittorrent torrent path{safety.unresolvedIncompleteCount === 1 ? '' : 's'} could not be resolved
+          </summary>
+          <p>Completed-download folders were skipped to protect active downloads; this qBittorrent issue did not block library-folder scanning. Check Settings → Connections → qBittorrent → Path mapping.</p>
+          <QBittorrentTorrentList items={safety.unresolvedIncompleteTorrents} omittedCount={safety.unresolvedIncompleteOmittedCount} />
+        </details>
+      )}
+    </>
   );
 }
 
@@ -227,7 +321,12 @@ export default function App() {
   const [sort, setSort] = useState<'largest' | 'overage' | 'title' | 'oldest'>('largest');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [qbittorrentConnection, setQbittorrentConnection] = useState<{
+    state: ConnectionState;
+    error: string | null;
+  }>({ state: 'not-configured', error: null });
   const scanRequestId = useRef(0);
+  const qbittorrentRequestId = useRef(0);
 
   useEffect(() => {
     api<{ authenticated: boolean; setupRequired: boolean }>('/api/auth/status')
@@ -247,6 +346,45 @@ export default function App() {
         setAuth('signed-out');
       });
   }, []);
+
+  useEffect(() => {
+    const requestId = ++qbittorrentRequestId.current;
+    if (auth !== 'signed-in' || !config?.qbittorrent.configured) {
+      setQbittorrentConnection({ state: 'not-configured', error: null });
+      return;
+    }
+
+    const controller = new AbortController();
+    setQbittorrentConnection({ state: 'checking', error: null });
+    api<{
+      status: 'connected';
+      version: string | null;
+      totalTorrentCount: number;
+      incompleteTorrentCount: number;
+      metadataPendingCount: number;
+      unresolvedIncompleteCount: number;
+    }>('/api/qbittorrent/status', { signal: controller.signal })
+      .then(() => {
+        if (requestId === qbittorrentRequestId.current) {
+          setQbittorrentConnection({ state: 'connected', error: null });
+        }
+      })
+      .catch((connectionError) => {
+        if (controller.signal.aborted || requestId !== qbittorrentRequestId.current) return;
+        if (connectionError instanceof ApiError && connectionError.status === 401) {
+          setAuth('signed-out');
+          setConfig(null);
+          setScan(null);
+          return;
+        }
+        setQbittorrentConnection({
+          state: 'error',
+          error: connectionError instanceof Error ? connectionError.message : String(connectionError),
+        });
+      });
+
+    return () => controller.abort();
+  }, [auth, config]);
 
   const source = tab === 'oversized' ? scan?.oversized ?? [] : scan?.orphans ?? [];
   const visible = useMemo(() => {
@@ -320,7 +458,12 @@ export default function App() {
       return true;
     } catch (scanError) {
       if (requestId !== scanRequestId.current) return false;
-      if (scanError instanceof Error && scanError.message.includes('Sign in')) setAuth('signed-out');
+      if (scanError instanceof ApiError && scanError.status === 401) {
+        setAuth('signed-out');
+        setConfig(null);
+        setScan(null);
+        return false;
+      }
       setError(scanError instanceof Error ? scanError.message : String(scanError));
       return false;
     } finally {
@@ -475,8 +618,17 @@ export default function App() {
         </div>
         <div className="header-actions">
           <div className="connection-cluster">
-            <ConnectionPill app="radarr" scan={scan} configured={Boolean(config?.radarr.configured)} />
-            <ConnectionPill app="sonarr" scan={scan} configured={Boolean(config?.sonarr.configured)} />
+            <ConnectionPill
+              name="Radarr"
+              state={scan?.connections.radarr.status ?? (config?.radarr.configured ? 'configured' : 'not-configured')}
+              error={scan?.connections.radarr.error}
+            />
+            <ConnectionPill
+              name="Sonarr"
+              state={scan?.connections.sonarr.status ?? (config?.sonarr.configured ? 'configured' : 'not-configured')}
+              error={scan?.connections.sonarr.error}
+            />
+            <ConnectionPill name="qBittorrent" state={qbittorrentConnection.state} error={qbittorrentConnection.error} />
           </div>
           <button className="text-button" onClick={() => { setOperationsTab('jobs'); setShowOperations(true); }}>Operations</button>
           <button className="text-button settings-button" onClick={() => setShowSettings(true)}>Settings</button>
@@ -497,7 +649,17 @@ export default function App() {
       </section>
 
       {(message || error) && <div className={`notice ${error ? 'error' : 'success'}`} role="status">{error || message}</div>}
-      {scan?.warnings.map((warning) => <div className="notice warning" key={warning}>{warning}</div>)}
+      {qbittorrentConnection.state === 'error' && qbittorrentConnection.error && (
+        <div className="notice warning qb-connection-warning" role="alert">
+          <div>
+            <strong>qBittorrent is not connected.</strong>
+            <span>{qbittorrentConnection.error} Open Settings → Connections → qBittorrent and test the connection.</span>
+          </div>
+          <button type="button" className="ghost-button compact" onClick={() => setShowSettings(true)}>Open Settings</button>
+        </div>
+      )}
+      {scan?.warnings.filter((warning) => warning !== scan.qbittorrentSafety.warning).map((warning) => <div className="notice warning" key={warning}>{warning}</div>)}
+      {scan && <QBittorrentSafetyNotices safety={scan.qbittorrentSafety} />}
 
       <section className="stat-grid" aria-label="Scan summary">
         <article className="stat-card accent"><p>Files over size limits</p><strong>{scan?.oversized.length ?? '—'}</strong><span>{scan ? formatBytes(totalOversized) : 'Scan to inspect'}</span></article>

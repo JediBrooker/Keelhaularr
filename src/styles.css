@@ -61,15 +61,39 @@ body:has(.modal-dialog[open]){overflow:hidden}
 .manifest-panel:focus-visible{outline-offset:-3px}
 .empty-state{padding:46px 24px}
 .header-actions,.connection-cluster,.hero>div,.manifest-head>div{min-width:0}
+.status-pill strong{min-width:0;font:inherit}
 .hero-copy,.manifest-head h3,.safety-note{overflow-wrap:anywhere}
+.notice.info{color:#225f6a;background:#d8e9e9}
+.qb-connection-warning{display:flex;align-items:center;justify-content:space-between;gap:14px}
+.qb-connection-warning>div{display:grid;gap:3px;min-width:0}
+.qb-connection-warning span{overflow-wrap:anywhere;line-height:1.45}
+.qb-connection-warning button{flex:0 0 auto}
+.qb-safety-notice{padding:0;overflow:hidden}
+.qb-safety-notice>summary{padding:12px 15px;cursor:pointer;font-weight:800}
+.qb-safety-notice>summary:focus-visible{outline-offset:-3px}
+.qb-safety-notice>p,.qb-safety-details{margin:0;padding:0 15px 13px;line-height:1.55}
+.qb-safety-details ul{display:grid;margin:0;padding:0;list-style:none}
+.qb-safety-details li{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(260px,1.2fr);gap:4px 14px;padding:9px 0;border-top:1px solid rgba(16,42,44,.1)}
+.qb-safety-details li>strong,.qb-safety-details li>span{min-width:0;overflow-wrap:anywhere}
+.qb-safety-details code{font-family:'DM Mono',monospace;font-size:.9em}
+.qb-safety-details .qb-raw-path{grid-column:1/-1;color:inherit;opacity:.8;overflow-wrap:anywhere}
+.qb-safety-details>p{margin:8px 0 0;padding:0;font-size:10px}
+
+@media(min-width:781px) and (max-width:940px){
+  .topbar{align-items:flex-start;flex-wrap:wrap;gap:14px}
+  .header-actions{display:grid;width:100%;grid-template-columns:minmax(0,1fr) repeat(3,max-content);gap:8px}
+  .connection-cluster{min-width:0;flex-wrap:wrap}
+}
 
 @media(max-width:780px){
   .shell{padding-top:12px}
   .topbar{align-items:center;flex-wrap:wrap;gap:12px;padding-bottom:16px}
   .header-actions{display:grid;align-items:stretch;width:100%;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px 8px}
-  .connection-cluster{display:grid;width:100%;grid-column:1/-1;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
-  .status-pill{justify-content:center;min-width:0;min-height:40px;padding:8px 10px;font-size:10px;white-space:nowrap}
-  .status-pill em{font-size:8px}
+  .connection-cluster{display:grid;width:100%;grid-column:1/-1;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}
+  .status-pill{display:grid;min-width:0;min-height:46px;grid-template-columns:auto minmax(0,auto);grid-template-rows:auto auto;align-content:center;justify-content:center;column-gap:6px;row-gap:2px;padding:7px 6px;font-size:9px;line-height:1.05;white-space:nowrap}
+  .status-pill span{grid-row:1/-1;align-self:center}
+  .status-pill strong{max-width:100%;overflow:hidden;text-overflow:ellipsis}
+  .status-pill em{grid-column:2;font-size:9px;letter-spacing:.03em}
   .header-actions>.text-button{width:100%;padding:8px 4px}
   .text-button,.tabs button,.filters button,.batch-tools button{min-height:44px}
   #root input[type=checkbox]{width:24px;height:24px}
@@ -84,6 +108,10 @@ body:has(.modal-dialog[open]){overflow:hidden}
   .result-tools{justify-content:flex-start;overflow-x:auto}
   .filters button{white-space:nowrap}
   .empty-state{padding:38px 18px}
+  .qb-connection-warning{align-items:stretch;flex-direction:column}
+  .qb-connection-warning button{width:100%}
+  .qb-safety-details li{grid-template-columns:1fr}
+  .qb-safety-details .qb-raw-path{grid-column:auto}
   .modal-dialog{width:calc(100% - 24px)}
   .confirm-dialog{padding:24px 20px}
 }

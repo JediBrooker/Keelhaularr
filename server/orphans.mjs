@@ -88,6 +88,17 @@ export async function scanOrphans(config, arrResults) {
   const roots = [];
   let downloadScanAllowed = true;
   let protectedDownloadPaths = [];
+  let qbittorrentSafety = {
+    checked: false,
+    metadataPendingCount: 0,
+    metadataPendingTorrents: [],
+    metadataPendingOmittedCount: 0,
+    unresolvedIncompleteCount: 0,
+    unresolvedIncompleteTorrents: [],
+    unresolvedIncompleteOmittedCount: 0,
+    detailLimit: 0,
+    warning: null,
+  };
 
   const configuredDownloadRoots = ['radarr', 'sonarr']
     .flatMap((app) => config[app]?.downloadRoots ?? [])
@@ -96,11 +107,19 @@ export async function scanOrphans(config, arrResults) {
     try {
       const snapshot = await inspectQbittorrent(config.qbittorrent);
       protectedDownloadPaths = snapshot.incompletePaths;
+      qbittorrentSafety = {
+        checked: true,
+        metadataPendingCount: snapshot.metadataPendingCount,
+        metadataPendingTorrents: snapshot.metadataPendingTorrents,
+        metadataPendingOmittedCount: snapshot.metadataPendingOmittedCount,
+        unresolvedIncompleteCount: snapshot.unmappedIncompleteCount,
+        unresolvedIncompleteTorrents: snapshot.unresolvedIncompleteTorrents,
+        unresolvedIncompleteOmittedCount: snapshot.unresolvedIncompleteOmittedCount,
+        detailLimit: snapshot.detailLimit,
+        warning: null,
+      };
       if (snapshot.unmappedIncompleteCount) {
         downloadScanAllowed = false;
-        warnings.push(
-          `qBittorrent reported ${snapshot.unmappedIncompleteCount} incomplete torrent path(s) that could not be mapped; completed-download orphan scans were withheld.`,
-        );
       } else {
         const outsideRoots = pathsOutsideRoots(protectedDownloadPaths, configuredDownloadRoots);
         if (outsideRoots.length) {
@@ -208,7 +227,13 @@ export async function scanOrphans(config, arrResults) {
     }
   }
 
-  return { candidates, warnings, roots };
+  if (qbittorrentSafety.unresolvedIncompleteCount) {
+    const warning = `qBittorrent is connected, but ${qbittorrentSafety.unresolvedIncompleteCount} incomplete torrent path${qbittorrentSafety.unresolvedIncompleteCount === 1 ? '' : 's'} could not be resolved. Completed-download folders were skipped to protect active downloads; this qBittorrent issue did not block library-folder scanning. Check Settings → Connections → qBittorrent → Path mapping.`;
+    qbittorrentSafety.warning = warning;
+    warnings.unshift(warning);
+  }
+
+  return { candidates, warnings, roots, qbittorrentSafety };
 }
 
 async function nextAvailablePath(destination) {
