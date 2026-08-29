@@ -714,16 +714,24 @@ export default function App() {
     setMinimumGib('0');
   }
 
-  async function excludeSelection() {
-    if (tab !== 'oversized' || !selectedVisible.length) return;
+  async function ignoreSelection() {
+    if (!selectedVisible.length) return;
+    const ignoredCount = selectedVisible.length;
     setApplying(true);
     setError('');
     try {
-      await api('/api/exclusions', { method: 'POST', body: JSON.stringify({ ids: selectedVisible.map((item) => item.id) }) });
-      setMessage(`${selectedVisible.length} item(s) excluded from future oversize scans.`);
-      await runScan();
-    } catch (excludeError) {
-      setError(excludeError instanceof Error ? excludeError.message : String(excludeError));
+      await api('/api/exclusions', {
+        method: 'POST',
+        body: JSON.stringify({
+          ids: selectedVisible.map((item) => item.id),
+          scope: tab === 'orphans' ? 'orphan' : 'oversized',
+        }),
+      });
+      if (await runScan()) {
+        setMessage(`${ignoredCount} file${ignoredCount === 1 ? '' : 's'} added to the ignore list. Manage or remove ignored files in Operations → Ignore list.`);
+      }
+    } catch (ignoreError) {
+      setError(ignoreError instanceof Error ? ignoreError.message : String(ignoreError));
     } finally {
       setApplying(false);
     }
@@ -854,6 +862,7 @@ export default function App() {
               {value === 'oversized' ? 'Size limits' : 'Untracked files'} <span>{value === 'oversized' ? scan?.oversized.length ?? 0 : scan?.orphans.length ?? 0}</span>
             </button>)}
           </div>
+          <button type="button" className="ghost-button compact" onClick={() => { setOperationsTab('exclusions'); setShowOperations(true); }}>Ignore list</button>
         </div>
 
         {manifestTabs.map((value) => <div
@@ -876,7 +885,7 @@ export default function App() {
                 <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search title, quality or path" aria-label="Search scan results" />
                 <label>Minimum {tab === 'oversized' ? 'overage' : 'size'}<span><input inputMode="decimal" value={minimumGib} onChange={(event) => setMinimumGib(event.target.value)} /> GiB</span></label>
                 <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="largest">Largest first</option>{tab === 'oversized' && <option value="overage">Most over limit</option>}<option value="title">Title</option>{tab === 'orphans' && <option value="oldest">Oldest first</option>}</select></label>
-                <div className="batch-tools"><button type="button" onClick={() => selectFirst(25)} disabled={!visible.length}>Select first 25</button><button type="button" onClick={() => selectFirst(100)} disabled={!visible.length}>Select first 100</button>{tab === 'oversized' && <button type="button" onClick={excludeSelection} disabled={!selectedVisible.length || applying}>Exclude selected</button>}</div>
+                <div className="batch-tools"><button type="button" onClick={() => selectFirst(25)} disabled={!visible.length}>Select first 25</button><button type="button" onClick={() => selectFirst(100)} disabled={!visible.length}>Select first 100</button><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button></div>
               </div>
             </>}
 
@@ -896,7 +905,7 @@ export default function App() {
               <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} />
             )}
 
-            <p className="safety-note"><span aria-hidden="true">⚓</span>{tab === 'oversized' ? 'Tracked files are removed through Radarr or Sonarr, then searched again using that app’s existing profiles.' : 'Choose quarantine or permanent deletion for each selected batch. Every file is revalidated immediately before it changes.'}</p>
+            <p className="safety-note"><span aria-hidden="true">⚓</span>{tab === 'oversized' ? 'Remove tracked files through Radarr or Sonarr and search again, or ignore them in future size-limit scans. Remove an item from Operations → Ignore list to include it again.' : 'Quarantine or permanently delete selected files, or ignore their paths in future untracked-file scans. Remove a path from Operations → Ignore list to include it again.'}</p>
           </>}
         </div>)}
       </section>

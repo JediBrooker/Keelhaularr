@@ -132,6 +132,12 @@ body:has(.modal-dialog[open]){overflow:hidden}
 .settings-actions{flex:0 0 auto}
 .operations-tabs button{text-transform:none}
 .schedule-report{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
+.ignore-record-tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:7px}
+.ignore-scope{color:#536665;background:#e5e9e5}
+.ignore-scope.orphan{color:#684c11;background:#efe0ba}
+.ignore-scope.oversized{color:#8f3025;background:#f5dcd6}
+.record-card .ignore-path{overflow:visible;white-space:normal;text-overflow:clip;overflow-wrap:anywhere;line-height:1.5}
+.record-card .ignore-summary{font-family:'DM Sans',sans-serif;white-space:normal;line-height:1.45}
 
 @media(max-width:780px){
   .settings-header{padding:18px 16px 15px}

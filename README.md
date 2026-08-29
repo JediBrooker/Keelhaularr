@@ -29,7 +29,7 @@ Both destructive automations are opt-in and disabled by default.
 - Durable background jobs, restart recovery, cancellation, retries, and item history
 - Replacement search/download status tracking
 - Optional per-quality size limits read directly from Radarr and Sonarr
-- Search, sorting, minimum-overage filters, batch selection, and permanent exclusions
+- Search, sorting, minimum-overage filters, batch selection, and a persistent ignore list
 - Brig interface for restoring or purging quarantined files
 - Optional automatic quarantine retention
 - Scheduled scan reports with generic, Discord, or Gotify webhooks
@@ -273,16 +273,23 @@ blocklisting, qBittorrent removal confirmation, and the single replacement
 search request. A failed or ambiguous phase is preserved for inspection and
 does not advance to a search.
 
-## Manifest controls and exclusions
+## Manifest controls and ignore list
 
 Search by title, quality, or path; filter by application; sort by size, overage,
 title, or orphan age; and set a minimum overage/size in GiB. **Select first 25**
 and **First 100** apply to the current filtered order.
 
-**Exclude selected** permanently hides selected movies or episodes from
-oversize scans, including later replacement files for the same movie/episode.
-Manage or remove these exceptions under **Operations → Exclusions**. Exclusions
-do not disable orphan checks.
+**Ignore selected** adds the current selection to a persistent ignore list. For
+size-limit results, the ignored scope is the Radarr movie or Sonarr episode, so
+later replacement files for that same item stay hidden from size-limit scans.
+For untracked results, the ignored scope is the exact filesystem path, so only
+that path stays hidden from future untracked-file scans.
+
+Open **Ignore list** beside the scan-result tabs, or use **Operations → Ignore
+list**, to review ignored items. Removing an item from the list makes it eligible
+to appear again on the next scan. Ignoring a size-limit result does not disable
+untracked-file checks for its paths, and ignoring an untracked path does not
+disable size-limit checks for a tracked movie or episode.
 
 ## Orphan scanning
 

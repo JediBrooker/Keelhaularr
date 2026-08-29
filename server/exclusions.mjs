@@ -8,7 +8,7 @@ export function listExclusions() {
 }
 
 export function filterExcluded(candidates) {
-  const keys = new Set(store.read().records.flatMap((record) => record.keys));
+  const keys = new Set(store.read().records.flatMap((record) => Array.isArray(record.keys) ? record.keys : []));
   return candidates.filter((candidate) => !candidate.exclusionKeys?.some((key) => keys.has(key)));
 }
 
@@ -20,10 +20,13 @@ export async function addExclusions(candidates) {
     title: candidate.title,
     subtitle: candidate.subtitle,
     keys: [...candidate.exclusionKeys],
+    scope: candidate.scope === 'orphan' ? 'orphan' : 'oversized',
+    path: candidate.path,
+    sizeBytes: candidate.sizeBytes,
     createdAt: now,
   }));
   await store.update((document) => {
-    const existingKeys = new Set(document.records.flatMap((record) => record.keys));
+    const existingKeys = new Set(document.records.flatMap((record) => Array.isArray(record.keys) ? record.keys : []));
     for (const record of records) {
       if (record.keys.some((key) => existingKeys.has(key))) continue;
       document.records.push(record);

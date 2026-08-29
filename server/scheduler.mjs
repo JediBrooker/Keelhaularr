@@ -57,6 +57,7 @@ export async function runScheduledScan(config, trigger = 'manual') {
     const arr = await scanArr(config);
     const orphans = await scanOrphans(config, arr);
     const oversized = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
+    const orphanCandidates = filterExcluded(orphans.candidates);
     const purged = await cleanupExpiredQuarantine(config.quarantineRetentionDays);
     const report = {
       id: randomUUID(),
@@ -64,8 +65,8 @@ export async function runScheduledScan(config, trigger = 'manual') {
       scannedAt: new Date().toISOString(),
       oversizedCount: oversized.length,
       oversizedBytes: bytes(oversized),
-      orphanCount: orphans.candidates.length,
-      orphanBytes: bytes(orphans.candidates),
+      orphanCount: orphanCandidates.length,
+      orphanBytes: bytes(orphanCandidates),
       purgedQuarantineCount: purged.length,
       warnings: [
         ...arr.radarr.warnings, ...arr.sonarr.warnings, ...orphans.warnings,

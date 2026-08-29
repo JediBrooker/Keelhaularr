@@ -552,16 +552,94 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   ]);
   assert.equal(scan.warnings.some((warning) => /qBittorrent/.test(warning)), false);
 
+  const invalidIgnoreScope = await request('/api/exclusions', {
+    ids: [scan.oversized[0].id],
+    scope: 'unknown',
+  });
+  assert.equal(invalidIgnoreScope.status, 400);
+  assert.deepEqual(await invalidIgnoreScope.json(), {
+    error: 'Choose either oversized or orphan ignore scope.',
+  });
+
   const exclusionResponse = await request('/api/exclusions', { ids: [scan.oversized[0].id] });
   assert.equal(exclusionResponse.status, 200);
   const exclusions = (await exclusionResponse.json()).exclusions;
   assert.equal(exclusions.length, 1);
+  const ignoredOversized = scan.oversized.find((item) => item.id === scan.oversized[0].id);
+  assert.deepEqual({
+    scope: exclusions[0].scope,
+    path: exclusions[0].path,
+    sizeBytes: exclusions[0].sizeBytes,
+  }, {
+    scope: 'oversized',
+    path: ignoredOversized.path,
+    sizeBytes: ignoredOversized.sizeBytes,
+  });
   const excludedScan = await request('/api/scan');
   assert.equal((await excludedScan.json()).oversized.length, 1);
   const removeExclusionResponse = await request(`/api/exclusions/${exclusions[0].id}`, {}, 'DELETE');
   assert.equal(removeExclusionResponse.status, 200);
   const restoredScan = await request('/api/scan');
   assert.equal((await restoredScan.json()).oversized.length, 2);
+
+  const ignoredOrphan = scan.orphans.find((item) => item.path === orphanMovie);
+  assert.ok(ignoredOrphan);
+  assert.equal(ignoredOrphan.exclusionKeys.length, 1);
+  const orphanExclusionResponse = await request('/api/exclusions', { ids: [ignoredOrphan.id], scope: 'orphan' });
+  assert.equal(orphanExclusionResponse.status, 200);
+  const orphanExclusions = (await orphanExclusionResponse.json()).exclusions;
+  assert.equal(orphanExclusions.length, 1);
+  const orphanExclusion = orphanExclusions[0];
+  assert.deepEqual({
+    scope: orphanExclusion.scope,
+    app: orphanExclusion.app,
+    title: orphanExclusion.title,
+    subtitle: orphanExclusion.subtitle,
+    path: orphanExclusion.path,
+    sizeBytes: orphanExclusion.sizeBytes,
+    keys: orphanExclusion.keys,
+  }, {
+    scope: 'orphan',
+    app: ignoredOrphan.app,
+    title: ignoredOrphan.title,
+    subtitle: ignoredOrphan.subtitle,
+    path: ignoredOrphan.path,
+    sizeBytes: ignoredOrphan.sizeBytes,
+    keys: ignoredOrphan.exclusionKeys,
+  });
+  const storedExclusions = JSON.parse(await readFile(path.join(tempRoot, 'config', 'exclusions.json'), 'utf8'));
+  assert.equal(storedExclusions.records[0].scope, 'orphan');
+  assert.equal(storedExclusions.records[0].path, orphanMovie);
+  assert.equal(storedExclusions.records[0].sizeBytes, ignoredOrphan.sizeBytes);
+
+  const ignoredOrphanScanResponse = await request('/api/scan');
+  assert.equal(ignoredOrphanScanResponse.status, 200);
+  const ignoredOrphanScan = await ignoredOrphanScanResponse.json();
+  assert.equal(ignoredOrphanScan.orphans.some((item) => item.id === ignoredOrphan.id), false);
+  const ignoredOrphanAction = await request('/api/orphans/apply', {
+    ids: [ignoredOrphan.id],
+    action: 'quarantine',
+  });
+  assert.equal(ignoredOrphanAction.status, 409);
+  assert.deepEqual(await ignoredOrphanAction.json(), {
+    error: 'None of the selected orphan files are still eligible.',
+  });
+
+  const ignoredScheduleResponse = await request('/api/schedule/run');
+  assert.equal(ignoredScheduleResponse.status, 200);
+  const ignoredReport = (await ignoredScheduleResponse.json()).report;
+  assert.equal(ignoredReport.orphanCount, scan.orphans.length - 1);
+  assert.equal(
+    ignoredReport.orphanBytes,
+    scan.orphans.reduce((total, item) => total + item.sizeBytes, 0) - ignoredOrphan.sizeBytes,
+  );
+
+  const removeOrphanExclusionResponse = await request(`/api/exclusions/${orphanExclusion.id}`, {}, 'DELETE');
+  assert.equal(removeOrphanExclusionResponse.status, 200);
+  assert.deepEqual((await removeOrphanExclusionResponse.json()).exclusions, []);
+  const restoredOrphanScanResponse = await request('/api/scan');
+  assert.equal(restoredOrphanScanResponse.status, 200);
+  assert.equal((await restoredOrphanScanResponse.json()).orphans.some((item) => item.id === ignoredOrphan.id), true);
 
   const oversized = await request('/api/oversized/apply', { ids: scan.oversized.map((item) => item.id) });
   assert.equal(oversized.status, 202);
@@ -646,7 +724,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const reportResponse = await request('/api/schedule/run');
   assert.equal(reportResponse.status, 200);
   assert.equal((await reportResponse.json()).report.notification.status, 'sent');
-  assert.equal(notifications.length, 1);
+  assert.equal(notifications.length, 2);
 
   const unauthenticated = await fetch(`${base}/api/status`);
   assert.equal(unauthenticated.status, 401);

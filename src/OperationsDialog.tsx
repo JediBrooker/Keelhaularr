@@ -8,7 +8,7 @@ const opsTabLabels: Record<OpsTab, string> = {
   jobs: 'Jobs',
   brig: 'Quarantine',
   storage: 'Storage health',
-  exclusions: 'Exclusions',
+  exclusions: 'Ignore list',
   schedule: 'Maintenance',
 };
 const activeJobStatuses = new Set(['queued', 'running', 'cancelling']);
@@ -108,6 +108,9 @@ interface Exclusion {
   title: string;
   subtitle: string;
   createdAt: string;
+  scope?: 'oversized' | 'orphan';
+  path?: string;
+  sizeBytes?: number | null;
 }
 
 interface StorageResult {
@@ -134,6 +137,16 @@ function formatBytes(bytes: number) {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   const order = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** order).toFixed(order >= 3 ? 2 : 1)} ${units[order]}`;
+}
+
+function ignoredAtLabel(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? 'date unavailable' : date.toLocaleString();
+}
+
+function ignoreScopeLabel(scope?: Exclusion['scope']) {
+  if (scope === 'orphan') return 'Untracked file';
+  return 'Size-limit file';
 }
 
 function fallbackLabel(value: string) {
@@ -351,7 +364,7 @@ export function OperationsDialog({ initialTab = 'jobs', onClose, onChanged, onJo
     >
       <section className="settings-dialog operations-dialog">
         <header className="settings-header">
-          <div><p className="eyebrow gold">SHIP’S OPERATIONS</p><h2 ref={titleRef} id="operations-title" tabIndex={-1}>Jobs, quarantine & health</h2><p id="operations-description">Track file actions, restore quarantined files, and inspect storage and maintenance reports.</p></div>
+          <div><p className="eyebrow gold">SHIP’S OPERATIONS</p><h2 ref={titleRef} id="operations-title" tabIndex={-1}>Operations & file safety</h2><p id="operations-description">Track file actions, manage the ignore list, restore quarantined files, and inspect storage and maintenance reports.</p></div>
           <button type="button" className="settings-close" onClick={() => dialogRef.current?.close()} aria-label="Close operations">×</button>
         </header>
         <nav className="operations-tabs" aria-label="Operations sections">
@@ -392,7 +405,27 @@ export function OperationsDialog({ initialTab = 'jobs', onClose, onChanged, onJo
             return <article className="health-row" key={root.id}><div><span className={`app-chip ${root.app}`}>{root.app}</span><strong>{fallbackLabel(root.kind)}</strong><p>{root.path}</p></div><div><Status value={health} label={statusLabel(health, { healthy: 'Healthy', warning: 'Needs attention', error: 'Error' })} /><small>{root.freeBytes === null ? root.error : `${formatBytes(root.freeBytes)} free`}</small></div></article>;
           })}{storage?.compatibility.map((item) => <div className={`hardlink-check ${item.hardlinksPossible ? 'success' : 'warning'}`} key={`${item.app}-${item.downloadRoot}`}><strong>{item.hardlinksPossible ? 'Hardlinks possible' : 'Filesystem mismatch'}</strong><span>{item.downloadRoot}</span><p>{item.detail}</p></div>)}</div>}
 
-          {tab === 'exclusions' && <div className="ops-list">{!exclusions.length && <div className="ops-empty"><h3>No exclusions</h3><p>Use the scan result batch controls to exclude selected files from size-limit findings.</p></div>}{exclusions.map((record) => <article className="record-card" key={record.id}><div><span className={`app-chip ${record.app}`}>{record.app}</span><h3>{record.title}</h3><p>{record.subtitle}</p><small>Excluded {new Date(record.createdAt).toLocaleString()}</small></div><button type="button" className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`exclude-${record.id}`, async () => { await api(`/api/exclusions/${record.id}`, { method: 'DELETE' }); }, loadExclusions, true)}>Remove exclusion</button></article>)}</div>}
+          {tab === 'exclusions' && <div className="ops-list">
+            {!exclusions.length && <div className="ops-empty"><h3>Ignore list is empty</h3><p>Ignore selected untracked or size-limit scan results to keep them out of future findings. Removed items return on the next scan if they still match.</p></div>}
+            {exclusions.map((record) => {
+              const actionKey = `ignore-remove-${record.id}`;
+              const path = record.path?.trim();
+              const rawSubtitle = record.subtitle?.trim();
+              const subtitle = rawSubtitle === '.' ? 'Library root' : rawSubtitle;
+              const title = record.title?.trim() || path || 'Ignored file';
+              const hasSize = typeof record.sizeBytes === 'number' && Number.isFinite(record.sizeBytes) && record.sizeBytes >= 0;
+              return <article className="record-card ignore-record" key={record.id}>
+                <div>
+                  <div className="ignore-record-tags"><span className={`app-chip ${record.app}`}>{record.app}</span><span className={`app-chip ignore-scope ${record.scope ?? 'legacy'}`}>{ignoreScopeLabel(record.scope)}</span></div>
+                  <h3>{title}</h3>
+                  {path ? <p className="ignore-path" title={path}>{path}</p> : <p className="ignore-path muted">Path unavailable for this older ignore-list entry.</p>}
+                  {subtitle && subtitle !== path && <p className="ignore-summary">{subtitle}</p>}
+                  <small>{hasSize ? `${formatBytes(record.sizeBytes as number)} · ` : ''}Ignored {ignoredAtLabel(record.createdAt)}</small>
+                </div>
+                <div className="record-actions"><button type="button" className="ghost-button compact" disabled={Boolean(busy)} aria-label={`Remove ${title} from ignore list`} onClick={() => action(actionKey, async () => { await api(`/api/exclusions/${record.id}`, { method: 'DELETE' }); }, loadExclusions, true)}>{busy === actionKey ? 'Removing…' : 'Remove from ignore list'}</button></div>
+              </article>;
+            })}
+          </div>}
 
           {tab === 'schedule' && <div className="ops-list"><div className="ops-toolbar"><div><h3>Scheduled maintenance</h3><p>Scheduled and manual maintenance scan for findings, apply configured quarantine retention, and may permanently delete expired quarantined files.</p></div><button type="button" className="primary-button compact" disabled={Boolean(busy)} onClick={runScheduled}>{busy === 'schedule' ? 'Running maintenance…' : 'Run maintenance now'}</button></div>{schedule?.lastReport ? <article className="schedule-report"><h3>Latest maintenance run</h3><div><strong>{schedule.lastReport.oversizedCount}</strong><span>over size limits · {formatBytes(schedule.lastReport.oversizedBytes)}</span></div><div><strong>{schedule.lastReport.orphanCount}</strong><span>untracked · {formatBytes(schedule.lastReport.orphanBytes)}</span></div>{typeof schedule.lastReport.purgedQuarantineCount === 'number' && <div><strong>{schedule.lastReport.purgedQuarantineCount}</strong><span>expired quarantine file(s) permanently deleted</span></div>}<p>Notification: {statusLabel(schedule.lastReport.notification.status, notificationStatusLabels)}{schedule.lastReport.notification.error ? ` · ${schedule.lastReport.notification.error}` : ''}</p>{schedule.lastReport.warnings?.map((warning, index) => <p className="notice warning" key={index}>{warning}</p>)}<small>Last run {schedule.lastRunAt ? new Date(schedule.lastRunAt).toLocaleString() : 'never'}{schedule.nextRunAt ? ` · next ${new Date(schedule.nextRunAt).toLocaleString()}` : ''}</small></article> : <div className="ops-empty"><h3>No maintenance runs yet</h3><p>Run maintenance now or enable scheduled maintenance in Settings.</p></div>}</div>}
         </div>

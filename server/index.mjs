@@ -390,6 +390,7 @@ app.post('/api/scan', async (request, response, next) => {
     const arr = await scanArr(config);
     const orphans = await scanOrphans(config, arr);
     const oversized = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
+    const orphanCandidates = filterExcluded(orphans.candidates);
     response.json({
       scannedAt: new Date().toISOString(),
       config: publicConfig(config),
@@ -398,7 +399,7 @@ app.post('/api/scan', async (request, response, next) => {
         sonarr: { status: arr.sonarr.status, version: arr.sonarr.version, error: arr.sonarr.error },
       },
       oversized: oversized.sort((a, b) => b.overageBytes - a.overageBytes),
-      orphans: orphans.candidates.sort((a, b) => b.sizeBytes - a.sizeBytes),
+      orphans: orphanCandidates.sort((a, b) => b.sizeBytes - a.sizeBytes),
       roots: orphans.roots,
       qbittorrentSafety: orphans.qbittorrentSafety,
       warnings: [...arr.radarr.warnings, ...arr.sonarr.warnings, ...orphans.warnings],
@@ -479,11 +480,21 @@ app.get('/api/exclusions', (request, response) => {
 app.post('/api/exclusions', async (request, response, next) => {
   try {
     const ids = Array.isArray(request.body?.ids) ? request.body.ids.filter((id) => typeof id === 'string') : [];
-    if (!ids.length || ids.length > 10000) return response.status(400).json({ error: 'Select between 1 and 10,000 files to exclude.' });
-    const arr = await scanArr(currentConfig());
+    if (!ids.length || ids.length > 10000) return response.status(400).json({ error: 'Select between 1 and 10,000 files to ignore.' });
+    const scope = request.body?.scope ?? 'oversized';
+    if (scope !== 'oversized' && scope !== 'orphan') {
+      return response.status(400).json({ error: 'Choose either oversized or orphan ignore scope.' });
+    }
+    const config = currentConfig();
+    const arr = await scanArr(config);
     const requested = new Set(ids);
-    const candidates = [...arr.radarr.candidates, ...arr.sonarr.candidates].filter((candidate) => requested.has(candidate.id));
-    if (!candidates.length) return response.status(409).json({ error: 'None of the selected files are still oversized.' });
+    const currentCandidates = scope === 'oversized'
+      ? [...arr.radarr.candidates, ...arr.sonarr.candidates]
+      : (await scanOrphans(config, arr)).candidates;
+    const candidates = currentCandidates
+      .filter((candidate) => requested.has(candidate.id))
+      .map((candidate) => ({ ...candidate, scope }));
+    if (!candidates.length) return response.status(409).json({ error: 'None of the selected files are still eligible to ignore.' });
     response.json({ exclusions: await addExclusions(candidates) });
   } catch (error) {
     next(error);

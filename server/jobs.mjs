@@ -226,7 +226,7 @@ export async function createOrphanJob(config, requestedIds, action) {
   const arr = await scanArr(config);
   const current = await scanOrphans(config, arr);
   const requested = new Set(requestedIds);
-  const candidates = current.candidates.filter((candidate) => requested.has(candidate.id));
+  const candidates = filterExcluded(current.candidates).filter((candidate) => requested.has(candidate.id));
   if (!candidates.length) inputError('None of the selected orphan files are still eligible.', 409);
   const now = new Date().toISOString();
   return saveNewJob({
@@ -653,7 +653,8 @@ async function processJob(job) {
           throw new Error('qBittorrent safety settings changed after this job was approved. Start a fresh orphan scan and job.');
         }
         const arr = await scanArr(config);
-        eligibleIds = new Set((await scanOrphans(config, arr)).candidates.map((candidate) => candidate.id));
+        const candidates = filterExcluded((await scanOrphans(config, arr)).candidates);
+        eligibleIds = new Set(candidates.map((candidate) => candidate.id));
         break;
       }
       case 'qbittorrent-recovery':

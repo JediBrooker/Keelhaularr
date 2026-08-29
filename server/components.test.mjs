@@ -11,6 +11,7 @@ process.env.CONFIG_DIR = path.join(testRoot, 'config');
 const { createJsonStore } = await import('./state.mjs');
 const { cleanupExpiredQuarantine, listQuarantine, recordQuarantine, restoreQuarantine } = await import('./quarantine.mjs');
 const appSource = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const operationsSource = await readFile(new URL('../src/OperationsDialog.tsx', import.meta.url), 'utf8');
 const settingsSource = await readFile(new URL('../src/SettingsDialog.tsx', import.meta.url), 'utf8');
 after(() => rm(testRoot, { recursive: true, force: true }));
 
@@ -184,6 +185,32 @@ test('untracked-file settings no longer contain a global action or permanent-del
   assert.match(settingsSource, /className="field wide-field"><label htmlFor="quarantine-directory"/);
 });
 
+test('both result types can be ignored and restored from the ignore list', () => {
+  const ignoreSelection = sourceSection(
+    'async function ignoreSelection()',
+    'async function applySelection',
+  );
+  const manifestControls = sourceSection(
+    '<div className="manifest-tools">',
+    '{!scan ? (',
+  );
+
+  assert.doesNotMatch(ignoreSelection, /tab !== 'oversized'/);
+  assert.match(ignoreSelection, /['"]\/api\/exclusions['"]/);
+  assert.match(ignoreSelection, /scope: tab === 'orphans' \? 'orphan' : 'oversized'/);
+  assert.match(ignoreSelection, /if \(await runScan\(\)\)/);
+  assert.match(ignoreSelection, /Operations → Ignore list/);
+  assert.match(manifestControls, /onClick=\{ignoreSelection\}/);
+  assert.match(manifestControls, /'Ignore selected'/);
+  assert.match(manifestControls, /setOperationsTab\('exclusions'\)/);
+  assert.match(manifestControls, />Ignore list<\/button>/);
+  assert.match(operationsSource, /exclusions: 'Ignore list'/);
+  assert.match(operationsSource, /Untracked file/);
+  assert.match(operationsSource, /Size-limit file/);
+  assert.match(operationsSource, /Remove from ignore list/);
+  assert.doesNotMatch(operationsSource, />Remove exclusion<|<h3>No exclusions<|>Exclusions</);
+});
+
 test('atomic state updates are serialized and kept private', async () => {
   const store = createJsonStore('counter.json', { version: 1, counter: 0 });
   await Promise.all(Array.from({ length: 40 }, () => store.update((document) => {
@@ -254,6 +281,32 @@ test('an orphan that gains a hardlink after scanning is preserved', async () => 
   await link(source, path.join(mediaRoot, 'imported.mkv'));
   await assert.rejects(applyOrphanCandidate(config, scan.candidates[0]), /changed after revalidation/);
   assert.equal((await stat(source)).nlink, 2);
+});
+
+test('orphan ignore identity follows the exact path across Arr ownership', async () => {
+  const sharedRoot = path.join(testRoot, 'shared-ignore-root');
+  await mkdir(sharedRoot);
+  const sharedPath = path.join(sharedRoot, 'shared-orphan.mkv');
+  await writeFile(sharedPath, 'shared orphan fixture');
+  const config = {
+    radarr: { mediaRoots: [sharedRoot], downloadRoots: [] },
+    sonarr: { mediaRoots: [sharedRoot], downloadRoots: [] },
+    qbittorrent: { configured: false },
+    ignoreDirectories: new Set(),
+    extensions: new Set(['.mkv']),
+    maxFiles: 100,
+    hardlinkMinAgeHours: 0,
+  };
+  const arr = {
+    radarr: { status: 'connected', knownPaths: new Set() },
+    sonarr: { status: 'connected', knownPaths: new Set() },
+  };
+
+  const scan = await scanOrphans(config, arr);
+  const candidates = scan.candidates.filter((candidate) => candidate.path === sharedPath);
+  assert.deepEqual(candidates.map((candidate) => candidate.app).sort(), ['radarr', 'sonarr']);
+  assert.equal(new Set(candidates.flatMap((candidate) => candidate.exclusionKeys)).size, 1);
+  assert.match(candidates[0].exclusionKeys[0], /^orphan:path:/);
 });
 
 test('qBittorrent excludes incomplete torrent content but leaves completed downloads eligible', async (context) => {

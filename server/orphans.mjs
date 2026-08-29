@@ -8,6 +8,10 @@ function orphanId(app, filePath) {
   return createHash('sha256').update(`${app}\0${filePath}`).digest('hex').slice(0, 24);
 }
 
+function orphanExclusionKey(filePath) {
+  return `orphan:path:${createHash('sha256').update(filePath).digest('hex')}`;
+}
+
 function isWithin(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
@@ -162,15 +166,18 @@ export async function scanOrphans(config, arrResults) {
       await walk(root, config, files);
       roots.push({ app, kind: 'library', path: root, filesScanned: files.length });
       for (const file of files) {
+        const relativePath = path.relative(root, file.path);
+        const relativeDirectory = path.dirname(relativePath);
         libraryIdentities.add(file.identity);
         if (known.has(file.path)) continue;
         candidates.push({
           id: orphanId(app, file.path),
           app,
+          exclusionKeys: [orphanExclusionKey(file.path)],
           title: path.basename(file.path),
-          subtitle: path.dirname(path.relative(root, file.path)) || 'Library root',
+          subtitle: relativeDirectory === '.' ? 'Library root' : relativeDirectory,
           path: file.path,
-          relativePath: path.relative(root, file.path),
+          relativePath,
           root,
           sizeBytes: file.sizeBytes,
           modifiedAt: file.modifiedAt,
@@ -212,6 +219,7 @@ export async function scanOrphans(config, arrResults) {
         candidates.push({
           id: orphanId(app, file.path),
           app,
+          exclusionKeys: [orphanExclusionKey(file.path)],
           title: path.basename(file.path),
           subtitle: `No ${app === 'radarr' ? 'Radarr' : 'Sonarr'} library hardlink`,
           path: file.path,
