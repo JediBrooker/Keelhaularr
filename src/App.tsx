@@ -10,6 +10,7 @@ type OrphanAction = 'quarantine' | 'permanent';
 type ConfirmationStage = 'closed' | 'choose' | 'permanent';
 type ConnectionState = 'checking' | 'connected' | 'error' | 'not-configured';
 const manifestTabs: Tab[] = ['oversized', 'orphans'];
+const arrConnectionRecheckMs = 30_000;
 
 interface ConnectionStatus {
   state: ConnectionState;
@@ -370,9 +371,12 @@ export default function App() {
     error: string | null;
   }>({ state: 'not-configured', error: null });
   const [arrConnectionProbeRevision, setArrConnectionProbeRevision] = useState(0);
+  const [qbittorrentProbeRevision, setQbittorrentProbeRevision] = useState(0);
   const scanRequestId = useRef(0);
   const arrConnectionsRequestId = useRef(0);
   const qbittorrentRequestId = useRef(0);
+  const showArrConnectionChecking = useRef(true);
+  const lastAutomaticArrProbeAt = useRef(0);
 
   useEffect(() => {
     api<{ authenticated: boolean; setupRequired: boolean }>('/api/auth/status')
@@ -397,6 +401,7 @@ export default function App() {
   useEffect(() => {
     const requestId = ++arrConnectionsRequestId.current;
     if (auth !== 'signed-in' || !config) {
+      showArrConnectionChecking.current = true;
       setArrConnections(emptyArrConnections());
       return;
     }
@@ -405,7 +410,9 @@ export default function App() {
       radarr: config.radarr.configured,
       sonarr: config.sonarr.configured,
     };
-    setArrConnections(pendingArrConnections(config));
+    const shouldShowChecking = showArrConnectionChecking.current;
+    showArrConnectionChecking.current = true;
+    if (shouldShowChecking) setArrConnections(pendingArrConnections(config));
     if (!configured.radarr && !configured.sonarr) return;
 
     const controller = new AbortController();
@@ -450,6 +457,29 @@ export default function App() {
   }, [auth, config?.radarr.configured, config?.sonarr.configured, arrConnectionProbeRevision]);
 
   useEffect(() => {
+    if (auth !== 'signed-in' || !config
+      || (!config.radarr.configured && !config.sonarr.configured)) return;
+
+    function requestAutomaticProbe() {
+      if (document.visibilityState !== 'visible') return;
+      const now = Date.now();
+      if (now - lastAutomaticArrProbeAt.current < 1_000) return;
+      lastAutomaticArrProbeAt.current = now;
+      showArrConnectionChecking.current = false;
+      setArrConnectionProbeRevision((current) => current + 1);
+    }
+
+    const interval = window.setInterval(requestAutomaticProbe, arrConnectionRecheckMs);
+    window.addEventListener('focus', requestAutomaticProbe);
+    document.addEventListener('visibilitychange', requestAutomaticProbe);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', requestAutomaticProbe);
+      document.removeEventListener('visibilitychange', requestAutomaticProbe);
+    };
+  }, [auth, config?.radarr.configured, config?.sonarr.configured]);
+
+  useEffect(() => {
     const requestId = ++qbittorrentRequestId.current;
     if (auth !== 'signed-in' || !config?.qbittorrent.configured) {
       setQbittorrentConnection({ state: 'not-configured', error: null });
@@ -486,7 +516,7 @@ export default function App() {
       });
 
     return () => controller.abort();
-  }, [auth, config]);
+  }, [auth, config, qbittorrentProbeRevision]);
 
   const source = tab === 'oversized' ? scan?.oversized ?? [] : scan?.orphans ?? [];
   const visible = useMemo(() => {
@@ -549,6 +579,15 @@ export default function App() {
     setSelected(new Set());
     setMessage('Standing orders changed. Run a fresh scan when ready.');
     setError('');
+  }
+
+  function connectionTested(app: AppKind | 'qbittorrent') {
+    if (app === 'qbittorrent') {
+      setQbittorrentProbeRevision((current) => current + 1);
+      return;
+    }
+    showArrConnectionChecking.current = false;
+    setArrConnectionProbeRevision((current) => current + 1);
   }
 
   async function runScan() {
@@ -874,7 +913,7 @@ export default function App() {
         onChoosePermanent={() => setConfirmationStage('permanent')}
         onConfirmPermanent={() => { void applySelection('permanent'); }}
       />
-      {showSettings && <SettingsDialog onboarding={!config?.radarr.configured && !config?.sonarr.configured} onClose={() => setShowSettings(false)} onSaved={settingsSaved} />}
+      {showSettings && <SettingsDialog onboarding={!config?.radarr.configured && !config?.sonarr.configured} onClose={() => setShowSettings(false)} onSaved={settingsSaved} onConnectionTested={connectionTested} />}
       {showOperations && <OperationsDialog initialTab={operationsTab} onClose={() => setShowOperations(false)} onChanged={async () => { if (scan) await runScan(); }} onJobQueued={refreshWhenJobSettles} />}
       </main>
     </>

@@ -70,6 +70,61 @@ test('Arr connection probes refresh after settings save and ignore stale respons
   assert.match(settingsSaved, /setArrConnectionProbeRevision\(\(current\) => current \+ 1\)/);
 });
 
+test('successful connection tests re-probe the saved header connection state', () => {
+  const settingsDialogIndex = settingsSource.indexOf('export function SettingsDialog');
+  assert.notEqual(settingsDialogIndex, -1);
+  const settingsDialog = settingsSource.slice(settingsDialogIndex);
+  const arrTestStart = settingsSource.indexOf('async function testConnection(app: AppKind)');
+  const arrTestEnd = settingsSource.indexOf('async function testQbittorrent()', arrTestStart);
+  assert.notEqual(arrTestStart, -1);
+  assert.notEqual(arrTestEnd, -1);
+  const arrTest = settingsSource.slice(arrTestStart, arrTestEnd);
+  const connectionTested = sourceSection(
+    "function connectionTested(app: AppKind | 'qbittorrent')",
+    'async function runScan()',
+  );
+
+  assert.match(settingsDialog, /onConnectionTested\?: \(app: TestKind\) => void/);
+  assert.equal(arrTest.match(/onConnectionTested\?\.\(app\)/g)?.length, 1);
+  assert.ok(arrTest.indexOf('onConnectionTested?.(app)') < arrTest.indexOf('} catch'));
+  assert.match(settingsDialog, /onConnectionTested\?\.\('qbittorrent'\)/);
+  assert.match(connectionTested, /setArrConnectionProbeRevision\(\(current\) => current \+ 1\)/);
+  assert.match(connectionTested, /setQbittorrentProbeRevision\(\(current\) => current \+ 1\)/);
+  assert.doesNotMatch(connectionTested, /setArrConnections|apiKey|url/);
+  assert.match(appSource, /onConnectionTested=\{connectionTested\}/);
+});
+
+test('Arr header connection failures recover automatically without pill flicker', () => {
+  const probeEffect = sourceSection(
+    'const requestId = ++arrConnectionsRequestId.current;',
+    'const requestId = ++qbittorrentRequestId.current;',
+  );
+  const automaticProbeFunctionIndex = appSource.indexOf('function requestAutomaticProbe()');
+  assert.notEqual(automaticProbeFunctionIndex, -1);
+  const automaticProbeEffectIndex = appSource.lastIndexOf('useEffect(() => {', automaticProbeFunctionIndex);
+  assert.notEqual(automaticProbeEffectIndex, -1);
+  const automaticProbeEndIndex = appSource.indexOf(
+    'const requestId = ++qbittorrentRequestId.current;',
+    automaticProbeFunctionIndex,
+  );
+  assert.notEqual(automaticProbeEndIndex, -1);
+  const automaticProbe = appSource.slice(automaticProbeEffectIndex, automaticProbeEndIndex);
+
+  assert.match(appSource, /const arrConnectionRecheckMs = 30_000/);
+  assert.match(probeEffect, /const shouldShowChecking = showArrConnectionChecking\.current/);
+  assert.match(probeEffect, /if \(shouldShowChecking\) setArrConnections\(pendingArrConnections\(config\)\)/);
+  assert.match(automaticProbe, /document\.visibilityState !== 'visible'/);
+  assert.match(automaticProbe, /showArrConnectionChecking\.current = false/);
+  assert.match(automaticProbe, /setArrConnectionProbeRevision\(\(current\) => current \+ 1\)/);
+  assert.match(automaticProbe, /setInterval\(requestAutomaticProbe, arrConnectionRecheckMs\)/);
+  assert.match(automaticProbe, /addEventListener\('focus', requestAutomaticProbe\)/);
+  assert.match(automaticProbe, /addEventListener\('visibilitychange', requestAutomaticProbe\)/);
+  assert.match(automaticProbe, /clearInterval\(interval\)/);
+  assert.match(automaticProbe, /removeEventListener\('focus', requestAutomaticProbe\)/);
+  assert.match(automaticProbe, /removeEventListener\('visibilitychange', requestAutomaticProbe\)/);
+  assert.match(automaticProbe, /!config\.radarr\.configured && !config\.sonarr\.configured/);
+});
+
 test('qBittorrent connection status still refreshes when a scan replaces config', () => {
   const qbittorrentProbeEffect = sourceSection(
     'const requestId = ++qbittorrentRequestId.current;',
@@ -77,7 +132,7 @@ test('qBittorrent connection status still refreshes when a scan replaces config'
   );
 
   assert.match(qbittorrentProbeEffect, /['"]\/api\/qbittorrent\/status['"]/);
-  assert.match(qbittorrentProbeEffect, /\}, \[auth, config\]\);/);
+  assert.match(qbittorrentProbeEffect, /\}, \[auth, config, qbittorrentProbeRevision\]\);/);
 });
 
 test('Arr connection probes sign out on 401 and expose ordinary connection failures', () => {

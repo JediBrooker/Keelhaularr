@@ -461,7 +461,12 @@ function QBittorrentRecoverySection({ form, categoryDiscovery, canRefreshCategor
   );
 }
 
-export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboarding?: boolean; onClose: () => void; onSaved: () => Promise<void> }) {
+export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnectionTested }: {
+  onboarding?: boolean;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+  onConnectionTested?: (app: TestKind) => void;
+}) {
   const titleRef = useRef<HTMLHeadingElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [section, setSection] = useState<SettingsSectionKey>('connections');
@@ -534,6 +539,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
           : current);
       }
       setTestMessages((current) => ({ ...current, [app]: `Connected${result.version ? ` · v${result.version}` : ''}${roots}` }));
+      onConnectionTested?.(app);
     } catch (error) {
       setTestMessages((current) => ({ ...current, [app]: error instanceof Error ? error.message : String(error) }));
     } finally {
@@ -578,6 +584,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
         ...current,
         qbittorrent: `Connected${result.version ? ` · v${result.version}` : ''} · ${incomplete}${mapping}${outside}`,
       }));
+      onConnectionTested?.('qbittorrent');
     } catch (error) {
       setTestMessages((current) => ({ ...current, qbittorrent: error instanceof Error ? error.message : String(error) }));
     } finally {
