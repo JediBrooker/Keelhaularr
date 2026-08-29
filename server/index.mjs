@@ -12,6 +12,7 @@ import {
   exclusionSummary,
   filterExcluded,
   listExclusions,
+  refreshExclusionOverages,
   removeExclusion,
 } from './exclusions.mjs';
 import {
@@ -399,6 +400,7 @@ app.post('/api/scan', async (request, response, next) => {
   try {
     const config = currentConfig();
     const arr = await scanArr(config);
+    await refreshExclusionOverages(arr);
     const orphans = await scanOrphans(config, arr);
     const oversized = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
     const orphanCandidates = filterExcluded(orphans.candidates);
@@ -500,6 +502,7 @@ app.post('/api/exclusions', async (request, response, next) => {
     }
     const config = currentConfig();
     const arr = await scanArr(config);
+    await refreshExclusionOverages(arr);
     const requested = new Set(ids);
     const currentCandidates = scope === 'oversized'
       ? [...arr.radarr.candidates, ...arr.sonarr.candidates]

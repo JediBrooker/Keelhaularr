@@ -106,12 +106,16 @@ interface IgnoreSummary {
   count: number;
   totalSizeBytes: number;
   unknownSizeCount: number;
+  totalOverageBytes: number;
+  unknownOverageCount: number;
 }
 
 const emptyIgnoreSummary = (): IgnoreSummary => ({
   count: 0,
   totalSizeBytes: 0,
   unknownSizeCount: 0,
+  totalOverageBytes: 0,
+  unknownOverageCount: 0,
 });
 
 function normalizeIgnoreSummary(summary?: IgnoreSummary): IgnoreSummary {
@@ -122,6 +126,10 @@ function normalizeIgnoreSummary(summary?: IgnoreSummary): IgnoreSummary {
     totalSizeBytes: Number.isFinite(summary.totalSizeBytes) ? Math.max(0, summary.totalSizeBytes) : 0,
     unknownSizeCount: Number.isFinite(summary.unknownSizeCount)
       ? Math.min(count, Math.max(0, Math.trunc(summary.unknownSizeCount)))
+      : 0,
+    totalOverageBytes: Number.isFinite(summary.totalOverageBytes) ? Math.max(0, summary.totalOverageBytes) : 0,
+    unknownOverageCount: Number.isFinite(summary.unknownOverageCount)
+      ? Math.min(count, Math.max(0, Math.trunc(summary.unknownOverageCount)))
       : 0,
   };
 }
@@ -577,10 +585,24 @@ export default function App() {
   const totalOrphans = scan?.orphans.reduce((sum, item) => sum + item.sizeBytes, 0) ?? 0;
   const ignoredFilesLabel = `${ignoreSummary.count} file${ignoreSummary.count === 1 ? '' : 's'}`;
   const ignoredSizeLabel = formatGib(ignoreSummary.totalSizeBytes);
-  const ignoreSummaryText = `${ignoredFilesLabel} · ${ignoredSizeLabel}${ignoreSummary.unknownSizeCount > 0 ? ` + ${ignoreSummary.unknownSizeCount} unknown` : ''}`;
-  const ignoreSummaryAccessibleLabel = ignoreSummary.unknownSizeCount > 0
-    ? `Ignore list: ${ignoredFilesLabel}; ${ignoredSizeLabel} across files with known sizes; ${ignoreSummary.unknownSizeCount} file${ignoreSummary.unknownSizeCount === 1 ? '' : 's'} with unknown size.`
-    : `Ignore list: ${ignoredFilesLabel}; ${ignoredSizeLabel} total.`;
+  const ignoredOverageLabel = formatGib(ignoreSummary.totalOverageBytes);
+  const unknownSizeText = ignoreSummary.unknownSizeCount > 0
+    ? ` · ${ignoreSummary.unknownSizeCount} size${ignoreSummary.unknownSizeCount === 1 ? '' : 's'} unknown`
+    : '';
+  const unknownOverageText = ignoreSummary.unknownOverageCount > 0
+    ? ` · ${ignoreSummary.unknownOverageCount} overage${ignoreSummary.unknownOverageCount === 1 ? '' : 's'} unknown`
+    : '';
+  const ignoreSummaryText = `${ignoredFilesLabel} · ${ignoredSizeLabel}${ignoreSummary.unknownSizeCount > 0 ? ' known' : ' total'}${unknownSizeText} · ${ignoredOverageLabel} over limit${unknownOverageText}`;
+  const ignoreSummaryAccessibleLabel = [
+    `Ignore list: ${ignoredFilesLabel}.`,
+    ignoreSummary.unknownSizeCount > 0
+      ? `${ignoredSizeLabel} across files with known sizes; ${ignoreSummary.unknownSizeCount} file${ignoreSummary.unknownSizeCount === 1 ? '' : 's'} with unknown size.`
+      : `${ignoredSizeLabel} total.`,
+    `${ignoredOverageLabel} over configured size limits across ignored size-limit files with known overages; untracked files are not included in this overage.`,
+    ignoreSummary.unknownOverageCount > 0
+      ? `${ignoreSummary.unknownOverageCount} ignored size-limit file${ignoreSummary.unknownOverageCount === 1 ? '' : 's'} with unknown overage.`
+      : '',
+  ].filter(Boolean).join(' ');
 
   async function signedIn() {
     const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary }>('/api/status');

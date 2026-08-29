@@ -274,6 +274,8 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     count: 0,
     totalSizeBytes: 0,
     unknownSizeCount: 0,
+    totalOverageBytes: 0,
+    unknownOverageCount: 0,
   });
 
   const directoryUrl = `${base}/api/storage/directories?path=${encodeURIComponent(`${moviesRoot}/`)}`;
@@ -525,7 +527,13 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const scanResponse = await request('/api/scan');
   assert.equal(scanResponse.status, 200);
   const scan = await scanResponse.json();
-  assert.deepEqual(scan.ignoreSummary, { count: 0, totalSizeBytes: 0, unknownSizeCount: 0 });
+  assert.deepEqual(scan.ignoreSummary, {
+    count: 0,
+    totalSizeBytes: 0,
+    unknownSizeCount: 0,
+    totalOverageBytes: 0,
+    unknownOverageCount: 0,
+  });
   assert.deepEqual(scan.oversized.map((item) => item.app).sort(), ['radarr', 'sonarr']);
   assert.equal(scan.oversized.find((item) => item.app === 'radarr').maxMbPerMinute, 60);
   assert.equal(scan.oversized.find((item) => item.app === 'radarr').limitSource, 'arr-quality-definition');
@@ -580,16 +588,22 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     count: 1,
     totalSizeBytes: ignoredOversized.sizeBytes,
     unknownSizeCount: 0,
+    totalOverageBytes: ignoredOversized.overageBytes,
+    unknownOverageCount: 0,
   });
   assert.deepEqual({
     scope: exclusions[0].scope,
     path: exclusions[0].path,
     sizeBytes: exclusions[0].sizeBytes,
+    overageBytes: exclusions[0].overageBytes,
   }, {
     scope: 'oversized',
     path: ignoredOversized.path,
     sizeBytes: ignoredOversized.sizeBytes,
+    overageBytes: ignoredOversized.overageBytes,
   });
+  const storedOversizedExclusions = JSON.parse(await readFile(path.join(tempRoot, 'config', 'exclusions.json'), 'utf8'));
+  assert.equal(storedOversizedExclusions.records[0].overageBytes, ignoredOversized.overageBytes);
   const excludedScan = await request('/api/scan');
   const excludedScanPayload = await excludedScan.json();
   assert.equal(excludedScanPayload.oversized.length, 1);
@@ -600,6 +614,8 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     count: 0,
     totalSizeBytes: 0,
     unknownSizeCount: 0,
+    totalOverageBytes: 0,
+    unknownOverageCount: 0,
   });
   const restoredScan = await request('/api/scan');
   assert.equal((await restoredScan.json()).oversized.length, 2);
@@ -617,6 +633,8 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     count: 1,
     totalSizeBytes: ignoredOrphan.sizeBytes,
     unknownSizeCount: 0,
+    totalOverageBytes: 0,
+    unknownOverageCount: 0,
   });
   assert.deepEqual({
     scope: orphanExclusion.scope,
@@ -639,6 +657,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(storedExclusions.records[0].scope, 'orphan');
   assert.equal(storedExclusions.records[0].path, orphanMovie);
   assert.equal(storedExclusions.records[0].sizeBytes, ignoredOrphan.sizeBytes);
+  assert.equal(Object.hasOwn(storedExclusions.records[0], 'overageBytes'), false);
 
   const ignoredOrphanScanResponse = await request('/api/scan');
   assert.equal(ignoredOrphanScanResponse.status, 200);
@@ -670,6 +689,8 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     count: 0,
     totalSizeBytes: 0,
     unknownSizeCount: 0,
+    totalOverageBytes: 0,
+    unknownOverageCount: 0,
   });
   const restoredOrphanScanResponse = await request('/api/scan');
   assert.equal(restoredOrphanScanResponse.status, 200);
@@ -1064,18 +1085,21 @@ test('ignore summaries preserve legacy records and report unknown sizes safely',
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-ignore-summary-'));
   const configDir = path.join(tempRoot, 'config');
   const knownSizeBytes = 5 * 1024 ** 3;
+  const knownOverageBytes = 2 * 1024 ** 3;
   const records = [
     {
       id: 'known-size',
       keys: ['legacy:known'],
       title: 'Known size',
       sizeBytes: knownSizeBytes,
+      overageBytes: knownOverageBytes,
       createdAt: '2025-01-05T00:00:00.000Z',
     },
     {
       id: 'zero-size',
       keys: ['legacy:zero'],
       title: 'Empty file',
+      scope: 'orphan',
       sizeBytes: 0,
       createdAt: '2025-01-04T00:00:00.000Z',
     },
@@ -1144,7 +1168,13 @@ test('ignore summaries preserve legacy records and report unknown sizes safely',
   assert.equal(login.status, 200);
   const cookie = login.headers.get('set-cookie')?.split(';', 1)[0];
   const headers = { Cookie: cookie };
-  const expectedSummary = { count: 5, totalSizeBytes: knownSizeBytes, unknownSizeCount: 3 };
+  const expectedSummary = {
+    count: 5,
+    totalSizeBytes: knownSizeBytes,
+    unknownSizeCount: 3,
+    totalOverageBytes: knownOverageBytes,
+    unknownOverageCount: 3,
+  };
 
   const statusResponse = await fetch(`${base}/api/status`, { headers });
   assert.equal(statusResponse.status, 200);
@@ -1165,5 +1195,200 @@ test('ignore summaries preserve legacy records and report unknown sizes safely',
   assert.equal(deleteResponse.status, 200);
   const deletePayload = await deleteResponse.json();
   assert.equal(deletePayload.exclusions.length, records.length - 1);
-  assert.deepEqual(deletePayload.ignoreSummary, { count: 4, totalSizeBytes: 0, unknownSizeCount: 3 });
+  assert.deepEqual(deletePayload.ignoreSummary, {
+    count: 4,
+    totalSizeBytes: 0,
+    unknownSizeCount: 3,
+    totalOverageBytes: 0,
+    unknownOverageCount: 3,
+  });
+});
+
+test('manual and scheduled scans refresh exact overages while non-authoritative scans preserve them', async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-ignore-overage-backfill-'));
+  const configDir = path.join(tempRoot, 'config');
+  const gib = 1024 ** 3;
+  const sizeBytes = 10 * gib;
+  const expectedCurrentOverage = sizeBytes - (10 * 1024 ** 2 * 100);
+  const preservedOverage = 1234;
+  const records = [
+    {
+      id: 'legacy-oversized',
+      keys: ['radarr:movie:42'],
+      scope: 'oversized',
+      title: 'Legacy oversized movie',
+      sizeBytes,
+      createdAt: '2025-02-03T00:00:00.000Z',
+    },
+    {
+      id: 'orphan-without-overage',
+      keys: ['orphan:path:fixture'],
+      scope: 'orphan',
+      title: 'Ignored orphan',
+      sizeBytes: gib,
+      createdAt: '2025-02-02T00:00:00.000Z',
+    },
+    {
+      id: 'unmatched-known-overage',
+      keys: ['sonarr:episode:999'],
+      scope: 'oversized',
+      title: 'Previously measured episode',
+      sizeBytes: 2 * gib,
+      overageBytes: preservedOverage,
+      createdAt: '2025-02-01T00:00:00.000Z',
+    },
+  ];
+  await mkdir(configDir, { recursive: true });
+  await writeFile(
+    path.join(configDir, 'exclusions.json'),
+    `${JSON.stringify({ version: 1, records }, null, 2)}\n`,
+  );
+
+  let movieHasFile = true;
+  let movieMonitored = true;
+  let currentMovieFileId = 420;
+  let currentMovieSizeBytes = sizeBytes;
+  let currentRelativePath = 'Legacy.oversized.movie.mkv';
+  const mock = createServer((request, response) => {
+    const url = new URL(request.url, 'http://mock');
+    let value;
+    if (request.method === 'GET' && url.pathname === '/api/v3/system/status') {
+      value = { version: 'test-1.0' };
+    } else if (request.method === 'GET' && url.pathname === '/api/v3/movie') {
+      value = [{
+        id: 42,
+        title: 'Legacy oversized movie',
+        runtime: 100,
+        monitored: movieMonitored,
+        hasFile: movieHasFile,
+        path: '/library/Legacy oversized movie',
+        movieFile: movieHasFile ? {
+          id: currentMovieFileId,
+          size: currentMovieSizeBytes,
+          relativePath: currentRelativePath,
+          quality: { quality: { id: 4, name: 'Bluray-1080p' } },
+        } : null,
+      }];
+    } else {
+      response.writeHead(404, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: 'Not found' }));
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(value));
+  });
+  mock.listen(0, '127.0.0.1');
+  await once(mock, 'listening');
+  const mockAddress = mock.address();
+  const mockPort = typeof mockAddress === 'object' && mockAddress ? mockAddress.port : 0;
+  const port = await freePort();
+  const child = spawn(process.execPath, ['server/index.mjs'], {
+    cwd: path.resolve('.'),
+    env: {
+      ...process.env,
+      CONFIG_DIR: configDir,
+      PORT: String(port),
+      APP_USERNAME: 'captain',
+      APP_PASSWORD: 'backfill-password',
+      APP_SESSION_SECRET: 'backfill-secret',
+      RADARR_URL: `http://127.0.0.1:${mockPort}`,
+      RADARR_API_KEY: 'fixture-key',
+      RADARR_MEDIA_ROOTS: '',
+      RADARR_DOWNLOAD_ROOTS: '',
+      RADARR_MAX_MB_PER_MIN: '',
+      RADARR_OVERSIZE_TOLERANCE_GIB: '',
+      RADARR_USE_ARR_QUALITY_DEFINITIONS: 'false',
+      RADARR_INCLUDE_UNMONITORED: 'false',
+      SONARR_URL: '',
+      SONARR_API_KEY: '',
+      SONARR_MEDIA_ROOTS: '',
+      SONARR_DOWNLOAD_ROOTS: '',
+      SONARR_MAX_MB_PER_MIN: '',
+      SONARR_OVERSIZE_TOLERANCE_GIB: '',
+      QBITTORRENT_URL: '',
+      MAX_MB_PER_MIN: '10',
+      OVERSIZE_TOLERANCE_GIB: '0',
+      SCHEDULE_ENABLED: 'false',
+      NOTIFICATION_WEBHOOK_URL: '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let mockClosed = false;
+  context.after(async () => {
+    child.kill('SIGTERM');
+    if (!mockClosed) mock.close();
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  const base = `http://127.0.0.1:${port}`;
+  await waitFor(`${base}/api/auth/status`);
+  const login = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'captain', password: 'backfill-password' }),
+  });
+  assert.equal(login.status, 200);
+  const headers = { Cookie: login.headers.get('set-cookie')?.split(';', 1)[0] };
+
+  const initialStatus = await fetch(`${base}/api/status`, { headers });
+  assert.equal(initialStatus.status, 200);
+  assert.deepEqual((await initialStatus.json()).ignoreSummary, {
+    count: 3,
+    totalSizeBytes: 13 * gib,
+    unknownSizeCount: 0,
+    totalOverageBytes: preservedOverage,
+    unknownOverageCount: 1,
+  });
+
+  const scanResponse = await fetch(`${base}/api/scan`, { method: 'POST', headers });
+  assert.equal(scanResponse.status, 200);
+  const scan = await scanResponse.json();
+  assert.deepEqual(scan.oversized, []);
+  assert.deepEqual(scan.ignoreSummary, {
+    count: 3,
+    totalSizeBytes: 13 * gib,
+    unknownSizeCount: 0,
+    totalOverageBytes: expectedCurrentOverage + preservedOverage,
+    unknownOverageCount: 0,
+  });
+  const persisted = JSON.parse(await readFile(path.join(configDir, 'exclusions.json'), 'utf8'));
+  assert.equal(persisted.records.find((record) => record.id === 'legacy-oversized').overageBytes, expectedCurrentOverage);
+  assert.equal(Object.hasOwn(persisted.records.find((record) => record.id === 'orphan-without-overage'), 'overageBytes'), false);
+
+  movieHasFile = false;
+  const missingFileScanResponse = await fetch(`${base}/api/scan`, { method: 'POST', headers });
+  assert.equal(missingFileScanResponse.status, 200);
+  assert.deepEqual((await missingFileScanResponse.json()).ignoreSummary, scan.ignoreSummary);
+
+  movieHasFile = true;
+  movieMonitored = false;
+  currentMovieSizeBytes = 500 * 1024 ** 2;
+  const unmonitoredScanResponse = await fetch(`${base}/api/scan`, { method: 'POST', headers });
+  assert.equal(unmonitoredScanResponse.status, 200);
+  assert.deepEqual((await unmonitoredScanResponse.json()).ignoreSummary, scan.ignoreSummary);
+
+  movieMonitored = true;
+  currentMovieFileId = 421;
+  currentRelativePath = 'Legacy.replacement.mkv';
+  const scheduledScanResponse = await fetch(`${base}/api/schedule/run`, { method: 'POST', headers });
+  assert.equal(scheduledScanResponse.status, 200);
+  assert.equal((await scheduledScanResponse.json()).report.oversizedCount, 0);
+  const refreshedStatusResponse = await fetch(`${base}/api/status`, { headers });
+  assert.equal(refreshedStatusResponse.status, 200);
+  const refreshedSummary = (await refreshedStatusResponse.json()).ignoreSummary;
+  assert.deepEqual(refreshedSummary, {
+    count: 3,
+    totalSizeBytes: 13 * gib,
+    unknownSizeCount: 0,
+    totalOverageBytes: preservedOverage,
+    unknownOverageCount: 0,
+  });
+  const refreshedPersistence = JSON.parse(await readFile(path.join(configDir, 'exclusions.json'), 'utf8'));
+  assert.equal(refreshedPersistence.records.find((record) => record.id === 'legacy-oversized').overageBytes, 0);
+
+  await new Promise((resolve) => mock.close(resolve));
+  mockClosed = true;
+  const failedScanResponse = await fetch(`${base}/api/scan`, { method: 'POST', headers });
+  assert.equal(failedScanResponse.status, 200);
+  const failedScan = await failedScanResponse.json();
+  assert.equal(failedScan.connections.radarr.status, 'error');
+  assert.deepEqual(failedScan.ignoreSummary, refreshedSummary);
 });

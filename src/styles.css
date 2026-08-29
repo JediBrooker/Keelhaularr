@@ -151,7 +151,8 @@ body:has(.modal-dialog[open]){overflow:hidden}
   .operations-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:8px 12px;overflow-x:visible;scroll-snap-type:none}
   .operations-tabs button{min-width:0;min-height:44px;padding:8px 5px;white-space:normal;line-height:1.2}
   .ignore-list-summary-button{width:100%;min-height:44px;justify-content:space-between;padding:10px 13px;border-radius:10px}
-  .ignore-list-summary-button>small{margin-left:auto;text-align:right}
+  .ignore-list-summary-button>span{flex:0 0 auto}
+  .ignore-list-summary-button>small{display:block;margin-left:auto;text-align:right;white-space:normal;line-height:1.45}
   .settings-scroll{padding:14px 14px 22px}
   .settings-section{margin-bottom:12px;padding:15px}
   .settings-section-head{align-items:flex-start;margin-bottom:15px}

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { scanArr } from './arr.mjs';
-import { filterExcluded } from './exclusions.mjs';
+import { filterExcluded, refreshExclusionOverages } from './exclusions.mjs';
 import { scanOrphans } from './orphans.mjs';
 import { cleanupExpiredQuarantine } from './quarantine.mjs';
 import { createJsonStore } from './state.mjs';
@@ -55,6 +55,7 @@ export async function runScheduledScan(config, trigger = 'manual') {
   running = true;
   try {
     const arr = await scanArr(config);
+    await refreshExclusionOverages(arr);
     const orphans = await scanOrphans(config, arr);
     const oversized = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
     const orphanCandidates = filterExcluded(orphans.candidates);

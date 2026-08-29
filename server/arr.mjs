@@ -12,6 +12,16 @@ function qualityName(mediaFile) {
   return mediaFile?.quality?.quality?.name ?? mediaFile?.quality?.name ?? 'Unknown quality';
 }
 
+function safeSizeBytes(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function recordOverageObservation(result, app, exclusionKeys, sizeBytes, limitBytes) {
+  const overageBytes = Math.max(0, sizeBytes - limitBytes);
+  result.overageObservations.push({ app, exclusionKeys, sizeBytes, limitBytes, overageBytes });
+  return overageBytes;
+}
+
 function joinArrPath(parent, child) {
   if (!parent) return child ?? '';
   if (!child) return parent;
@@ -86,6 +96,7 @@ function baseResult(kind, configured) {
     status: configured ? 'connecting' : 'not-configured',
     version: null,
     candidates: [],
+    overageObservations: [],
     knownPaths: new Set(),
     warnings: [],
     error: null,
@@ -123,15 +134,20 @@ export async function scanRadarr(connection) {
       const configuredLimitBytes = Math.round(maxMbPerMinute * MIB) * runtimeMinutes;
       const toleranceBytes = Math.round(connection.toleranceGib * GIB);
       const limitBytes = configuredLimitBytes + toleranceBytes;
-      const sizeBytes = Number(mediaFile.size) || 0;
-      if (sizeBytes <= limitBytes) continue;
+      const sizeBytes = safeSizeBytes(mediaFile.size);
+      if (sizeBytes === null) continue;
+      const exclusionKeys = [`radarr:movie:${movie.id}`];
+      const overageBytes = recordOverageObservation(
+        result, 'radarr', exclusionKeys, sizeBytes, limitBytes,
+      );
+      if (overageBytes === 0) continue;
 
       result.candidates.push({
         id: stableId('radarr', mediaFile.id, arrPath),
         app: 'radarr',
         fileId: Number(mediaFile.id),
         searchIds: [Number(movie.id)],
-        exclusionKeys: [`radarr:movie:${movie.id}`],
+        exclusionKeys,
         title: movie.title ?? 'Unknown movie',
         subtitle: [movie.year, qualityName(mediaFile)].filter(Boolean).join(' · '),
         path: arrPath,
@@ -139,7 +155,7 @@ export async function scanRadarr(connection) {
         configuredLimitBytes,
         toleranceBytes,
         limitBytes,
-        overageBytes: sizeBytes - limitBytes,
+        overageBytes,
         runtimeMinutes,
         maxMbPerMinute,
         limitSource,
@@ -220,8 +236,13 @@ export async function scanSonarr(connection) {
         const configuredLimitBytes = Math.round(maxMbPerMinute * MIB) * runtimeMinutes;
         const toleranceBytes = Math.round(connection.toleranceGib * GIB);
         const limitBytes = configuredLimitBytes + toleranceBytes;
-        const sizeBytes = Number(mediaFile.size) || 0;
-        if (sizeBytes <= limitBytes) continue;
+        const sizeBytes = safeSizeBytes(mediaFile.size);
+        if (sizeBytes === null) continue;
+        const exclusionKeys = fileEpisodes.map((episode) => `sonarr:episode:${episode.id}`);
+        const overageBytes = recordOverageObservation(
+          result, 'sonarr', exclusionKeys, sizeBytes, limitBytes,
+        );
+        if (overageBytes === 0) continue;
 
         const code = episodeCode(fileEpisodes);
         const firstTitle = fileEpisodes.length === 1 ? fileEpisodes[0].title : `${fileEpisodes.length} episodes`;
@@ -230,7 +251,7 @@ export async function scanSonarr(connection) {
           app: 'sonarr',
           fileId: Number(mediaFile.id),
           searchIds: fileEpisodes.map((episode) => Number(episode.id)),
-          exclusionKeys: fileEpisodes.map((episode) => `sonarr:episode:${episode.id}`),
+          exclusionKeys,
           title: `${series.title ?? 'Unknown series'} · ${code}`,
           subtitle: [firstTitle, qualityName(mediaFile)].filter(Boolean).join(' · '),
           path: arrPath,
@@ -238,7 +259,7 @@ export async function scanSonarr(connection) {
           configuredLimitBytes,
           toleranceBytes,
           limitBytes,
-          overageBytes: sizeBytes - limitBytes,
+          overageBytes,
           runtimeMinutes,
           maxMbPerMinute,
           limitSource,
