@@ -6,8 +6,20 @@ import { SettingsDialog } from './SettingsDialog';
 
 type AppKind = 'radarr' | 'sonarr';
 type Tab = 'oversized' | 'orphans';
-type ConnectionState = 'checking' | 'connected' | 'error' | 'configured' | 'not-configured';
+type OrphanAction = 'quarantine' | 'permanent';
+type ConfirmationStage = 'closed' | 'choose' | 'permanent';
+type ConnectionState = 'checking' | 'connected' | 'error' | 'not-configured';
 const manifestTabs: Tab[] = ['oversized', 'orphans'];
+
+interface ConnectionStatus {
+  state: ConnectionState;
+  error: string | null;
+}
+
+const emptyArrConnections = (): Record<AppKind, ConnectionStatus> => ({
+  radarr: { state: 'not-configured', error: null },
+  sonarr: { state: 'not-configured', error: null },
+});
 
 function skipToMain(event: MouseEvent<HTMLAnchorElement> | KeyboardEvent<HTMLAnchorElement>) {
   event.preventDefault();
@@ -28,9 +40,15 @@ interface PublicConfig {
   radarr: PublicConnectionConfig;
   sonarr: PublicConnectionConfig;
   qbittorrent: { configured: boolean };
-  orphanAction: 'quarantine' | 'permanent';
   hardlinkMinAgeHours: number;
   protected: boolean;
+}
+
+function pendingArrConnections(config: PublicConfig): Record<AppKind, ConnectionStatus> {
+  return {
+    radarr: { state: config.radarr.configured ? 'checking' : 'not-configured', error: null },
+    sonarr: { state: config.sonarr.configured ? 'checking' : 'not-configured', error: null },
+  };
 }
 
 interface OversizedItem {
@@ -195,9 +213,7 @@ function ConnectionPill({ name, state, error }: {
       ? 'Not connected'
       : state === 'checking'
         ? 'Checking'
-        : state === 'configured'
-          ? 'Configured'
-          : 'Not set';
+        : 'Not set';
   return (
     <div className={`status-pill ${state}`} title={error ?? undefined}>
       <span aria-hidden="true" /><strong>{name}</strong><em>{label}</em>
@@ -256,21 +272,31 @@ function QBittorrentSafetyNotices({ safety }: { safety: QBittorrentSafety }) {
   );
 }
 
-function ConfirmDialog({ open, tab, count, action, busy, onCancel, onConfirm }: {
-  open: boolean;
+function ConfirmDialog({ stage, tab, count, busy, onCancel, onConfirmTracked, onQuarantine, onChoosePermanent, onConfirmPermanent }: {
+  stage: ConfirmationStage;
   tab: Tab;
   count: number;
-  action: 'quarantine' | 'permanent';
   busy: boolean;
   onCancel: () => void;
-  onConfirm: () => void;
+  onConfirmTracked: () => void;
+  onQuarantine: () => void;
+  onChoosePermanent: () => void;
+  onConfirmPermanent: () => void;
 }) {
   const oversized = tab === 'oversized';
+  const finalPermanentConfirmation = !oversized && stage === 'permanent';
   const cancelRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    if (stage === 'closed') return;
+    const frame = window.requestAnimationFrame(() => cancelRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [stage]);
+
   return (
     <ModalDialog
-      open={open}
+      open={stage !== 'closed'}
       labelledBy="confirm-title"
       describedBy="confirm-description"
       className="confirm-modal"
@@ -281,20 +307,37 @@ function ConfirmDialog({ open, tab, count, action, busy, onCancel, onConfirm }: 
     >
       <section className="confirm-dialog">
         <div className="danger-emblem" aria-hidden="true">☠</div>
-        <p className="eyebrow coral">DELETION CONFIRMATION</p>
-        <h2 id="confirm-title">{oversized ? 'Remove selected files and search again?' : action === 'permanent' ? 'Delete selected untracked files permanently?' : 'Quarantine selected untracked files?'}</h2>
+        <p className="eyebrow coral">{oversized ? 'DELETION CONFIRMATION' : finalPermanentConfirmation ? 'FINAL DELETION CONFIRMATION' : 'UNTRACKED-FILE HANDLING'}</p>
+        <h2 id="confirm-title">
+          {oversized
+            ? 'Remove selected files and search again?'
+            : finalPermanentConfirmation
+              ? 'Permanently delete the selected untracked files?'
+              : 'How should these untracked files be handled?'}
+        </h2>
         <p id="confirm-description">
           {oversized
             ? `${count} tracked file(s) will be deleted through their *arr app, then searched again.`
-            : action === 'permanent'
+            : finalPermanentConfirmation
               ? `${count} untracked file(s) will be permanently removed from disk. This cannot be undone.`
-              : `${count} untracked file(s) will be moved into Keelhaularr’s quarantine area.`}
+              : `${count} untracked file(s) can be moved to recoverable quarantine or deleted permanently.`}
         </p>
-        <div className="dialog-actions">
+        <div className={`dialog-actions ${!oversized && !finalPermanentConfirmation ? 'orphan-choice-actions' : ''}`}>
           <button ref={cancelRef} type="button" className="ghost-button" onClick={() => dialogRef.current?.close()} disabled={busy}>CANCEL</button>
-          <button type="button" className="danger-button" onClick={onConfirm} disabled={busy}>
-            {busy ? 'CONFIRMING…' : 'CONFIRM'}
-          </button>
+          {oversized ? (
+            <button type="button" className="danger-button" onClick={onConfirmTracked} disabled={busy}>
+              {busy ? 'CONFIRMING…' : 'CONFIRM'}
+            </button>
+          ) : finalPermanentConfirmation ? (
+            <button type="button" className="danger-button" onClick={onConfirmPermanent} disabled={busy}>
+              {busy ? 'DELETING…' : 'DELETE PERMANENTLY'}
+            </button>
+          ) : <>
+            <button type="button" className="primary-button" onClick={onQuarantine} disabled={busy}>
+              {busy ? 'QUARANTINING…' : 'QUARANTINE'}
+            </button>
+            <button type="button" className="danger-button" onClick={onChoosePermanent} disabled={busy}>DELETE PERMANENTLY</button>
+          </>}
         </div>
       </section>
     </ModalDialog>
@@ -311,7 +354,7 @@ export default function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [scanning, setScanning] = useState(false);
   const [applying, setApplying] = useState(false);
-  const [confirming, setConfirming] = useState(false);
+  const [confirmationStage, setConfirmationStage] = useState<ConfirmationStage>('closed');
   const [showSettings, setShowSettings] = useState(false);
   const [showOperations, setShowOperations] = useState(false);
   const [operationsTab, setOperationsTab] = useState<'jobs' | 'brig' | 'storage' | 'exclusions' | 'schedule'>('jobs');
@@ -321,11 +364,14 @@ export default function App() {
   const [sort, setSort] = useState<'largest' | 'overage' | 'title' | 'oldest'>('largest');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [arrConnections, setArrConnections] = useState<Record<AppKind, ConnectionStatus>>(emptyArrConnections);
   const [qbittorrentConnection, setQbittorrentConnection] = useState<{
     state: ConnectionState;
     error: string | null;
   }>({ state: 'not-configured', error: null });
+  const [arrConnectionProbeRevision, setArrConnectionProbeRevision] = useState(0);
   const scanRequestId = useRef(0);
+  const arrConnectionsRequestId = useRef(0);
   const qbittorrentRequestId = useRef(0);
 
   useEffect(() => {
@@ -338,6 +384,7 @@ export default function App() {
         }
         const statusData = await api<{ config: PublicConfig }>('/api/status');
         setConfig(statusData.config);
+        setArrConnections(pendingArrConnections(statusData.config));
         if (!statusData.config.radarr.configured && !statusData.config.sonarr.configured) setShowSettings(true);
         setAuth('signed-in');
       })
@@ -346,6 +393,61 @@ export default function App() {
         setAuth('signed-out');
       });
   }, []);
+
+  useEffect(() => {
+    const requestId = ++arrConnectionsRequestId.current;
+    if (auth !== 'signed-in' || !config) {
+      setArrConnections(emptyArrConnections());
+      return;
+    }
+
+    const configured = {
+      radarr: config.radarr.configured,
+      sonarr: config.sonarr.configured,
+    };
+    setArrConnections(pendingArrConnections(config));
+    if (!configured.radarr && !configured.sonarr) return;
+
+    const controller = new AbortController();
+    api<{
+      connections: Record<AppKind, {
+        status: 'connected' | 'error' | 'not-configured';
+        version: string | null;
+        error: string | null;
+      }>;
+    }>('/api/connections/status', { signal: controller.signal })
+      .then(({ connections }) => {
+        if (requestId !== arrConnectionsRequestId.current) return;
+        setArrConnections({
+          radarr: { state: connections.radarr.status, error: connections.radarr.error },
+          sonarr: { state: connections.sonarr.status, error: connections.sonarr.error },
+        });
+      })
+      .catch((connectionError) => {
+        if (controller.signal.aborted || requestId !== arrConnectionsRequestId.current) return;
+        if (connectionError instanceof ApiError && connectionError.status === 401) {
+          setAuth('signed-out');
+          setConfig(null);
+          setScan(null);
+          return;
+        }
+        const connectionErrorMessage = connectionError instanceof Error
+          ? connectionError.message
+          : String(connectionError);
+        setArrConnections({
+          radarr: {
+            state: configured.radarr ? 'error' : 'not-configured',
+            error: configured.radarr ? connectionErrorMessage : null,
+          },
+          sonarr: {
+            state: configured.sonarr ? 'error' : 'not-configured',
+            error: configured.sonarr ? connectionErrorMessage : null,
+          },
+        });
+      });
+
+    return () => controller.abort();
+  }, [auth, config?.radarr.configured, config?.sonarr.configured, arrConnectionProbeRevision]);
 
   useEffect(() => {
     const requestId = ++qbittorrentRequestId.current;
@@ -416,12 +518,15 @@ export default function App() {
   async function signedIn() {
     const statusData = await api<{ config: PublicConfig }>('/api/status');
     setConfig(statusData.config);
+    setArrConnections(pendingArrConnections(statusData.config));
     if (!statusData.config.radarr.configured && !statusData.config.sonarr.configured) setShowSettings(true);
     setAuth('signed-in');
   }
 
   async function logout() {
     scanRequestId.current += 1;
+    arrConnectionsRequestId.current += 1;
+    qbittorrentRequestId.current += 1;
     setScanning(false);
     setJobsAwaitingRefresh([]);
     await api('/api/auth/logout', { method: 'POST', body: '{}' }).catch(() => undefined);
@@ -430,6 +535,7 @@ export default function App() {
     setAuth('signed-out');
     setScan(null);
     setConfig(null);
+    setArrConnections(emptyArrConnections());
   }
 
   async function settingsSaved() {
@@ -437,6 +543,8 @@ export default function App() {
     setScanning(false);
     const statusData = await api<{ config: PublicConfig }>('/api/status');
     setConfig(statusData.config);
+    setArrConnections(pendingArrConnections(statusData.config));
+    setArrConnectionProbeRevision((current) => current + 1);
     setScan(null);
     setSelected(new Set());
     setMessage('Standing orders changed. Run a fresh scan when ready.');
@@ -453,6 +561,11 @@ export default function App() {
       if (requestId !== scanRequestId.current) return false;
       setScan(data);
       setConfig(data.config);
+      arrConnectionsRequestId.current += 1;
+      setArrConnections({
+        radarr: { state: data.connections.radarr.status, error: data.connections.radarr.error },
+        sonarr: { state: data.connections.sonarr.status, error: data.connections.sonarr.error },
+      });
       setSelected(new Set());
       setMessage(`Manifest refreshed at ${new Date(data.scannedAt).toLocaleTimeString()}.`);
       return true;
@@ -577,18 +690,25 @@ export default function App() {
     }
   }
 
-  async function applySelection() {
+  async function applySelection(orphanAction?: OrphanAction) {
+    if (tab === 'orphans' && !orphanAction) return;
     setApplying(true);
     setError('');
     try {
       const endpoint = tab === 'oversized' ? '/api/oversized/apply' : '/api/orphans/apply';
       const result = await api<{ job: { id: string; title: string } }>(endpoint, {
         method: 'POST',
-        body: JSON.stringify({ ids: selectedVisible.map((item) => item.id) }),
+        body: JSON.stringify({
+          ids: selectedVisible.map((item) => item.id),
+          ...(tab === 'orphans' ? {
+            action: orphanAction,
+            confirmPermanent: orphanAction === 'permanent',
+          } : {}),
+        }),
       });
       refreshWhenJobSettles(result.job.id);
       setMessage(`${result.job.title} started. Progress is saved and can be followed in Operations → Jobs.`);
-      setConfirming(false);
+      setConfirmationStage('closed');
       setSelected(new Set());
       setOperationsTab('jobs');
       setShowOperations(true);
@@ -620,13 +740,13 @@ export default function App() {
           <div className="connection-cluster">
             <ConnectionPill
               name="Radarr"
-              state={scan?.connections.radarr.status ?? (config?.radarr.configured ? 'configured' : 'not-configured')}
-              error={scan?.connections.radarr.error}
+              state={arrConnections.radarr.state}
+              error={arrConnections.radarr.error}
             />
             <ConnectionPill
               name="Sonarr"
-              state={scan?.connections.sonarr.status ?? (config?.sonarr.configured ? 'configured' : 'not-configured')}
-              error={scan?.connections.sonarr.error}
+              state={arrConnections.sonarr.state}
+              error={arrConnections.sonarr.error}
             />
             <ConnectionPill name="qBittorrent" state={qbittorrentConnection.state} error={qbittorrentConnection.error} />
           </div>
@@ -673,8 +793,8 @@ export default function App() {
             <p className="eyebrow">SCAN RESULTS</p>
             <h3 id="manifest-title">{tab === 'oversized' ? 'Tracked files over configured size limits' : 'Files not tracked by Radarr or Sonarr'}</h3>
           </div>
-          {selectedVisible.length > 0 && <button className="danger-button" disabled={scanning || applying} onClick={() => setConfirming(true)}>
-            {tab === 'oversized' ? 'Remove & search again' : config?.orphanAction === 'permanent' ? 'Delete permanently' : 'Quarantine'} · {selectedVisible.length}
+          {selectedVisible.length > 0 && <button className="danger-button" disabled={scanning || applying} onClick={() => setConfirmationStage('choose')}>
+            {tab === 'oversized' ? 'Remove & search again' : 'Handle selected'} · {selectedVisible.length}
           </button>}
         </div>
 
@@ -734,16 +854,26 @@ export default function App() {
             ) : tab === 'oversized' ? (
               <OversizedTable items={visible as OversizedItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} />
             ) : (
-              <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} action={config?.orphanAction ?? 'quarantine'} />
+              <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} />
             )}
 
-            <p className="safety-note"><span aria-hidden="true">⚓</span>{tab === 'oversized' ? 'Tracked files are removed through Radarr or Sonarr, then searched again using that app’s existing profiles.' : config?.orphanAction === 'permanent' ? 'Permanent deletion is enabled. Selected files are revalidated immediately before deletion.' : 'Selected untracked files are revalidated immediately before moving to quarantine.'}</p>
+            <p className="safety-note"><span aria-hidden="true">⚓</span>{tab === 'oversized' ? 'Tracked files are removed through Radarr or Sonarr, then searched again using that app’s existing profiles.' : 'Choose quarantine or permanent deletion for each selected batch. Every file is revalidated immediately before it changes.'}</p>
           </>}
         </div>)}
       </section>
 
       <footer><span>Keelhaularr</span> · Library file changes require confirmation · Every file action is revalidated server-side</footer>
-      <ConfirmDialog open={confirming} tab={tab} count={selectedVisible.length} action={config?.orphanAction ?? 'quarantine'} busy={applying} onCancel={() => setConfirming(false)} onConfirm={applySelection} />
+      <ConfirmDialog
+        stage={confirmationStage}
+        tab={tab}
+        count={selectedVisible.length}
+        busy={applying}
+        onCancel={() => setConfirmationStage('closed')}
+        onConfirmTracked={() => { void applySelection(); }}
+        onQuarantine={() => { void applySelection('quarantine'); }}
+        onChoosePermanent={() => setConfirmationStage('permanent')}
+        onConfirmPermanent={() => { void applySelection('permanent'); }}
+      />
       {showSettings && <SettingsDialog onboarding={!config?.radarr.configured && !config?.sonarr.configured} onClose={() => setShowSettings(false)} onSaved={settingsSaved} />}
       {showOperations && <OperationsDialog initialTab={operationsTab} onClose={() => setShowOperations(false)} onChanged={async () => { if (scan) await runScan(); }} onJobQueued={refreshWhenJobSettles} />}
       </main>
@@ -760,6 +890,6 @@ function OversizedTable({ items, selected, onToggle, onToggleAll }: { items: Ove
   return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td><span className="excess-chip">+{formatBytes(item.overageBytes)}</span></td></tr>)}</tbody></table></div>;
 }
 
-function OrphanTable({ items, selected, onToggle, onToggleAll, action }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; action: string }) {
-  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell">{new Date(item.modifiedAt).toLocaleDateString()}</td><td><span className={`action-chip ${action}`}>{action === 'permanent' ? 'Delete permanently' : 'Quarantine'}</span></td></tr>)}</tbody></table></div>;
+function OrphanTable({ items, selected, onToggle, onToggleAll }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void }) {
+  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell">{new Date(item.modifiedAt).toLocaleDateString()}</td></tr>)}</tbody></table></div>;
 }

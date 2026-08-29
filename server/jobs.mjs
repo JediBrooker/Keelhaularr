@@ -219,7 +219,10 @@ export async function createOversizeJob(config, requestedIds) {
   });
 }
 
-export async function createOrphanJob(config, requestedIds) {
+export async function createOrphanJob(config, requestedIds, action) {
+  if (action !== 'quarantine' && action !== 'permanent') {
+    inputError('Orphan jobs require either quarantine or permanent action.');
+  }
   const arr = await scanArr(config);
   const current = await scanOrphans(config, arr);
   const requested = new Set(requestedIds);
@@ -229,8 +232,8 @@ export async function createOrphanJob(config, requestedIds) {
   return saveNewJob({
     id: randomUUID(),
     type: 'orphans',
-    title: `${config.orphanAction === 'permanent' ? 'Delete' : 'Quarantine'} ${candidates.length} orphan file${candidates.length === 1 ? '' : 's'}`,
-    action: config.orphanAction,
+    title: `${action === 'permanent' ? 'Delete' : 'Quarantine'} ${candidates.length} orphan file${candidates.length === 1 ? '' : 's'}`,
+    action,
     trashDir: config.orphanTrashDir,
     status: 'queued',
     createdAt: now,

@@ -257,7 +257,6 @@ export function publicConfig(config) {
       configured: config.qbittorrent.configured,
       recovery: { ...config.qbittorrent.recovery },
     },
-    orphanAction: config.orphanAction,
     hardlinkMinAgeHours: config.hardlinkMinAgeHours,
     quarantineRetentionDays: config.quarantineRetentionDays,
     schedule: {

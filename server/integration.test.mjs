@@ -190,11 +190,11 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     APP_PASSWORD: 'test-password',
     APP_SESSION_SECRET: 'test-session-secret',
     RADARR_URL: `http://127.0.0.1:${mockPort}`,
-    RADARR_API_KEY: 'test',
+    RADARR_API_KEY: 'fixture-radarr-key',
     RADARR_MEDIA_ROOTS: moviesRoot,
     RADARR_DOWNLOAD_ROOTS: movieDownloadsRoot,
     SONARR_URL: `http://127.0.0.1:${mockPort}`,
-    SONARR_API_KEY: 'test',
+    SONARR_API_KEY: 'fixture-sonarr-key',
     SONARR_MEDIA_ROOTS: tvRoot,
     SONARR_DOWNLOAD_ROOTS: tvDownloadsRoot,
     MAX_MB_PER_MIN: '85',
@@ -239,7 +239,8 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(initialSettingsResponse.status, 200);
   const initialSettingsText = await initialSettingsResponse.text();
   assert.equal(initialSettingsText.includes('test-password'), false);
-  assert.equal(initialSettingsText.includes('"apiKey":"test"'), false);
+  assert.equal(initialSettingsText.includes('fixture-radarr-key'), false);
+  assert.equal(initialSettingsText.includes('fixture-sonarr-key'), false);
   const initialSettings = JSON.parse(initialSettingsText).settings;
   assert.equal(initialSettings.radarr.apiKeyConfigured, true);
   assert.equal(initialSettings.defaults.maxMbPerMinute, 85);
@@ -251,9 +252,21 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     excludedCategories: [],
   });
   assert.deepEqual(initialSettings.server.storageRoots, [moviesRoot, tvRoot]);
+  assert.equal((await fetch(`${base}/api/connections/status`)).status, 401);
   assert.equal((await fetch(`${base}/api/settings/qbittorrent/categories`)).status, 401);
   assert.equal((await fetch(`${base}/api/qbittorrent/status`)).status, 401);
   assert.equal((await fetch(`${base}/api/qbittorrent/recovery/status`)).status, 401);
+
+  const initialConnectionsResponse = await fetch(`${base}/api/connections/status`, {
+    headers: { Cookie: cookie },
+  });
+  assert.equal(initialConnectionsResponse.status, 200);
+  assert.deepEqual(await initialConnectionsResponse.json(), {
+    connections: {
+      radarr: { status: 'connected', version: 'test-1.0', error: null },
+      sonarr: { status: 'connected', version: 'test-1.0', error: null },
+    },
+  });
 
   const directoryUrl = `${base}/api/storage/directories?path=${encodeURIComponent(`${moviesRoot}/`)}`;
   assert.equal((await fetch(directoryUrl)).status, 401);
@@ -566,11 +579,30 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const recoveredLibraryPath = path.join(moviesRoot, 'Recovered', 'Relinked.Before.Apply.mkv');
   await mkdir(path.dirname(recoveredLibraryPath), { recursive: true });
   await link(relinkedBeforeApply, recoveredLibraryPath);
-  const orphans = await request('/api/orphans/apply', { ids: scan.orphans.map((item) => item.id) });
+  const orphanIds = scan.orphans.map((item) => item.id);
+  const missingAction = await request('/api/orphans/apply', { ids: orphanIds });
+  assert.equal(missingAction.status, 400);
+  assert.deepEqual(await missingAction.json(), {
+    error: 'Choose either quarantine or permanent for the selected orphan files.',
+  });
+  const invalidAction = await request('/api/orphans/apply', { ids: orphanIds, action: 'Permanent' });
+  assert.equal(invalidAction.status, 400);
+  const unconfirmedPermanent = await request('/api/orphans/apply', {
+    ids: orphanIds,
+    action: 'permanent',
+  });
+  assert.equal(unconfirmedPermanent.status, 400);
+  assert.deepEqual(await unconfirmedPermanent.json(), {
+    error: 'Permanent deletion requires explicit confirmation.',
+  });
+  const orphans = await request('/api/orphans/apply', { ids: orphanIds, action: 'quarantine' });
   assert.equal(orphans.status, 202);
   const orphanResult = await orphans.json();
+  assert.equal(orphanResult.job.action, 'quarantine');
+  assert.match(orphanResult.job.title, /^Quarantine 3 orphan files$/);
   const orphanJob = await waitForJob(base, cookie, orphanResult.job.id);
   assert.equal(orphanJob.status, 'completed');
+  assert.equal(orphanJob.action, 'quarantine');
   assert.equal(orphanJob.items.length, 3);
   assert.equal(orphanJob.items.every((item) => item.status === 'complete'), true);
   assert.equal((await collectFiles(quarantineRoot)).length, 3);
@@ -584,6 +616,26 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(restoreResponse.status, 200);
   assert.equal((await stat(orphanMovie)).isFile(), true);
   assert.equal((await collectFiles(quarantineRoot)).length, 2);
+
+  const permanentScanResponse = await request('/api/scan');
+  assert.equal(permanentScanResponse.status, 200);
+  const permanentCandidate = (await permanentScanResponse.json()).orphans
+    .find((candidate) => candidate.path === orphanMovie);
+  assert.ok(permanentCandidate);
+  const permanentResponse = await request('/api/orphans/apply', {
+    ids: [permanentCandidate.id],
+    action: 'permanent',
+    confirmPermanent: true,
+  });
+  assert.equal(permanentResponse.status, 202);
+  const permanentResult = await permanentResponse.json();
+  assert.equal(permanentResult.job.action, 'permanent');
+  assert.equal(permanentResult.job.title, 'Delete 1 orphan file');
+  const permanentJob = await waitForJob(base, cookie, permanentResult.job.id);
+  assert.equal(permanentJob.status, 'completed');
+  assert.equal(permanentJob.action, 'permanent');
+  assert.equal(permanentJob.items[0].phase, 'deleted');
+  await assert.rejects(stat(orphanMovie), { code: 'ENOENT' });
 
   const storageResponse = await fetch(`${base}/api/storage/health`, { headers: { Cookie: cookie } });
   assert.equal(storageResponse.status, 200);
@@ -636,8 +688,20 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const persistedJobsResponse = await fetch(`${restartedBase}/api/jobs`, { headers: { Cookie: persistedCookie } });
   assert.equal(persistedJobsResponse.status, 200);
   const persistedJobs = (await persistedJobsResponse.json()).jobs;
-  assert.equal(persistedJobs.length, 2);
+  assert.equal(persistedJobs.length, 3);
   assert.equal(persistedJobs.every((job) => job.status === 'completed'), true);
+  const persistedQuarantineJobResponse = await fetch(
+    `${restartedBase}/api/jobs/${orphanResult.job.id}`,
+    { headers: { Cookie: persistedCookie } },
+  );
+  assert.equal(persistedQuarantineJobResponse.status, 200);
+  assert.equal((await persistedQuarantineJobResponse.json()).job.action, 'quarantine');
+  const persistedPermanentJobResponse = await fetch(
+    `${restartedBase}/api/jobs/${permanentResult.job.id}`,
+    { headers: { Cookie: persistedCookie } },
+  );
+  assert.equal(persistedPermanentJobResponse.status, 200);
+  assert.equal((await persistedPermanentJobResponse.json()).job.action, 'permanent');
   const persistedQuarantineResponse = await fetch(`${restartedBase}/api/quarantine`, { headers: { Cookie: persistedCookie } });
   assert.equal(persistedQuarantineResponse.status, 200);
   assert.equal((await persistedQuarantineResponse.json()).records.length, 2);
@@ -645,6 +709,117 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(persistedScheduleResponse.status, 200);
   const persistedSchedule = await persistedScheduleResponse.json();
   assert.equal(persistedSchedule.lastReport.notification.status, 'sent');
+});
+
+test('connection status probes Arr apps independently without exposing credentials', async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-connections-test-'));
+  const requests = [];
+  const mock = createServer(async (request, response) => {
+    const url = new URL(request.url, 'http://mock');
+    if (request.method !== 'GET' || url.pathname !== '/api/v3/system/status') {
+      response.writeHead(404).end();
+      return;
+    }
+
+    const apiKey = String(request.headers['x-api-key'] ?? '');
+    requests.push(apiKey);
+    if (apiKey === 'radarr-status-secret') {
+      response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({
+        version: `v1\u0000radarr-status-secret-${'x'.repeat(100)}`,
+      }));
+      return;
+    }
+    if (apiKey === 'sonarr-status-secret') {
+      response.writeHead(503, { 'Content-Type': 'text/plain' })
+        .end(`sonarr-status-secret\n${'private detail'.repeat(100)}`);
+      return;
+    }
+    response.writeHead(401).end();
+  });
+  mock.listen(0, '127.0.0.1');
+  await once(mock, 'listening');
+  const mockAddress = mock.address();
+  const mockPort = typeof mockAddress === 'object' && mockAddress ? mockAddress.port : 0;
+  const children = [];
+
+  context.after(async () => {
+    for (const child of children) child.kill('SIGTERM');
+    mock.close();
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  async function start(sonarrConfigured) {
+    const port = await freePort();
+    const child = spawn(process.execPath, ['server/index.mjs'], {
+      cwd: path.resolve('.'),
+      env: {
+        ...process.env,
+        CONFIG_DIR: path.join(tempRoot, `config-${port}`),
+        PORT: String(port),
+        APP_USERNAME: 'captain',
+        APP_PASSWORD: 'connection-password',
+        APP_SESSION_SECRET: 'connection-session-secret',
+        RADARR_URL: `http://127.0.0.1:${mockPort}`,
+        RADARR_API_KEY: 'radarr-status-secret',
+        RADARR_MEDIA_ROOTS: '',
+        RADARR_DOWNLOAD_ROOTS: '',
+        SONARR_URL: sonarrConfigured ? `http://127.0.0.1:${mockPort}` : '',
+        SONARR_API_KEY: sonarrConfigured ? 'sonarr-status-secret' : '',
+        SONARR_MEDIA_ROOTS: '',
+        SONARR_DOWNLOAD_ROOTS: '',
+        QBITTORRENT_URL: '',
+        QBITTORRENT_RECOVERY_ENABLED: 'false',
+        SCHEDULE_ENABLED: 'false',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    children.push(child);
+    const base = `http://127.0.0.1:${port}`;
+    await waitFor(`${base}/api/auth/status`);
+    const login = await fetch(`${base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'captain', password: 'connection-password' }),
+    });
+    assert.equal(login.status, 200);
+    return { base, cookie: login.headers.get('set-cookie')?.split(';', 1)[0] };
+  }
+
+  const mixed = await start(true);
+  assert.equal((await fetch(`${mixed.base}/api/connections/status`)).status, 401);
+  const mixedResponse = await fetch(`${mixed.base}/api/connections/status`, {
+    headers: { Cookie: mixed.cookie },
+  });
+  assert.equal(mixedResponse.status, 200);
+  const mixedText = await mixedResponse.text();
+  assert.equal(mixedText.includes('radarr-status-secret'), false);
+  assert.equal(mixedText.includes('sonarr-status-secret'), false);
+  assert.equal(mixedText.includes('private detail'), false);
+  const mixedStatus = JSON.parse(mixedText).connections;
+  assert.equal(mixedStatus.radarr.status, 'connected');
+  assert.equal(mixedStatus.radarr.version.length, 64);
+  assert.match(mixedStatus.radarr.version, /^v1�\[redacted\]-/);
+  assert.equal(mixedStatus.radarr.error, null);
+  assert.deepEqual(mixedStatus.sonarr, {
+    status: 'error',
+    version: null,
+    error: 'Sonarr returned HTTP 503.',
+  });
+
+  const withoutSonarr = await start(false);
+  const unconfiguredResponse = await fetch(`${withoutSonarr.base}/api/connections/status`, {
+    headers: { Cookie: withoutSonarr.cookie },
+  });
+  assert.equal(unconfiguredResponse.status, 200);
+  const unconfiguredStatus = (await unconfiguredResponse.json()).connections;
+  assert.equal(unconfiguredStatus.radarr.status, 'connected');
+  assert.deepEqual(unconfiguredStatus.sonarr, {
+    status: 'not-configured',
+    version: null,
+    error: null,
+  });
+  assert.equal(requests.filter((apiKey) => apiKey === 'radarr-status-secret').length, 2);
+  assert.equal(requests.filter((apiKey) => apiKey === 'sonarr-status-secret').length, 1);
 });
 
 test('an interrupted deletion resumes safely and still queues its replacement search', async (context) => {

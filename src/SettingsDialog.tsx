@@ -76,9 +76,7 @@ interface SettingsData {
   sonarr: ConnectionSettings;
   qbittorrent: QBittorrentSettings;
   orphan: {
-    action: 'quarantine' | 'permanent';
     trashDir: string;
-    allowPermanentDelete: boolean;
     ignoreDirectories: string[];
     maxFiles: number;
     mediaExtensions: string[];
@@ -146,9 +144,7 @@ interface SettingsForm {
   sonarr: ConnectionForm;
   qbittorrent: QBittorrentForm;
   orphan: {
-    action: 'quarantine' | 'permanent';
     trashDir: string;
-    allowPermanentDelete: boolean;
     ignoreDirectoriesText: string;
     maxFiles: string;
     mediaExtensionsText: string;
@@ -229,9 +225,7 @@ function formFromSettings(settings: SettingsData): SettingsForm {
     sonarr: connectionForm(settings.sonarr),
     qbittorrent: qbittorrentForm(settings.qbittorrent),
     orphan: {
-      action: settings.orphan.action,
       trashDir: settings.orphan.trashDir,
-      allowPermanentDelete: settings.orphan.allowPermanentDelete,
       ignoreDirectoriesText: settings.orphan.ignoreDirectories.join(', '),
       maxFiles: settings.orphan.maxFiles.toString(),
       mediaExtensionsText: settings.orphan.mediaExtensions.join(', '),
@@ -641,9 +635,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
             },
           },
           orphan: {
-            action: form.orphan.action,
             trashDir: form.orphan.trashDir,
-            allowPermanentDelete: form.orphan.allowPermanentDelete,
             ignoreDirectories: listFromText(form.orphan.ignoreDirectoriesText, /[,\n]/),
             maxFiles: numeric(form.orphan.maxFiles, 'Maximum orphan scan files'),
             hardlinkMinAgeHours: numeric(form.orphan.hardlinkMinAgeHours, 'Minimum unlinked age'),
@@ -725,9 +717,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved }: { onboa
                   <section className="settings-section">
                     <div className="settings-section-head"><div><span className="app-chip orphan">Untracked</span><h3>Untracked-file handling</h3></div></div>
                     <div className="settings-grid two">
-                      <label className="field">Action<select value={form.orphan.action} onChange={(event) => updateSection('orphan', { ...form.orphan, action: event.target.value as 'quarantine' | 'permanent' })}><option value="quarantine">Quarantine (recommended)</option><option value="permanent">Delete permanently</option></select></label>
-                      <div className="field"><label htmlFor="quarantine-directory">Quarantine directory</label><span>Start typing to browse server folders</span><DirectoryInput id="quarantine-directory" label="Quarantine directory" value={form.orphan.trashDir} onChange={(value) => updateSection('orphan', { ...form.orphan, trashDir: value })} placeholder="/quarantine" allowNew /></div>
-                      <label className={`check-row danger-check wide-field ${form.orphan.action === 'permanent' ? 'active' : ''}`}><input type="checkbox" checked={form.orphan.allowPermanentDelete} onChange={(event) => updateSection('orphan', { ...form.orphan, allowPermanentDelete: event.target.checked })} />Allow irreversible deletion of untracked files</label>
+                      <div className="field wide-field"><label htmlFor="quarantine-directory">Quarantine directory</label><span>Start typing to browse server folders</span><DirectoryInput id="quarantine-directory" label="Quarantine directory" value={form.orphan.trashDir} onChange={(value) => updateSection('orphan', { ...form.orphan, trashDir: value })} placeholder="/quarantine" allowNew /></div>
                       <label className="field wide-field">Ignored directory names <span>comma separated</span><textarea rows={2} value={form.orphan.ignoreDirectoriesText} onChange={(event) => updateSection('orphan', { ...form.orphan, ignoreDirectoriesText: event.target.value })} /></label>
                       <label className="field">Maximum files per scan<input type="number" min="1" max="1000000" value={form.orphan.maxFiles} onChange={(event) => updateSection('orphan', { ...form.orphan, maxFiles: event.target.value })} /></label>
                       <label className="field">Minimum unlinked age (hours) <span>allows completed imports to finish</span><input type="number" min="0" max="8760" step="0.5" value={form.orphan.hardlinkMinAgeHours} onChange={(event) => updateSection('orphan', { ...form.orphan, hardlinkMinAgeHours: event.target.value })} /></label>

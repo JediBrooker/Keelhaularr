@@ -10,7 +10,124 @@ const testRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-components-')
 process.env.CONFIG_DIR = path.join(testRoot, 'config');
 const { createJsonStore } = await import('./state.mjs');
 const { cleanupExpiredQuarantine, listQuarantine, recordQuarantine, restoreQuarantine } = await import('./quarantine.mjs');
+const appSource = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
+const settingsSource = await readFile(new URL('../src/SettingsDialog.tsx', import.meta.url), 'utf8');
 after(() => rm(testRoot, { recursive: true, force: true }));
+
+function sourceSection(start, end) {
+  const startIndex = appSource.indexOf(start);
+  assert.notEqual(startIndex, -1, `Expected App.tsx to contain ${start}`);
+  const endIndex = appSource.indexOf(end, startIndex + start.length);
+  assert.notEqual(endIndex, -1, `Expected App.tsx to contain ${end} after ${start}`);
+  return appSource.slice(startIndex, endIndex);
+}
+
+test('Radarr and Sonarr connection pills probe immediately without waiting for a scan', () => {
+  const pendingConnections = sourceSection(
+    'function pendingArrConnections',
+    'interface OversizedItem',
+  );
+  const probeEffect = sourceSection(
+    'const requestId = ++arrConnectionsRequestId.current;',
+    'const requestId = ++qbittorrentRequestId.current;',
+  );
+
+  assert.match(pendingConnections, /config\.radarr\.configured \? 'checking' : 'not-configured'/);
+  assert.match(pendingConnections, /config\.sonarr\.configured \? 'checking' : 'not-configured'/);
+  assert.match(probeEffect, /setArrConnections\(pendingArrConnections\(config\)\)/);
+  assert.match(probeEffect, /['"]\/api\/connections\/status['"]/);
+  assert.doesNotMatch(probeEffect, /['"]\/api\/scan['"]/);
+  assert.match(probeEffect, /connections\.radarr\.status/);
+  assert.match(probeEffect, /connections\.sonarr\.status/);
+
+  const connectionPills = sourceSection(
+    '<ConnectionPill\n              name="Radarr"',
+    '<ConnectionPill name="qBittorrent"',
+  );
+  assert.match(connectionPills, /state=\{arrConnections\.radarr\.state\}/);
+  assert.match(connectionPills, /error=\{arrConnections\.radarr\.error\}/);
+  assert.match(connectionPills, /state=\{arrConnections\.sonarr\.state\}/);
+  assert.match(connectionPills, /error=\{arrConnections\.sonarr\.error\}/);
+  assert.doesNotMatch(connectionPills, /scan\?\.connections/);
+  assert.doesNotMatch(appSource, /state === 'configured'|\| 'configured'/);
+});
+
+test('Arr connection probes refresh after settings save and ignore stale responses', () => {
+  const probeEffect = sourceSection(
+    'const requestId = ++arrConnectionsRequestId.current;',
+    'const requestId = ++qbittorrentRequestId.current;',
+  );
+  const settingsSaved = sourceSection(
+    'async function settingsSaved()',
+    'async function runScan()',
+  );
+
+  assert.match(probeEffect, /new AbortController\(\)/);
+  assert.equal(probeEffect.match(/requestId !== arrConnectionsRequestId\.current/g)?.length, 2);
+  assert.match(probeEffect, /controller\.signal\.aborted/);
+  assert.match(probeEffect, /return \(\) => controller\.abort\(\)/);
+  assert.match(probeEffect, /arrConnectionProbeRevision\]\);/);
+  assert.match(settingsSaved, /setArrConnectionProbeRevision\(\(current\) => current \+ 1\)/);
+});
+
+test('qBittorrent connection status still refreshes when a scan replaces config', () => {
+  const qbittorrentProbeEffect = sourceSection(
+    'const requestId = ++qbittorrentRequestId.current;',
+    'const source = tab ===',
+  );
+
+  assert.match(qbittorrentProbeEffect, /['"]\/api\/qbittorrent\/status['"]/);
+  assert.match(qbittorrentProbeEffect, /\}, \[auth, config\]\);/);
+});
+
+test('Arr connection probes sign out on 401 and expose ordinary connection failures', () => {
+  const probeEffect = sourceSection(
+    'const requestId = ++arrConnectionsRequestId.current;',
+    'const requestId = ++qbittorrentRequestId.current;',
+  );
+
+  assert.match(probeEffect, /connectionError instanceof ApiError && connectionError\.status === 401/);
+  assert.match(probeEffect, /setAuth\('signed-out'\)/);
+  assert.match(probeEffect, /setConfig\(null\)/);
+  assert.match(probeEffect, /setScan\(null\)/);
+  assert.match(probeEffect, /state: configured\.radarr \? 'error' : 'not-configured'/);
+  assert.match(probeEffect, /state: configured\.sonarr \? 'error' : 'not-configured'/);
+  assert.match(probeEffect, /error: configured\.radarr \? connectionErrorMessage : null/);
+  assert.match(probeEffect, /error: configured\.sonarr \? connectionErrorMessage : null/);
+});
+
+test('untracked-file confirmation offers all actions and adds a second permanent-delete confirmation', () => {
+  const dialog = sourceSection('function ConfirmDialog', 'export default function App');
+  const cancelIndex = dialog.indexOf('>CANCEL</button>');
+  const quarantineIndex = dialog.indexOf("'QUARANTINE'");
+  const permanentChoiceIndex = dialog.indexOf('onClick={onChoosePermanent}');
+
+  assert.ok(cancelIndex >= 0);
+  assert.ok(quarantineIndex > cancelIndex);
+  assert.ok(permanentChoiceIndex > quarantineIndex);
+  assert.match(dialog, /stage === 'permanent'/);
+  assert.match(dialog, /FINAL DELETION CONFIRMATION/);
+  assert.match(dialog, /This cannot be undone/);
+  assert.match(dialog, /onClick=\{onConfirmPermanent\}/);
+  assert.match(dialog, /DELETE PERMANENTLY/);
+});
+
+test('untracked-file requests carry the selected action and explicit permanent confirmation', () => {
+  const applySelection = sourceSection('async function applySelection', "if (auth === 'loading')");
+
+  assert.match(applySelection, /if \(tab === 'orphans' && !orphanAction\) return/);
+  assert.match(applySelection, /action: orphanAction/);
+  assert.match(applySelection, /confirmPermanent: orphanAction === 'permanent'/);
+  assert.match(appSource, /onQuarantine=\{\(\) => \{ void applySelection\('quarantine'\); \}\}/);
+  assert.match(appSource, /onChoosePermanent=\{\(\) => setConfirmationStage\('permanent'\)\}/);
+  assert.match(appSource, /onConfirmPermanent=\{\(\) => \{ void applySelection\('permanent'\); \}\}/);
+});
+
+test('untracked-file settings no longer contain a global action or permanent-delete switch', () => {
+  assert.doesNotMatch(settingsSource, /form\.orphan\.action|allowPermanentDelete/);
+  assert.doesNotMatch(settingsSource, /<label className="field">Action<select/);
+  assert.match(settingsSource, /className="field wide-field"><label htmlFor="quarantine-directory"/);
+});
 
 test('atomic state updates are serialized and kept private', async () => {
   const store = createJsonStore('counter.json', { version: 1, counter: 0 });

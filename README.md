@@ -21,8 +21,7 @@ Both destructive automations are opt-in and disabled by default.
 - Inode-based hardlink integrity checks for completed torrent/download folders
 - Optional qBittorrent guard that withholds every incomplete torrent from orphan actions
 - Opt-in automatic recovery for continuously slow or stalled qBittorrent downloads
-- Recoverable orphan quarantine by default
-- Optional permanent orphan deletion with an explicit server-side enable flag
+- Recoverable orphan quarantine or confirmed permanent deletion per selected batch
 - Built-in login, HttpOnly signed sessions, and login rate limiting
 - API keys kept server-side
 - Authenticated GUI settings with immediate apply and durable, atomic storage
@@ -166,7 +165,7 @@ Later, open **Settings** in the top bar. The interface manages login
 credentials and sessions, shared and per-app size rules, Radarr/Sonarr URLs and
 API keys, the qBittorrent safety and recovery connection, unmonitored-media
 behavior, media roots, completed-download roots, hardlink minimum age, path
-mappings, orphan action and safety controls, quarantine, ignored directories,
+mappings, quarantine, ignored directories,
 scan limits, and media extensions. Connection tests are available before
 saving and automatically fill empty library-folder fields. The qBittorrent test
 also discovers exact category names for recovery exclusions; saved connections
@@ -373,22 +372,15 @@ deployments, rerun the one-command installer to add or change completed-download
 mounts. You can then edit their container paths and every other scanner setting
 from the GUI.
 
-The default orphan action is recoverable quarantine:
+The quarantine destination is configurable:
 
 ```dotenv
-ORPHAN_ACTION=quarantine
 ORPHAN_TRASH_DIR=/quarantine
 ```
 
-Permanent deletion must be enabled with both settings:
-
-```dotenv
-ORPHAN_ACTION=permanent
-ALLOW_PERMANENT_ORPHAN_DELETE=true
-```
-
-The interface clearly labels the active action and uses a standard
-**Confirm / Cancel** dialog before removal.
+When acting on selected untracked files, the confirmation dialog offers
+**Cancel**, **Quarantine**, and **Delete permanently**. Permanent deletion
+requires a second confirmation.
 
 ## Automatic qBittorrent recovery
 

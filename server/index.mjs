@@ -52,6 +52,62 @@ app.use((request, response, next) => {
 const failedLogins = new Map();
 const currentConfig = () => getConfig(getSettingsOverrides());
 
+function safeConnectionText(value, maxLength, secrets = []) {
+  if (typeof value !== 'string') return null;
+  let text = value.replace(/[\u0000-\u001f\u007f]/g, '�').trim();
+  for (const secret of secrets) {
+    if (typeof secret === 'string' && secret) text = text.split(secret).join('[redacted]');
+  }
+  return text ? text.slice(0, maxLength) : null;
+}
+
+async function arrConnectionStatus(connection) {
+  if (!connection.configured) {
+    return { status: 'not-configured', version: null, error: null };
+  }
+
+  const label = connection.kind === 'sonarr' ? 'Sonarr' : 'Radarr';
+  try {
+    const statusResponse = await fetch(`${connection.url}/api/v3/system/status`, {
+      signal: AbortSignal.timeout(10000),
+      headers: { Accept: 'application/json', 'X-Api-Key': connection.apiKey },
+    });
+    if (!statusResponse.ok) {
+      return {
+        status: 'error',
+        version: null,
+        error: safeConnectionText(`${label} returned HTTP ${statusResponse.status}.`, 300),
+      };
+    }
+
+    let status;
+    try {
+      status = await statusResponse.json();
+    } catch {
+      return {
+        status: 'error',
+        version: null,
+        error: `${label} returned an invalid status response.`,
+      };
+    }
+    return {
+      status: 'connected',
+      version: safeConnectionText(status?.version, 64, [connection.apiKey]),
+      error: null,
+    };
+  } catch (error) {
+    const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+    return {
+      status: 'error',
+      version: null,
+      error: safeConnectionText(
+        timedOut ? `${label} connection timed out.` : `${label} could not be reached.`,
+        300,
+      ),
+    };
+  }
+}
+
 function safeEqual(left, right) {
   const leftBuffer = Buffer.from(String(left));
   const rightBuffer = Buffer.from(String(right));
@@ -160,6 +216,15 @@ app.use('/api', (request, response, next) => {
 app.get('/api/status', (request, response) => {
   const config = currentConfig();
   response.json({ config: publicConfig(config), jobs: activeJobSummary(), schedule: scheduleStatus(config) });
+});
+
+app.get('/api/connections/status', async (request, response) => {
+  const config = currentConfig();
+  const [radarr, sonarr] = await Promise.all([
+    arrConnectionStatus(config.radarr),
+    arrConnectionStatus(config.sonarr),
+  ]);
+  response.json({ connections: { radarr, sonarr } });
 });
 
 app.get('/api/settings', (request, response) => {
@@ -365,7 +430,16 @@ app.post('/api/orphans/apply', async (request, response, next) => {
       response.status(400).json({ error: 'Select between 1 and 10,000 orphan files.' });
       return;
     }
-    const job = await createOrphanJob(currentConfig(), ids);
+    const action = request.body?.action;
+    if (action !== 'quarantine' && action !== 'permanent') {
+      response.status(400).json({ error: 'Choose either quarantine or permanent for the selected orphan files.' });
+      return;
+    }
+    if (action === 'permanent' && request.body?.confirmPermanent !== true) {
+      response.status(400).json({ error: 'Permanent deletion requires explicit confirmation.' });
+      return;
+    }
+    const job = await createOrphanJob(currentConfig(), ids, action);
     response.status(202).json({ job });
   } catch (error) {
     next(error);

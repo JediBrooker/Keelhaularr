@@ -315,9 +315,7 @@ export function settingsView(config) {
       recovery: { ...config.qbittorrent.recovery },
     },
     orphan: {
-      action: config.orphanAction,
       trashDir: config.orphanTrashDir ?? '',
-      allowPermanentDelete: config.allowPermanentOrphanDelete,
       ignoreDirectories: config.customIgnoreDirectories,
       maxFiles: config.maxFiles,
       mediaExtensions: config.mediaExtensions,
@@ -396,10 +394,6 @@ export function buildSettingsOverrides(input, currentOverrides) {
     }
   }
 
-  const action = stringValue(orphan.action, 'Orphan action');
-  if (!['quarantine', 'permanent'].includes(action)) inputError('Orphan action must be quarantine or permanent.');
-  const allowPermanent = booleanValue(orphan.allowPermanentDelete, 'Allow permanent deletion');
-  if (action === 'permanent' && !allowPermanent) inputError('Permanent orphan deletion requires its explicit safety switch.');
   const trashDir = stringValue(orphan.trashDir, 'Quarantine directory', { allowEmpty: true });
   if (trashDir && !path.isAbsolute(trashDir)) inputError('Quarantine directory must be an absolute container path.');
   const ignoreDirectories = stringArray(orphan.ignoreDirectories, 'Ignored directories');
@@ -413,8 +407,6 @@ export function buildSettingsOverrides(input, currentOverrides) {
   for (const extension of extensions) {
     if (!/^[a-z0-9]+$/i.test(extension)) inputError('Media extensions may contain only letters and numbers.');
   }
-  output.ORPHAN_ACTION = action;
-  output.ALLOW_PERMANENT_ORPHAN_DELETE = String(allowPermanent);
   output.ORPHAN_TRASH_DIR = trashDir;
   output.ORPHAN_IGNORE_DIRECTORIES = ignoreDirectories.join(',');
   output.ORPHAN_MAX_FILES = numberValue(orphan.maxFiles, 'Maximum orphan scan files', { min: 1, max: 1000000, integer: true }).toString();
