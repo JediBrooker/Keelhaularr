@@ -7,6 +7,18 @@ export function listExclusions() {
   return store.read().records.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+export function exclusionSummary(records = store.read().records) {
+  return records.reduce((summary, record) => {
+    summary.count += 1;
+    if (typeof record.sizeBytes === 'number' && Number.isFinite(record.sizeBytes) && record.sizeBytes >= 0) {
+      summary.totalSizeBytes += record.sizeBytes;
+    } else {
+      summary.unknownSizeCount += 1;
+    }
+    return summary;
+  }, { count: 0, totalSizeBytes: 0, unknownSizeCount: 0 });
+}
+
 export function filterExcluded(candidates) {
   const keys = new Set(store.read().records.flatMap((record) => Array.isArray(record.keys) ? record.keys : []));
   return candidates.filter((candidate) => !candidate.exclusionKeys?.some((key) => keys.has(key)));

@@ -203,12 +203,76 @@ test('both result types can be ignored and restored from the ignore list', () =>
   assert.match(manifestControls, /onClick=\{ignoreSelection\}/);
   assert.match(manifestControls, /'Ignore selected'/);
   assert.match(manifestControls, /setOperationsTab\('exclusions'\)/);
-  assert.match(manifestControls, />Ignore list<\/button>/);
+  assert.match(manifestControls, /<span>Ignore list<\/span>/);
   assert.match(operationsSource, /exclusions: 'Ignore list'/);
   assert.match(operationsSource, /Untracked file/);
   assert.match(operationsSource, /Size-limit file/);
   assert.match(operationsSource, /Remove from ignore list/);
   assert.doesNotMatch(operationsSource, />Remove exclusion<|<h3>No exclusions<|>Exclusions</);
+});
+
+test('dashboard ignore-list summary reports exact GiB totals and stays fresh', () => {
+  const summaryModel = sourceSection(
+    'interface IgnoreSummary',
+    'interface ScanData',
+  );
+  const formatGib = sourceSection(
+    'function formatGib',
+    'function AppBadge',
+  );
+  const appInitialization = sourceSection(
+    'export default function App()',
+    'const requestId = ++arrConnectionsRequestId.current;',
+  );
+  const summaryLabels = sourceSection(
+    'const totalOversized =',
+    'async function signedIn()',
+  );
+  const signInAndSettingsRefresh = sourceSection(
+    'async function signedIn()',
+    "function connectionTested(app: AppKind | 'qbittorrent')",
+  );
+  const scanRefresh = sourceSection(
+    'async function runScan()',
+    'useEffect(() => {\n    if (auth !== \'signed-in\' || !jobsAwaitingRefresh.length)',
+  );
+  const operationsRefresh = sourceSection(
+    'async function operationsChanged()',
+    'async function ignoreSelection()',
+  );
+  const manifestControls = sourceSection(
+    '<div className="manifest-tools">',
+    '{!scan ? (',
+  );
+
+  assert.match(summaryModel, /count: number/);
+  assert.match(summaryModel, /totalSizeBytes: number/);
+  assert.match(summaryModel, /unknownSizeCount: number/);
+  assert.match(summaryModel, /if \(!summary\) return emptyIgnoreSummary\(\)/);
+  assert.match(summaryModel, /count: 0/);
+  assert.match(summaryModel, /totalSizeBytes: 0/);
+  assert.match(summaryModel, /unknownSizeCount: 0/);
+  assert.match(appSource, /ignoreSummary\?: IgnoreSummary/);
+  assert.match(formatGib, /bytes \/ 1024 \*\* 3\)\.toFixed\(2\)/);
+  assert.match(formatGib, /GiB/);
+  assert.match(appInitialization, /useState<IgnoreSummary>\(emptyIgnoreSummary\)/);
+  assert.match(appInitialization, /setIgnoreSummary\(normalizeIgnoreSummary\(statusData\.ignoreSummary\)\)/);
+  assert.equal(signInAndSettingsRefresh.match(/setIgnoreSummary\(normalizeIgnoreSummary\(statusData\.ignoreSummary\)\)/g)?.length, 2);
+  assert.match(scanRefresh, /setIgnoreSummary\(normalizeIgnoreSummary\(data\.ignoreSummary\)\)/);
+  assert.match(summaryLabels, /unknownSizeCount > 0 \? ` \+ \$\{ignoreSummary\.unknownSizeCount\} unknown` : ''/);
+  assert.match(summaryLabels, /files with known sizes/);
+  assert.match(summaryLabels, /with unknown size/);
+  assert.match(operationsRefresh, /if \(scan\)[\s\S]*await runScan\(\)/);
+  assert.match(operationsRefresh, /['"]\/api\/status['"]/);
+  assert.match(operationsRefresh, /setIgnoreSummary\(normalizeIgnoreSummary\(statusData\.ignoreSummary\)\)/);
+  assert.match(appSource, /const result = await api<\{ ignoreSummary\?: IgnoreSummary \}>\('\/api\/exclusions'/);
+  assert.match(appSource, /setIgnoreSummary\(normalizeIgnoreSummary\(result\.ignoreSummary\)\)/);
+  assert.match(manifestControls, /className="ghost-button compact ignore-list-summary-button"/);
+  assert.match(manifestControls, /aria-label=\{ignoreSummaryAccessibleLabel\}/);
+  assert.match(manifestControls, /title=\{ignoreSummaryAccessibleLabel\}/);
+  assert.match(manifestControls, /<span>Ignore list<\/span>/);
+  assert.match(manifestControls, /<small>\{ignoreSummaryText\}<\/small>/);
+  assert.match(appSource, /onChanged=\{operationsChanged\}/);
 });
 
 test('atomic state updates are serialized and kept private', async () => {

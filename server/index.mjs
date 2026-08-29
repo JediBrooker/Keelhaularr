@@ -7,7 +7,13 @@ import express from 'express';
 import { scanArr } from './arr.mjs';
 import { getConfig, publicConfig } from './config.mjs';
 import { suggestDirectories } from './directories.mjs';
-import { addExclusions, filterExcluded, listExclusions, removeExclusion } from './exclusions.mjs';
+import {
+  addExclusions,
+  exclusionSummary,
+  filterExcluded,
+  listExclusions,
+  removeExclusion,
+} from './exclusions.mjs';
 import {
   activeJobSummary,
   cancelJob,
@@ -215,7 +221,12 @@ app.use('/api', (request, response, next) => {
 
 app.get('/api/status', (request, response) => {
   const config = currentConfig();
-  response.json({ config: publicConfig(config), jobs: activeJobSummary(), schedule: scheduleStatus(config) });
+  response.json({
+    config: publicConfig(config),
+    jobs: activeJobSummary(),
+    schedule: scheduleStatus(config),
+    ignoreSummary: exclusionSummary(),
+  });
 });
 
 app.get('/api/connections/status', async (request, response) => {
@@ -403,6 +414,7 @@ app.post('/api/scan', async (request, response, next) => {
       roots: orphans.roots,
       qbittorrentSafety: orphans.qbittorrentSafety,
       warnings: [...arr.radarr.warnings, ...arr.sonarr.warnings, ...orphans.warnings],
+      ignoreSummary: exclusionSummary(),
     });
   } catch (error) {
     next(error);
@@ -474,7 +486,8 @@ app.post('/api/jobs/:id/retry', async (request, response, next) => {
 });
 
 app.get('/api/exclusions', (request, response) => {
-  response.json({ exclusions: listExclusions() });
+  const exclusions = listExclusions();
+  response.json({ exclusions, ignoreSummary: exclusionSummary(exclusions) });
 });
 
 app.post('/api/exclusions', async (request, response, next) => {
@@ -495,7 +508,8 @@ app.post('/api/exclusions', async (request, response, next) => {
       .filter((candidate) => requested.has(candidate.id))
       .map((candidate) => ({ ...candidate, scope }));
     if (!candidates.length) return response.status(409).json({ error: 'None of the selected files are still eligible to ignore.' });
-    response.json({ exclusions: await addExclusions(candidates) });
+    const exclusions = await addExclusions(candidates);
+    response.json({ exclusions, ignoreSummary: exclusionSummary(exclusions) });
   } catch (error) {
     next(error);
   }
@@ -504,7 +518,8 @@ app.post('/api/exclusions', async (request, response, next) => {
 app.delete('/api/exclusions/:id', async (request, response, next) => {
   try {
     if (!await removeExclusion(request.params.id)) return response.status(404).json({ error: 'Exclusion not found.' });
-    response.json({ exclusions: listExclusions() });
+    const exclusions = listExclusions();
+    response.json({ exclusions, ignoreSummary: exclusionSummary(exclusions) });
   } catch (error) {
     next(error);
   }

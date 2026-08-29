@@ -102,6 +102,30 @@ interface QBittorrentSafety {
   warning: string | null;
 }
 
+interface IgnoreSummary {
+  count: number;
+  totalSizeBytes: number;
+  unknownSizeCount: number;
+}
+
+const emptyIgnoreSummary = (): IgnoreSummary => ({
+  count: 0,
+  totalSizeBytes: 0,
+  unknownSizeCount: 0,
+});
+
+function normalizeIgnoreSummary(summary?: IgnoreSummary): IgnoreSummary {
+  if (!summary) return emptyIgnoreSummary();
+  const count = Number.isFinite(summary.count) ? Math.max(0, Math.trunc(summary.count)) : 0;
+  return {
+    count,
+    totalSizeBytes: Number.isFinite(summary.totalSizeBytes) ? Math.max(0, summary.totalSizeBytes) : 0,
+    unknownSizeCount: Number.isFinite(summary.unknownSizeCount)
+      ? Math.min(count, Math.max(0, Math.trunc(summary.unknownSizeCount)))
+      : 0,
+  };
+}
+
 interface ScanData {
   scannedAt: string;
   config: PublicConfig;
@@ -110,6 +134,7 @@ interface ScanData {
   orphans: OrphanItem[];
   roots: Array<{ app: AppKind; kind: 'library' | 'download'; path: string; filesScanned: number }>;
   qbittorrentSafety: QBittorrentSafety;
+  ignoreSummary?: IgnoreSummary;
   warnings: string[];
 }
 
@@ -141,6 +166,10 @@ function formatBytes(bytes: number) {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   const order = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** order).toFixed(order >= 3 ? 2 : 1)} ${units[order]}`;
+}
+
+function formatGib(bytes: number) {
+  return `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
 }
 
 function AppBadge({ app }: { app: AppKind }) {
@@ -350,6 +379,7 @@ export default function App() {
   const [setupRequired, setSetupRequired] = useState(false);
   const [config, setConfig] = useState<PublicConfig | null>(null);
   const [scan, setScan] = useState<ScanData | null>(null);
+  const [ignoreSummary, setIgnoreSummary] = useState<IgnoreSummary>(emptyIgnoreSummary);
   const [tab, setTab] = useState<Tab>('oversized');
   const [filter, setFilter] = useState<'all' | AppKind>('all');
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -386,8 +416,9 @@ export default function App() {
           setAuth('signed-out');
           return;
         }
-        const statusData = await api<{ config: PublicConfig }>('/api/status');
+        const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary }>('/api/status');
         setConfig(statusData.config);
+        setIgnoreSummary(normalizeIgnoreSummary(statusData.ignoreSummary));
         setArrConnections(pendingArrConnections(statusData.config));
         if (!statusData.config.radarr.configured && !statusData.config.sonarr.configured) setShowSettings(true);
         setAuth('signed-in');
@@ -544,10 +575,17 @@ export default function App() {
   const scanIsIncomplete = Boolean(scan?.warnings.length) || scanHasConnectionError || scanHasNoConfiguredApps;
   const totalOversized = scan?.oversized.reduce((sum, item) => sum + item.sizeBytes, 0) ?? 0;
   const totalOrphans = scan?.orphans.reduce((sum, item) => sum + item.sizeBytes, 0) ?? 0;
+  const ignoredFilesLabel = `${ignoreSummary.count} file${ignoreSummary.count === 1 ? '' : 's'}`;
+  const ignoredSizeLabel = formatGib(ignoreSummary.totalSizeBytes);
+  const ignoreSummaryText = `${ignoredFilesLabel} · ${ignoredSizeLabel}${ignoreSummary.unknownSizeCount > 0 ? ` + ${ignoreSummary.unknownSizeCount} unknown` : ''}`;
+  const ignoreSummaryAccessibleLabel = ignoreSummary.unknownSizeCount > 0
+    ? `Ignore list: ${ignoredFilesLabel}; ${ignoredSizeLabel} across files with known sizes; ${ignoreSummary.unknownSizeCount} file${ignoreSummary.unknownSizeCount === 1 ? '' : 's'} with unknown size.`
+    : `Ignore list: ${ignoredFilesLabel}; ${ignoredSizeLabel} total.`;
 
   async function signedIn() {
-    const statusData = await api<{ config: PublicConfig }>('/api/status');
+    const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary }>('/api/status');
     setConfig(statusData.config);
+    setIgnoreSummary(normalizeIgnoreSummary(statusData.ignoreSummary));
     setArrConnections(pendingArrConnections(statusData.config));
     if (!statusData.config.radarr.configured && !statusData.config.sonarr.configured) setShowSettings(true);
     setAuth('signed-in');
@@ -565,14 +603,16 @@ export default function App() {
     setAuth('signed-out');
     setScan(null);
     setConfig(null);
+    setIgnoreSummary(emptyIgnoreSummary());
     setArrConnections(emptyArrConnections());
   }
 
   async function settingsSaved() {
     scanRequestId.current += 1;
     setScanning(false);
-    const statusData = await api<{ config: PublicConfig }>('/api/status');
+    const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary }>('/api/status');
     setConfig(statusData.config);
+    setIgnoreSummary(normalizeIgnoreSummary(statusData.ignoreSummary));
     setArrConnections(pendingArrConnections(statusData.config));
     setArrConnectionProbeRevision((current) => current + 1);
     setScan(null);
@@ -600,6 +640,7 @@ export default function App() {
       if (requestId !== scanRequestId.current) return false;
       setScan(data);
       setConfig(data.config);
+      setIgnoreSummary(normalizeIgnoreSummary(data.ignoreSummary));
       arrConnectionsRequestId.current += 1;
       setArrConnections({
         radarr: { state: data.connections.radarr.status, error: data.connections.radarr.error },
@@ -714,19 +755,26 @@ export default function App() {
     setMinimumGib('0');
   }
 
+  async function operationsChanged() {
+    const statusData = await api<{ ignoreSummary?: IgnoreSummary }>('/api/status');
+    setIgnoreSummary(normalizeIgnoreSummary(statusData.ignoreSummary));
+    if (scan) await runScan();
+  }
+
   async function ignoreSelection() {
     if (!selectedVisible.length) return;
     const ignoredCount = selectedVisible.length;
     setApplying(true);
     setError('');
     try {
-      await api('/api/exclusions', {
+      const result = await api<{ ignoreSummary?: IgnoreSummary }>('/api/exclusions', {
         method: 'POST',
         body: JSON.stringify({
           ids: selectedVisible.map((item) => item.id),
           scope: tab === 'orphans' ? 'orphan' : 'oversized',
         }),
       });
+      setIgnoreSummary(normalizeIgnoreSummary(result.ignoreSummary));
       if (await runScan()) {
         setMessage(`${ignoredCount} file${ignoredCount === 1 ? '' : 's'} added to the ignore list. Manage or remove ignored files in Operations → Ignore list.`);
       }
@@ -862,7 +910,16 @@ export default function App() {
               {value === 'oversized' ? 'Size limits' : 'Untracked files'} <span>{value === 'oversized' ? scan?.oversized.length ?? 0 : scan?.orphans.length ?? 0}</span>
             </button>)}
           </div>
-          <button type="button" className="ghost-button compact" onClick={() => { setOperationsTab('exclusions'); setShowOperations(true); }}>Ignore list</button>
+          <button
+            type="button"
+            className="ghost-button compact ignore-list-summary-button"
+            aria-label={ignoreSummaryAccessibleLabel}
+            title={ignoreSummaryAccessibleLabel}
+            onClick={() => { setOperationsTab('exclusions'); setShowOperations(true); }}
+          >
+            <span>Ignore list</span>
+            <small>{ignoreSummaryText}</small>
+          </button>
         </div>
 
         {manifestTabs.map((value) => <div
@@ -923,7 +980,7 @@ export default function App() {
         onConfirmPermanent={() => { void applySelection('permanent'); }}
       />
       {showSettings && <SettingsDialog onboarding={!config?.radarr.configured && !config?.sonarr.configured} onClose={() => setShowSettings(false)} onSaved={settingsSaved} onConnectionTested={connectionTested} />}
-      {showOperations && <OperationsDialog initialTab={operationsTab} onClose={() => setShowOperations(false)} onChanged={async () => { if (scan) await runScan(); }} onJobQueued={refreshWhenJobSettles} />}
+      {showOperations && <OperationsDialog initialTab={operationsTab} onClose={() => setShowOperations(false)} onChanged={operationsChanged} onJobQueued={refreshWhenJobSettles} />}
       </main>
     </>
   );

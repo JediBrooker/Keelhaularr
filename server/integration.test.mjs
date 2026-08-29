@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { link, mkdtemp, mkdir, open, readFile, readdir, rm, stat } from 'node:fs/promises';
+import { link, mkdtemp, mkdir, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -268,6 +268,14 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     },
   });
 
+  const initialStatusResponse = await fetch(`${base}/api/status`, { headers: { Cookie: cookie } });
+  assert.equal(initialStatusResponse.status, 200);
+  assert.deepEqual((await initialStatusResponse.json()).ignoreSummary, {
+    count: 0,
+    totalSizeBytes: 0,
+    unknownSizeCount: 0,
+  });
+
   const directoryUrl = `${base}/api/storage/directories?path=${encodeURIComponent(`${moviesRoot}/`)}`;
   assert.equal((await fetch(directoryUrl)).status, 401);
   const directoriesResponse = await fetch(directoryUrl, { headers: { Cookie: cookie } });
@@ -517,6 +525,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const scanResponse = await request('/api/scan');
   assert.equal(scanResponse.status, 200);
   const scan = await scanResponse.json();
+  assert.deepEqual(scan.ignoreSummary, { count: 0, totalSizeBytes: 0, unknownSizeCount: 0 });
   assert.deepEqual(scan.oversized.map((item) => item.app).sort(), ['radarr', 'sonarr']);
   assert.equal(scan.oversized.find((item) => item.app === 'radarr').maxMbPerMinute, 60);
   assert.equal(scan.oversized.find((item) => item.app === 'radarr').limitSource, 'arr-quality-definition');
@@ -563,9 +572,15 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
 
   const exclusionResponse = await request('/api/exclusions', { ids: [scan.oversized[0].id] });
   assert.equal(exclusionResponse.status, 200);
-  const exclusions = (await exclusionResponse.json()).exclusions;
+  const exclusionPayload = await exclusionResponse.json();
+  const exclusions = exclusionPayload.exclusions;
   assert.equal(exclusions.length, 1);
   const ignoredOversized = scan.oversized.find((item) => item.id === scan.oversized[0].id);
+  assert.deepEqual(exclusionPayload.ignoreSummary, {
+    count: 1,
+    totalSizeBytes: ignoredOversized.sizeBytes,
+    unknownSizeCount: 0,
+  });
   assert.deepEqual({
     scope: exclusions[0].scope,
     path: exclusions[0].path,
@@ -576,9 +591,16 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     sizeBytes: ignoredOversized.sizeBytes,
   });
   const excludedScan = await request('/api/scan');
-  assert.equal((await excludedScan.json()).oversized.length, 1);
+  const excludedScanPayload = await excludedScan.json();
+  assert.equal(excludedScanPayload.oversized.length, 1);
+  assert.deepEqual(excludedScanPayload.ignoreSummary, exclusionPayload.ignoreSummary);
   const removeExclusionResponse = await request(`/api/exclusions/${exclusions[0].id}`, {}, 'DELETE');
   assert.equal(removeExclusionResponse.status, 200);
+  assert.deepEqual((await removeExclusionResponse.json()).ignoreSummary, {
+    count: 0,
+    totalSizeBytes: 0,
+    unknownSizeCount: 0,
+  });
   const restoredScan = await request('/api/scan');
   assert.equal((await restoredScan.json()).oversized.length, 2);
 
@@ -587,9 +609,15 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(ignoredOrphan.exclusionKeys.length, 1);
   const orphanExclusionResponse = await request('/api/exclusions', { ids: [ignoredOrphan.id], scope: 'orphan' });
   assert.equal(orphanExclusionResponse.status, 200);
-  const orphanExclusions = (await orphanExclusionResponse.json()).exclusions;
+  const orphanExclusionPayload = await orphanExclusionResponse.json();
+  const orphanExclusions = orphanExclusionPayload.exclusions;
   assert.equal(orphanExclusions.length, 1);
   const orphanExclusion = orphanExclusions[0];
+  assert.deepEqual(orphanExclusionPayload.ignoreSummary, {
+    count: 1,
+    totalSizeBytes: ignoredOrphan.sizeBytes,
+    unknownSizeCount: 0,
+  });
   assert.deepEqual({
     scope: orphanExclusion.scope,
     app: orphanExclusion.app,
@@ -636,7 +664,13 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
 
   const removeOrphanExclusionResponse = await request(`/api/exclusions/${orphanExclusion.id}`, {}, 'DELETE');
   assert.equal(removeOrphanExclusionResponse.status, 200);
-  assert.deepEqual((await removeOrphanExclusionResponse.json()).exclusions, []);
+  const removeOrphanExclusionPayload = await removeOrphanExclusionResponse.json();
+  assert.deepEqual(removeOrphanExclusionPayload.exclusions, []);
+  assert.deepEqual(removeOrphanExclusionPayload.ignoreSummary, {
+    count: 0,
+    totalSizeBytes: 0,
+    unknownSizeCount: 0,
+  });
   const restoredOrphanScanResponse = await request('/api/scan');
   assert.equal(restoredOrphanScanResponse.status, 200);
   assert.equal((await restoredOrphanScanResponse.json()).orphans.some((item) => item.id === ignoredOrphan.id), true);
@@ -1024,4 +1058,112 @@ test('an interrupted deletion resumes safely and still queues its replacement se
   assert.equal(recoveredJob.items[0].phase, 'search_queued');
   assert.equal(deleteRequests, 2);
   assert.deepEqual(commands, [{ name: 'MoviesSearch', movieIds: [12] }]);
+});
+
+test('ignore summaries preserve legacy records and report unknown sizes safely', async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-ignore-summary-'));
+  const configDir = path.join(tempRoot, 'config');
+  const knownSizeBytes = 5 * 1024 ** 3;
+  const records = [
+    {
+      id: 'known-size',
+      keys: ['legacy:known'],
+      title: 'Known size',
+      sizeBytes: knownSizeBytes,
+      createdAt: '2025-01-05T00:00:00.000Z',
+    },
+    {
+      id: 'zero-size',
+      keys: ['legacy:zero'],
+      title: 'Empty file',
+      sizeBytes: 0,
+      createdAt: '2025-01-04T00:00:00.000Z',
+    },
+    {
+      id: 'missing-size',
+      keys: ['legacy:missing'],
+      title: 'Legacy record without a size',
+      createdAt: '2025-01-03T00:00:00.000Z',
+    },
+    {
+      id: 'negative-size',
+      keys: ['legacy:negative'],
+      title: 'Invalid negative size',
+      sizeBytes: -1,
+      createdAt: '2025-01-02T00:00:00.000Z',
+    },
+    {
+      id: 'string-size',
+      keys: ['legacy:string'],
+      title: 'Invalid string size',
+      sizeBytes: '1024',
+      createdAt: '2025-01-01T00:00:00.000Z',
+    },
+  ];
+  await mkdir(configDir, { recursive: true });
+  await writeFile(
+    path.join(configDir, 'exclusions.json'),
+    `${JSON.stringify({ version: 1, records }, null, 2)}\n`,
+  );
+
+  const port = await freePort();
+  const child = spawn(process.execPath, ['server/index.mjs'], {
+    cwd: path.resolve('.'),
+    env: {
+      ...process.env,
+      CONFIG_DIR: configDir,
+      PORT: String(port),
+      APP_USERNAME: 'captain',
+      APP_PASSWORD: 'summary-password',
+      APP_SESSION_SECRET: 'summary-secret',
+      RADARR_URL: '',
+      RADARR_API_KEY: '',
+      RADARR_MEDIA_ROOTS: '',
+      RADARR_DOWNLOAD_ROOTS: '',
+      SONARR_URL: '',
+      SONARR_API_KEY: '',
+      SONARR_MEDIA_ROOTS: '',
+      SONARR_DOWNLOAD_ROOTS: '',
+      QBITTORRENT_URL: '',
+      SCHEDULE_ENABLED: 'false',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  context.after(async () => {
+    child.kill('SIGTERM');
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  const base = `http://127.0.0.1:${port}`;
+  await waitFor(`${base}/api/auth/status`);
+  const login = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'captain', password: 'summary-password' }),
+  });
+  assert.equal(login.status, 200);
+  const cookie = login.headers.get('set-cookie')?.split(';', 1)[0];
+  const headers = { Cookie: cookie };
+  const expectedSummary = { count: 5, totalSizeBytes: knownSizeBytes, unknownSizeCount: 3 };
+
+  const statusResponse = await fetch(`${base}/api/status`, { headers });
+  assert.equal(statusResponse.status, 200);
+  assert.deepEqual((await statusResponse.json()).ignoreSummary, expectedSummary);
+
+  const exclusionsResponse = await fetch(`${base}/api/exclusions`, { headers });
+  assert.equal(exclusionsResponse.status, 200);
+  const exclusionsPayload = await exclusionsResponse.json();
+  assert.equal(exclusionsPayload.exclusions.length, records.length);
+  assert.equal(exclusionsPayload.exclusions.find((record) => record.id === 'missing-size').sizeBytes, undefined);
+  assert.deepEqual(exclusionsPayload.ignoreSummary, expectedSummary);
+
+  const scanResponse = await fetch(`${base}/api/scan`, { method: 'POST', headers });
+  assert.equal(scanResponse.status, 200);
+  assert.deepEqual((await scanResponse.json()).ignoreSummary, expectedSummary);
+
+  const deleteResponse = await fetch(`${base}/api/exclusions/known-size`, { method: 'DELETE', headers });
+  assert.equal(deleteResponse.status, 200);
+  const deletePayload = await deleteResponse.json();
+  assert.equal(deletePayload.exclusions.length, records.length - 1);
+  assert.deepEqual(deletePayload.ignoreSummary, { count: 4, totalSizeBytes: 0, unknownSizeCount: 3 });
 });
