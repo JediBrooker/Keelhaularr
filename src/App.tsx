@@ -134,6 +134,16 @@ function normalizeIgnoreSummary(summary?: IgnoreSummary): IgnoreSummary {
   };
 }
 
+function ignoreOverageRefreshKey(summary: IgnoreSummary) {
+  return [
+    summary.count,
+    summary.totalSizeBytes,
+    summary.unknownSizeCount,
+    summary.totalOverageBytes,
+    summary.unknownOverageCount,
+  ].join(':');
+}
+
 interface ScanData {
   scannedAt: string;
   config: PublicConfig;
@@ -177,7 +187,8 @@ function formatBytes(bytes: number) {
 }
 
 function formatGib(bytes: number) {
-  return `${(bytes / 1024 ** 3).toFixed(2)} GiB`;
+  const gib = bytes / 1024 ** 3;
+  return `${gib > 0 && gib < 0.01 ? '<0.01' : gib.toFixed(2)} GiB`;
 }
 
 function AppBadge({ app }: { app: AppKind }) {
@@ -388,6 +399,7 @@ export default function App() {
   const [config, setConfig] = useState<PublicConfig | null>(null);
   const [scan, setScan] = useState<ScanData | null>(null);
   const [ignoreSummary, setIgnoreSummary] = useState<IgnoreSummary>(emptyIgnoreSummary);
+  const [ignoreOverageRefreshState, setIgnoreOverageRefreshState] = useState<'idle' | 'refreshing' | 'settled'>('idle');
   const [tab, setTab] = useState<Tab>('oversized');
   const [filter, setFilter] = useState<'all' | AppKind>('all');
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -415,6 +427,9 @@ export default function App() {
   const qbittorrentRequestId = useRef(0);
   const showArrConnectionChecking = useRef(true);
   const lastAutomaticArrProbeAt = useRef(0);
+  const attemptedIgnoreOverageRefreshes = useRef(new Set<string>());
+  const pendingIgnoreOverageRefreshes = useRef(new Set<string>());
+  const ignoreOverageRefreshSession = useRef(0);
 
   useEffect(() => {
     api<{ authenticated: boolean; setupRequired: boolean }>('/api/auth/status')
@@ -436,6 +451,53 @@ export default function App() {
         setAuth('signed-out');
       });
   }, []);
+
+  useEffect(() => {
+    if (auth !== 'signed-in') {
+      attemptedIgnoreOverageRefreshes.current.clear();
+      pendingIgnoreOverageRefreshes.current.clear();
+      ignoreOverageRefreshSession.current += 1;
+      setIgnoreOverageRefreshState('idle');
+      return;
+    }
+    if (ignoreSummary.unknownOverageCount === 0) {
+      setIgnoreOverageRefreshState('idle');
+      return;
+    }
+
+    const stateKey = ignoreOverageRefreshKey(ignoreSummary);
+    if (attemptedIgnoreOverageRefreshes.current.has(stateKey)) {
+      setIgnoreOverageRefreshState(pendingIgnoreOverageRefreshes.current.has(stateKey) ? 'refreshing' : 'settled');
+      return;
+    }
+
+    attemptedIgnoreOverageRefreshes.current.add(stateKey);
+    pendingIgnoreOverageRefreshes.current.add(stateKey);
+    const session = ignoreOverageRefreshSession.current;
+    setIgnoreOverageRefreshState('refreshing');
+    void api<{ ignoreSummary?: IgnoreSummary }>('/api/exclusions/refresh', {
+      method: 'POST',
+      body: '{}',
+    }).then((result) => {
+      if (session !== ignoreOverageRefreshSession.current) return;
+      pendingIgnoreOverageRefreshes.current.delete(stateKey);
+      const refreshedSummary = normalizeIgnoreSummary(result.ignoreSummary);
+      attemptedIgnoreOverageRefreshes.current.add(ignoreOverageRefreshKey(refreshedSummary));
+      setIgnoreSummary(refreshedSummary);
+      setIgnoreOverageRefreshState(refreshedSummary.unknownOverageCount > 0 ? 'settled' : 'idle');
+    }).catch((refreshError) => {
+      if (session !== ignoreOverageRefreshSession.current) return;
+      pendingIgnoreOverageRefreshes.current.delete(stateKey);
+      if (refreshError instanceof ApiError && refreshError.status === 401) {
+        setAuth('signed-out');
+        setConfig(null);
+        setScan(null);
+        return;
+      }
+      // The summary remains usable, but must continue to identify unresolved overages honestly.
+      setIgnoreOverageRefreshState('settled');
+    });
+  }, [auth, ignoreSummary]);
 
   useEffect(() => {
     const requestId = ++arrConnectionsRequestId.current;
@@ -589,19 +651,26 @@ export default function App() {
   const unknownSizeText = ignoreSummary.unknownSizeCount > 0
     ? ` · ${ignoreSummary.unknownSizeCount} size${ignoreSummary.unknownSizeCount === 1 ? '' : 's'} unknown`
     : '';
-  const unknownOverageText = ignoreSummary.unknownOverageCount > 0
-    ? ` · ${ignoreSummary.unknownOverageCount} overage${ignoreSummary.unknownOverageCount === 1 ? '' : 's'} unknown`
-    : '';
-  const ignoreSummaryText = `${ignoredFilesLabel} · ${ignoredSizeLabel}${ignoreSummary.unknownSizeCount > 0 ? ' known' : ' total'}${unknownSizeText} · ${ignoredOverageLabel} over limit${unknownOverageText}`;
+  const ignoreSummarySizeText = `${ignoredFilesLabel} · ${ignoredSizeLabel}${ignoreSummary.unknownSizeCount > 0 ? ' known' : ' total'}${unknownSizeText}`;
+  const ignoreSummaryOverageText = ignoreOverageRefreshState === 'refreshing'
+    ? 'Calculating overage…'
+    : ignoreSummary.unknownOverageCount > 0
+      ? ignoreSummary.totalOverageBytes > 0
+        ? `At least ${ignoredOverageLabel} over limit · ${ignoreSummary.unknownOverageCount} pending`
+        : `Overage unavailable for ${ignoreSummary.unknownOverageCount} file${ignoreSummary.unknownOverageCount === 1 ? '' : 's'}`
+      : `${ignoredOverageLabel} over limit`;
   const ignoreSummaryAccessibleLabel = [
     `Ignore list: ${ignoredFilesLabel}.`,
     ignoreSummary.unknownSizeCount > 0
       ? `${ignoredSizeLabel} across files with known sizes; ${ignoreSummary.unknownSizeCount} file${ignoreSummary.unknownSizeCount === 1 ? '' : 's'} with unknown size.`
       : `${ignoredSizeLabel} total.`,
-    `${ignoredOverageLabel} over configured size limits across ignored size-limit files with known overages; untracked files are not included in this overage.`,
-    ignoreSummary.unknownOverageCount > 0
-      ? `${ignoreSummary.unknownOverageCount} ignored size-limit file${ignoreSummary.unknownOverageCount === 1 ? '' : 's'} with unknown overage.`
-      : '',
+    ignoreOverageRefreshState === 'refreshing'
+      ? 'Calculating overage against configured size limits.'
+      : ignoreSummary.unknownOverageCount > 0
+        ? ignoreSummary.totalOverageBytes > 0
+          ? `At least ${ignoredOverageLabel} over configured size limits; ${ignoreSummary.unknownOverageCount} ignored size-limit file${ignoreSummary.unknownOverageCount === 1 ? '' : 's'} still have unavailable overage values.`
+          : `Overage is unavailable for ${ignoreSummary.unknownOverageCount} ignored size-limit file${ignoreSummary.unknownOverageCount === 1 ? '' : 's'}.`
+        : `${ignoredOverageLabel} over configured size limits across ignored size-limit files; untracked files are not included in this overage.`,
   ].filter(Boolean).join(' ');
 
   async function signedIn() {
@@ -631,6 +700,10 @@ export default function App() {
 
   async function settingsSaved() {
     scanRequestId.current += 1;
+    attemptedIgnoreOverageRefreshes.current.clear();
+    pendingIgnoreOverageRefreshes.current.clear();
+    ignoreOverageRefreshSession.current += 1;
+    setIgnoreOverageRefreshState('idle');
     setScanning(false);
     const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary }>('/api/status');
     setConfig(statusData.config);
@@ -939,8 +1012,11 @@ export default function App() {
             title={ignoreSummaryAccessibleLabel}
             onClick={() => { setOperationsTab('exclusions'); setShowOperations(true); }}
           >
-            <span>Ignore list</span>
-            <small>{ignoreSummaryText}</small>
+            <span className="ignore-list-summary-title">Ignore list</span>
+            <span className="ignore-list-summary-metrics" aria-hidden="true">
+              <small>{ignoreSummarySizeText}</small>
+              <small>{ignoreSummaryOverageText}</small>
+            </span>
           </button>
         </div>
 

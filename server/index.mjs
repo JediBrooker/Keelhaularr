@@ -492,6 +492,16 @@ app.get('/api/exclusions', (request, response) => {
   response.json({ exclusions, ignoreSummary: exclusionSummary(exclusions) });
 });
 
+app.post('/api/exclusions/refresh', async (request, response, next) => {
+  try {
+    const arr = await scanArr(currentConfig());
+    const exclusions = await refreshExclusionOverages(arr);
+    response.json({ exclusions, ignoreSummary: exclusionSummary(exclusions) });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post('/api/exclusions', async (request, response, next) => {
   try {
     const ids = Array.isArray(request.body?.ids) ? request.body.ids.filter((id) => typeof id === 'string') : [];

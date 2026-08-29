@@ -7,17 +7,21 @@ export function listExclusions() {
   return store.read().records.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+function validBytes(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
 export function exclusionSummary(records = store.read().records) {
   return records.reduce((summary, record) => {
     summary.count += 1;
-    if (typeof record.sizeBytes === 'number' && Number.isFinite(record.sizeBytes) && record.sizeBytes >= 0) {
+    if (validBytes(record.sizeBytes)) {
       summary.totalSizeBytes += record.sizeBytes;
     } else {
       summary.unknownSizeCount += 1;
     }
     if (record.scope !== 'orphan') {
-      if (typeof record.overageBytes === 'number' && Number.isFinite(record.overageBytes) && record.overageBytes >= 0) {
-        summary.totalOverageBytes += record.overageBytes;
+      if (validBytes(record.sizeBytes) && validBytes(record.limitBytes)) {
+        summary.totalOverageBytes += Math.max(0, record.sizeBytes - record.limitBytes);
       } else {
         summary.unknownOverageCount += 1;
       }
@@ -44,34 +48,46 @@ function exclusionKeySignature(keys) {
 }
 
 export async function refreshExclusionOverages(arrResults) {
-  const overageByKeys = new Map();
+  const measurementsByKeys = new Map();
   for (const result of Object.values(arrResults ?? {})) {
     // Only a connected scan is authoritative. Missing, unmonitored, special-season,
     // or otherwise unmeasurable files produce no observation and retain their last value.
     if (result?.status !== 'connected') continue;
     for (const observation of Array.isArray(result.overageObservations) ? result.overageObservations : []) {
-      if (typeof observation?.overageBytes !== 'number'
-        || !Number.isFinite(observation.overageBytes)
-        || observation.overageBytes < 0) continue;
+      if (!validBytes(observation?.sizeBytes) || !validBytes(observation?.limitBytes)) continue;
       const signature = exclusionKeySignature(observation.exclusionKeys);
-      if (signature) overageByKeys.set(signature, observation.overageBytes);
+      if (signature) {
+        measurementsByKeys.set(signature, {
+          sizeBytes: observation.sizeBytes,
+          limitBytes: observation.limitBytes,
+          overageBytes: Math.max(0, observation.sizeBytes - observation.limitBytes),
+        });
+      }
     }
   }
-  if (!overageByKeys.size) return listExclusions();
+  if (!measurementsByKeys.size) return listExclusions();
 
   const updates = new Map();
   for (const record of store.read().records) {
     if (record.scope === 'orphan') continue;
     const signature = exclusionKeySignature(record.keys);
-    if (!signature || !overageByKeys.has(signature)) continue;
-    const overageBytes = overageByKeys.get(signature);
-    if (record.overageBytes !== overageBytes) updates.set(record.id, overageBytes);
+    if (!signature || !measurementsByKeys.has(signature)) continue;
+    const measurement = measurementsByKeys.get(signature);
+    if (record.sizeBytes !== measurement.sizeBytes
+      || record.limitBytes !== measurement.limitBytes
+      || record.overageBytes !== measurement.overageBytes) {
+      updates.set(record.id, measurement);
+    }
   }
   if (!updates.size) return listExclusions();
 
   await store.update((document) => {
     for (const record of document.records) {
-      if (updates.has(record.id)) record.overageBytes = updates.get(record.id);
+      const measurement = updates.get(record.id);
+      if (!measurement) continue;
+      record.sizeBytes = measurement.sizeBytes;
+      record.limitBytes = measurement.limitBytes;
+      record.overageBytes = measurement.overageBytes;
     }
   });
   return listExclusions();
@@ -90,7 +106,10 @@ export async function addExclusions(candidates) {
       scope,
       path: candidate.path,
       sizeBytes: candidate.sizeBytes,
-      ...(scope === 'oversized' ? { overageBytes: candidate.overageBytes } : {}),
+      ...(scope === 'oversized' ? {
+        limitBytes: candidate.limitBytes,
+        overageBytes: Math.max(0, candidate.sizeBytes - candidate.limitBytes),
+      } : {}),
       createdAt: now,
     };
   });

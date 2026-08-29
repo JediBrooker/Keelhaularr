@@ -13,6 +13,7 @@ const { cleanupExpiredQuarantine, listQuarantine, recordQuarantine, restoreQuara
 const appSource = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
 const operationsSource = await readFile(new URL('../src/OperationsDialog.tsx', import.meta.url), 'utf8');
 const settingsSource = await readFile(new URL('../src/SettingsDialog.tsx', import.meta.url), 'utf8');
+const stylesSource = await readFile(new URL('../src/styles.css', import.meta.url), 'utf8');
 after(() => rm(testRoot, { recursive: true, force: true }));
 
 function sourceSection(start, end) {
@@ -203,7 +204,7 @@ test('both result types can be ignored and restored from the ignore list', () =>
   assert.match(manifestControls, /onClick=\{ignoreSelection\}/);
   assert.match(manifestControls, /'Ignore selected'/);
   assert.match(manifestControls, /setOperationsTab\('exclusions'\)/);
-  assert.match(manifestControls, /<span>Ignore list<\/span>/);
+  assert.match(manifestControls, /<span className="ignore-list-summary-title">Ignore list<\/span>/);
   assert.match(operationsSource, /exclusions: 'Ignore list'/);
   assert.match(operationsSource, /Untracked file/);
   assert.match(operationsSource, /Size-limit file/);
@@ -236,6 +237,10 @@ test('dashboard ignore-list summary reports exact GiB totals and stays fresh', (
     'async function runScan()',
     'useEffect(() => {\n    if (auth !== \'signed-in\' || !jobsAwaitingRefresh.length)',
   );
+  const overageRefreshEffect = sourceSection(
+    "if (auth !== 'signed-in') {\n      attemptedIgnoreOverageRefreshes.current.clear();",
+    'const requestId = ++arrConnectionsRequestId.current;',
+  );
   const operationsRefresh = sourceSection(
     'async function operationsChanged()',
     'async function ignoreSelection()',
@@ -259,21 +264,37 @@ test('dashboard ignore-list summary reports exact GiB totals and stays fresh', (
   assert.match(summaryModel, /totalOverageBytes: Number\.isFinite\(summary\.totalOverageBytes\)/);
   assert.match(summaryModel, /unknownOverageCount: Number\.isFinite\(summary\.unknownOverageCount\)/);
   assert.match(appSource, /ignoreSummary\?: IgnoreSummary/);
-  assert.match(formatGib, /bytes \/ 1024 \*\* 3\)\.toFixed\(2\)/);
+  assert.match(formatGib, /const gib = bytes \/ 1024 \*\* 3/);
+  assert.match(formatGib, /gib > 0 && gib < 0\.01 \? '<0\.01' : gib\.toFixed\(2\)/);
   assert.match(formatGib, /GiB/);
   assert.match(appInitialization, /useState<IgnoreSummary>\(emptyIgnoreSummary\)/);
+  assert.match(appInitialization, /useState<'idle' \| 'refreshing' \| 'settled'>\('idle'\)/);
   assert.match(appInitialization, /setIgnoreSummary\(normalizeIgnoreSummary\(statusData\.ignoreSummary\)\)/);
   assert.equal(signInAndSettingsRefresh.match(/setIgnoreSummary\(normalizeIgnoreSummary\(statusData\.ignoreSummary\)\)/g)?.length, 2);
   assert.match(scanRefresh, /setIgnoreSummary\(normalizeIgnoreSummary\(data\.ignoreSummary\)\)/);
+  assert.match(overageRefreshEffect, /ignoreSummary\.unknownOverageCount === 0/);
+  assert.match(overageRefreshEffect, /attemptedIgnoreOverageRefreshes\.current\.has\(stateKey\)/);
+  assert.match(overageRefreshEffect, /pendingIgnoreOverageRefreshes\.current\.has\(stateKey\) \? 'refreshing' : 'settled'/);
+  assert.match(overageRefreshEffect, /pendingIgnoreOverageRefreshes\.current\.add\(stateKey\)/);
+  assert.match(overageRefreshEffect, /pendingIgnoreOverageRefreshes\.current\.delete\(stateKey\)/);
+  assert.match(overageRefreshEffect, /['"]\/api\/exclusions\/refresh['"]/);
+  assert.match(overageRefreshEffect, /method: 'POST'/);
+  assert.match(overageRefreshEffect, /setIgnoreOverageRefreshState\('refreshing'\)/);
+  assert.match(overageRefreshEffect, /setIgnoreSummary\(refreshedSummary\)/);
+  assert.match(overageRefreshEffect, /unknownOverageCount > 0 \? 'settled' : 'idle'/);
   assert.match(summaryLabels, /ignoredOverageLabel = formatGib\(ignoreSummary\.totalOverageBytes\)/);
+  assert.match(summaryLabels, /ignoreSummarySizeText/);
+  assert.match(summaryLabels, /ignoreSummaryOverageText/);
+  assert.match(summaryLabels, /Calculating overage…/);
+  assert.match(summaryLabels, /Overage unavailable for \$\{ignoreSummary\.unknownOverageCount\}/);
+  assert.match(summaryLabels, /At least \$\{ignoredOverageLabel\} over limit/);
   assert.match(summaryLabels, /\$\{ignoredOverageLabel\} over limit/);
   assert.match(summaryLabels, /unknownSizeText/);
-  assert.match(summaryLabels, /unknownOverageText/);
-  assert.match(summaryLabels, /overages; untracked files are not included in this overage/);
+  assert.match(summaryLabels, /untracked files are not included in this overage/);
   assert.match(summaryLabels, /files with known sizes/);
   assert.match(summaryLabels, /with unknown size/);
   assert.match(summaryLabels, /ignored size-limit file/);
-  assert.match(summaryLabels, /with unknown overage/);
+  assert.match(summaryLabels, /Overage is unavailable/);
   assert.match(operationsRefresh, /if \(scan\)[\s\S]*await runScan\(\)/);
   assert.match(operationsRefresh, /['"]\/api\/status['"]/);
   assert.match(operationsRefresh, /setIgnoreSummary\(normalizeIgnoreSummary\(statusData\.ignoreSummary\)\)/);
@@ -282,8 +303,13 @@ test('dashboard ignore-list summary reports exact GiB totals and stays fresh', (
   assert.match(manifestControls, /className="ghost-button compact ignore-list-summary-button"/);
   assert.match(manifestControls, /aria-label=\{ignoreSummaryAccessibleLabel\}/);
   assert.match(manifestControls, /title=\{ignoreSummaryAccessibleLabel\}/);
-  assert.match(manifestControls, /<span>Ignore list<\/span>/);
-  assert.match(manifestControls, /<small>\{ignoreSummaryText\}<\/small>/);
+  assert.match(manifestControls, /className="ignore-list-summary-title">Ignore list<\/span>/);
+  assert.match(manifestControls, /className="ignore-list-summary-metrics" aria-hidden="true"/);
+  assert.match(manifestControls, /<small>\{ignoreSummarySizeText\}<\/small>/);
+  assert.match(manifestControls, /<small>\{ignoreSummaryOverageText\}<\/small>/);
+  assert.match(stylesSource, /\.ignore-list-summary-button\{display:inline-grid;grid-template-columns:auto minmax\(0,1fr\)/);
+  assert.match(stylesSource, /\.ignore-list-summary-metrics\{display:flex;[^}]*flex-direction:column/);
+  assert.match(stylesSource, /\.ignore-list-summary-button\{width:auto;max-width:100%;[^}]*align-self:flex-end/);
   assert.match(appSource, /onChanged=\{operationsChanged\}/);
 });
 
