@@ -105,6 +105,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const commands = [];
   const deletes = [];
   const notifications = [];
+  const qbittorrentLogins = [];
   const commandStates = new Map();
   let nextCommandId = 54;
   let movieDeleted = false;
@@ -112,7 +113,34 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const mock = createServer(async (request, response) => {
     const url = new URL(request.url, 'http://mock');
     let value;
-    if (request.method === 'POST' && url.pathname === '/notify') {
+    if (request.method === 'POST' && url.pathname === '/api/v2/auth/login') {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const credentials = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+      qbittorrentLogins.push({
+        username: credentials.get('username'),
+        password: credentials.get('password'),
+        origin: request.headers.origin,
+      });
+      if (credentials.get('username') !== 'qbit-admin' || credentials.get('password') !== 'qbit-secret') {
+        response.writeHead(401).end('Unauthorized');
+        return;
+      }
+      response.writeHead(204, { 'Set-Cookie': `QBT_SID_${mockPort || 0}=fixture-session; Path=/; HttpOnly` }).end();
+      return;
+    } else if (request.method === 'GET' && url.pathname === '/api/v2/app/version') {
+      response.writeHead(200, { 'Content-Type': 'text/plain' }).end('5.2.0');
+      return;
+    } else if (request.method === 'GET' && url.pathname === '/api/v2/torrents/categories') {
+      value = {
+        'Kids Movies': { savePath: '/downloads/kids' },
+        'do-not-touch': { savePath: '' },
+      };
+    } else if (request.method === 'GET' && url.pathname === '/api/v2/torrents/info') value = [];
+    else if (request.method === 'POST' && url.pathname === '/api/v2/auth/logout') {
+      response.writeHead(204).end();
+      return;
+    } else if (request.method === 'POST' && url.pathname === '/notify') {
       const chunks = [];
       for await (const chunk of request) chunks.push(chunk);
       notifications.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
@@ -214,7 +242,16 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const initialSettings = JSON.parse(initialSettingsText).settings;
   assert.equal(initialSettings.radarr.apiKeyConfigured, true);
   assert.equal(initialSettings.defaults.maxMbPerMinute, 85);
+  assert.deepEqual(initialSettings.qbittorrent.recovery, {
+    enabled: false,
+    slowSpeedKibPerSecond: 100,
+    slowMinutes: 30,
+    stalledMinutes: 30,
+    excludedCategories: [],
+  });
   assert.deepEqual(initialSettings.server.storageRoots, [moviesRoot, tvRoot]);
+  assert.equal((await fetch(`${base}/api/settings/qbittorrent/categories`)).status, 401);
+  assert.equal((await fetch(`${base}/api/qbittorrent/recovery/status`)).status, 401);
 
   const directoryUrl = `${base}/api/storage/directories?path=${encodeURIComponent(`${moviesRoot}/`)}`;
   assert.equal((await fetch(directoryUrl)).status, 401);
@@ -259,6 +296,20 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
       downloadRoots: [tvDownloadsRoot],
       pathMaps: [],
     },
+    qbittorrent: {
+      url: `http://127.0.0.1:${mockPort}`,
+      username: 'qbit-admin',
+      password: 'qbit-secret',
+      clearPassword: false,
+      pathMaps: [],
+      recovery: {
+        enabled: true,
+        slowSpeedKibPerSecond: 0,
+        slowMinutes: 45,
+        stalledMinutes: 60,
+        excludedCategories: ['', 'do-not-touch', ' Kids Movies '],
+      },
+    },
     orphan: {
       action: 'quarantine',
       trashDir: quarantineRoot,
@@ -282,19 +333,83 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(saveSettingsResponse.status, 200);
   const savedSettingsText = await saveSettingsResponse.text();
   assert.equal(savedSettingsText.includes('updated-radarr-key'), false);
+  assert.equal(savedSettingsText.includes('qbit-secret'), false);
   assert.equal(savedSettingsText.includes('/notify'), false);
   assert.equal(savedSettingsText.includes('"newPassword"'), false);
   const savedSettings = JSON.parse(savedSettingsText);
   assert.equal(savedSettings.settings.defaults.maxMbPerMinute, 70);
   assert.equal(savedSettings.settings.sonarr.maxMbPerMinuteOverride, 75);
   assert.equal(savedSettings.settings.radarr.useArrQualityDefinitions, true);
+  assert.equal(savedSettings.settings.qbittorrent.passwordConfigured, true);
+  assert.deepEqual(savedSettings.settings.qbittorrent.recovery, settingsUpdate.qbittorrent.recovery);
   assert.equal(savedSettings.config.radarr.maxMbPerMinute, 70);
   assert.equal(savedSettings.config.sonarr.maxMbPerMinute, 75);
+  assert.deepEqual(savedSettings.config.qbittorrent.recovery, settingsUpdate.qbittorrent.recovery);
+
+  const recoveryStatusResponse = await fetch(`${base}/api/qbittorrent/recovery/status`, {
+    headers: { Cookie: cookie },
+  });
+  assert.equal(recoveryStatusResponse.status, 200);
+  const recoveryStatus = await recoveryStatusResponse.json();
+  assert.equal(recoveryStatus.enabled, true);
+  assert.equal(recoveryStatus.running, true);
+
+  const changedQbittorrentSave = await request('/api/settings', {
+    ...settingsUpdate,
+    account: { ...settingsUpdate.account, newPassword: '' },
+    qbittorrent: {
+      ...settingsUpdate.qbittorrent,
+      url: `http://127.0.0.1:${mockPort}/different-server`,
+      password: '',
+    },
+  }, 'PUT');
+  assert.equal(changedQbittorrentSave.status, 400);
+  assert.match((await changedQbittorrentSave.json()).error, /password again/i);
+
+  for (const [recovery, message] of [
+    [{ ...settingsUpdate.qbittorrent.recovery, slowSpeedKibPerSecond: 1048577 }, /slow-speed threshold/i],
+    [{ ...settingsUpdate.qbittorrent.recovery, slowMinutes: 0 }, /slow duration/i],
+    [{ ...settingsUpdate.qbittorrent.recovery, stalledMinutes: 10081 }, /stalled duration/i],
+    [{ ...settingsUpdate.qbittorrent.recovery, excludedCategories: ['duplicate', 'duplicate'] }, /duplicate/i],
+    [{ ...settingsUpdate.qbittorrent.recovery, excludedCategories: ['x'.repeat(257)] }, /256/i],
+    [{ ...settingsUpdate.qbittorrent.recovery, excludedCategories: Array.from({ length: 101 }, (_, index) => `category-${index}`) }, /100/i],
+  ]) {
+    const invalidRecovery = await request('/api/settings', {
+      ...settingsUpdate,
+      account: { ...settingsUpdate.account, newPassword: '' },
+      qbittorrent: { ...settingsUpdate.qbittorrent, recovery },
+    }, 'PUT');
+    assert.equal(invalidRecovery.status, 400);
+    assert.match((await invalidRecovery.json()).error, message);
+  }
+
+  const recoveryWithoutQbittorrent = await request('/api/settings', {
+    ...settingsUpdate,
+    account: { ...settingsUpdate.account, newPassword: '' },
+    qbittorrent: { ...settingsUpdate.qbittorrent, url: '' },
+  }, 'PUT');
+  assert.equal(recoveryWithoutQbittorrent.status, 400);
+  assert.match((await recoveryWithoutQbittorrent.json()).error, /configured qBittorrent/i);
+
+  const recoveryWithoutArr = await request('/api/settings', {
+    ...settingsUpdate,
+    account: { ...settingsUpdate.account, newPassword: '' },
+    radarr: { ...settingsUpdate.radarr, url: '', apiKey: '', clearApiKey: true },
+    sonarr: { ...settingsUpdate.sonarr, url: '', apiKey: '', clearApiKey: true },
+  }, 'PUT');
+  assert.equal(recoveryWithoutArr.status, 400);
+  assert.match((await recoveryWithoutArr.json()).error, /configured Arr/i);
 
   const persistedPath = path.join(tempRoot, 'config', 'settings.json');
   const persisted = JSON.parse(await readFile(persistedPath, 'utf8'));
   assert.equal(persisted.values.APP_PASSWORD, 'yo');
   assert.equal(persisted.values.RADARR_API_KEY, 'updated-radarr-key');
+  assert.equal(persisted.values.QBITTORRENT_PASSWORD, 'qbit-secret');
+  assert.equal(persisted.values.QBITTORRENT_RECOVERY_ENABLED, 'true');
+  assert.equal(
+    persisted.values.QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON,
+    JSON.stringify(settingsUpdate.qbittorrent.recovery.excludedCategories),
+  );
   assert.equal((await stat(persistedPath)).mode & 0o777, 0o600);
 
   const testConnection = await request('/api/settings/test', {
@@ -306,6 +421,47 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const connectionResult = await testConnection.json();
   assert.equal(connectionResult.version, 'test-1.0');
   assert.deepEqual(connectionResult.rootFolders, [moviesRoot, tvRoot]);
+
+  const qbittorrentConnection = await request('/api/settings/test', {
+    app: 'qbittorrent',
+    url: `http://127.0.0.1:${mockPort}`,
+    username: 'qbit-admin',
+    password: '',
+    pathMaps: [],
+  });
+  assert.equal(qbittorrentConnection.status, 200);
+  const qbittorrentConnectionResult = await qbittorrentConnection.json();
+  assert.equal(qbittorrentConnectionResult.version, '5.2.0');
+  assert.deepEqual(qbittorrentConnectionResult.categories, [
+    { name: '', savePath: '', synthetic: true },
+    { name: 'Kids Movies', savePath: '/downloads/kids' },
+    { name: 'do-not-touch', savePath: '' },
+  ]);
+  assert.deepEqual(qbittorrentLogins.at(-1), {
+    username: 'qbit-admin',
+    password: 'qbit-secret',
+    origin: `http://127.0.0.1:${mockPort}`,
+  });
+  const loginCountBeforeChangedTarget = qbittorrentLogins.length;
+  const changedTargetTest = await request('/api/settings/test', {
+    app: 'qbittorrent',
+    url: `http://127.0.0.1:${mockPort}/different-server`,
+    username: 'qbit-admin',
+    password: '',
+    pathMaps: [],
+  });
+  assert.equal(changedTargetTest.status, 400);
+  assert.equal(qbittorrentLogins.length, loginCountBeforeChangedTarget);
+
+  const savedCategoriesResponse = await fetch(`${base}/api/settings/qbittorrent/categories`, {
+    headers: { Cookie: cookie },
+  });
+  assert.equal(savedCategoriesResponse.status, 200);
+  assert.deepEqual((await savedCategoriesResponse.json()).categories, [
+    { name: '', savePath: '', synthetic: true },
+    { name: 'Kids Movies', savePath: '/downloads/kids' },
+    { name: 'do-not-touch', savePath: '' },
+  ]);
 
   const scanResponse = await request('/api/scan');
   assert.equal(scanResponse.status, 200);

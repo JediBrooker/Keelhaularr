@@ -5,10 +5,11 @@ tracked media files above a configured MB/min limit plus an absolute oversize
 tolerance, and it can compare real library folders with both *arr databases to
 find orphaned media.
 
-Library and download files are never deleted automatically. File actions are
-selected in the interface, confirmed, and revalidated on the server before
-they run. Optional Brig retention can automatically purge already-quarantined
-files; it is disabled by default.
+Scan findings are never acted on automatically. File actions are selected in
+the interface, confirmed, and revalidated on the server before they run.
+Optional Brig retention can purge already-quarantined files, and the separate
+qBittorrent recovery policy can remove eligible partial torrents through Arr.
+Both destructive automations are opt-in and disabled by default.
 
 ## Features
 
@@ -18,6 +19,8 @@ files; it is disabled by default.
 - Fresh Radarr/Sonarr searches after tracked files are removed
 - Filesystem orphan scanning against the files actually tracked by each app
 - Inode-based hardlink integrity checks for completed torrent/download folders
+- Optional qBittorrent guard that withholds every incomplete torrent from orphan actions
+- Opt-in automatic recovery for continuously slow or stalled qBittorrent downloads
 - Recoverable orphan quarantine by default
 - Optional permanent orphan deletion with an explicit server-side enable flag
 - Built-in login, HttpOnly signed sessions, and login rate limiting
@@ -52,9 +55,9 @@ non-system mount points detected inside the LXC. It then starts Keelhaularr and
 verifies its health endpoint.
 
 Sign in at the printed URL and the **First voyage setup** screen opens
-automatically. Radarr/Sonarr URLs, API keys, independent size limits, media and
-download roots, path mappings, quarantine, and all scanner controls are entered
-there. Testing an application connection copies its API-reported media roots
+automatically. Radarr/Sonarr URLs, API keys, qBittorrent credentials,
+independent size limits, media and download roots, path mappings, quarantine,
+and all scanner controls are entered there. Testing an *arr connection copies its API-reported media roots
 into the empty path fields. A mistake in the GUI can simply be corrected and
 saved; the terminal installer does not need to be restarted.
 
@@ -109,7 +112,10 @@ inside Keelhaularr.
    - `RADARR_MEDIA_ROOTS` and `SONARR_MEDIA_ROOTS`
 
    To check completed downloads for broken or stale hardlinks, also set
-   `RADARR_DOWNLOAD_ROOTS` and `SONARR_DOWNLOAD_ROOTS`.
+   `RADARR_DOWNLOAD_ROOTS` and `SONARR_DOWNLOAD_ROOTS`. Add
+   `QBITTORRENT_URL`, `QBITTORRENT_USERNAME`, and `QBITTORRENT_PASSWORD` to
+   guarantee that incomplete torrents are withheld. Automatic recovery remains
+   off unless its separate destructive policy is explicitly enabled.
 
 3. Copy and edit the Compose example:
 
@@ -158,13 +164,16 @@ are both served on `PORT`, which defaults to 8787.
 On a fresh installation, **First voyage setup** opens immediately after login.
 Later, open **Settings** in the top bar. The interface manages login
 credentials and sessions, shared and per-app size rules, Radarr/Sonarr URLs and
-API keys, unmonitored-media behavior, media roots, completed-download roots,
-hardlink minimum age, path mappings, orphan action
-and safety controls, quarantine, ignored directories, scan limits, and media
-extensions. Connection tests are available before saving and automatically fill
-empty library-folder fields. Folders use individual add/remove rows; path
-mapping is kept in a collapsed advanced section because normal installer-based
-deployments use identical paths and do not need it.
+API keys, the qBittorrent safety and recovery connection, unmonitored-media
+behavior, media roots, completed-download roots, hardlink minimum age, path
+mappings, orphan action and safety controls, quarantine, ignored directories,
+scan limits, and media extensions. Connection tests are available before
+saving and automatically fill empty library-folder fields. The qBittorrent test
+also discovers exact category names for recovery exclusions; saved connections
+refresh that list whenever Settings opens. Missing categories already selected
+as exclusions remain visible until explicitly removed. Folders use individual
+add/remove rows; path mapping is kept in a collapsed advanced section because
+normal installer-based deployments use identical paths and do not need it.
 
 Library, completed-download, and quarantine fields discover folders as you
 type. Start with `/data/` (or another mounted path), click a suggestion to look
@@ -258,6 +267,13 @@ the search to be requested again, but recovery targets the original file ID,
 not a newly imported replacement. Changing an application's URL while a job is
 active withholds that job's actions until the original connection is restored.
 
+Automatic qBittorrent recovery also uses durable jobs. Expand one to see the
+torrent name, exact category, slow/stalled reason, destructive phase, and later
+replacement status. Its phases distinguish revalidation, Arr removal and
+blocklisting, qBittorrent removal confirmation, and the single replacement
+search request. A failed or ambiguous phase is preserved for inspection and
+does not advance to a search.
+
 ## Manifest controls and exclusions
 
 Search by title, quality, or path; filter by application; sort by size, overage,
@@ -317,6 +333,41 @@ file is fully rescanned and its inode and size are checked again immediately
 before quarantine or deletion; if a library hardlink appeared in the meantime,
 the download copy is withheld.
 
+For a stronger guarantee, connect qBittorrent in Settings or configure:
+
+```dotenv
+QBITTORRENT_URL=http://qbittorrent:8080
+QBITTORRENT_USERNAME=admin
+QBITTORRENT_PASSWORD=your-web-ui-password
+QBITTORRENT_PATH_MAPS=/downloads/movies=>/radarr-downloads;/downloads/tv=>/sonarr-downloads
+```
+
+Keelhaularr reads qBittorrent's torrent list and excludes the entire content
+path of every torrent whose progress is below 100% or whose remaining byte
+count is nonzero. That covers incomplete downloads even when they are paused,
+stalled, or queued. Completed and seeding torrents remain eligible for the
+normal broken-hardlink check. qBittorrent 4.3.3 or newer is required because
+the guard relies on the Web API's `content_path` field. The guard is queried
+during each scan, when a job is created, at job preflight, and again immediately
+before each download file is changed.
+
+The guard fails closed: when a configured qBittorrent server cannot be reached
+or authenticated, or an incomplete path cannot be mapped safely, all
+completed-download orphan results are withheld while library orphan scanning
+continues. If qBittorrent and Keelhaularr see different paths, add mappings from
+the qBittorrent path to the Keelhaularr container path. Mapping does not mount a
+folder; the completed-download directories must still be bind-mounted.
+
+Every incomplete torrent path is validated. A mixed-purpose qBittorrent client
+with an unrelated active download outside these roots therefore withholds all
+download-root orphan results until that job finishes. This deliberately favors
+preservation over guessing which torrents belong to an *arr application.
+
+The Web UI URL must be reachable from inside the Keelhaularr container. A
+Docker service name works when both containers share a network; otherwise use a
+reachable LAN address. Prefer an isolated Docker/LAN HTTP connection or HTTPS
+with a certificate trusted by the container.
+
 Docker can only see host paths that are bind-mounted into it. For installer
 deployments, rerun the one-command installer to add or change completed-download
 mounts. You can then edit their container paths and every other scanner setting
@@ -336,8 +387,65 @@ ORPHAN_ACTION=permanent
 ALLOW_PERMANENT_ORPHAN_DELETE=true
 ```
 
-The interface clearly labels the active action and requires a stronger typed
-confirmation for permanent removal.
+The interface clearly labels the active action and uses a standard
+**Confirm / Cancel** dialog before removal.
+
+## Automatic qBittorrent recovery
+
+Automatic recovery is a separate, destructive feature. It is disabled by
+default and can be enabled only when qBittorrent and at least one Radarr or
+Sonarr connection are configured. Enabling the toggle is the explicit opt-in:
+once an eligible torrent passes every safety gate, no per-torrent confirmation
+is shown.
+
+The default policy is:
+
+```dotenv
+QBITTORRENT_RECOVERY_ENABLED=false
+QBITTORRENT_RECOVERY_SLOW_KIB_PER_SECOND=100
+QBITTORRENT_RECOVERY_SLOW_MINUTES=30
+QBITTORRENT_RECOVERY_STALLED_MINUTES=30
+QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON=[]
+```
+
+The speed is KiB per second; `0` disables slow-speed detection without
+disabling stalled detection. Durations are whole minutes. Category exclusions
+are an exact JSON string array: matching is case- and space-sensitive, and `""`
+selects **Uncategorized**. Disabling recovery does not erase thresholds or
+exclusions. Settings discovers categories from the saved connection, while a
+successful test of unsaved credentials replaces the displayed discovery list.
+
+Eligibility is deliberately narrow. The torrent must still be incomplete and
+must remain either exactly `downloading` below the configured speed or exactly
+`stalledDL` for its full threshold. Paused, queued, forced, checking, metadata,
+uploading, completed, malformed, and unknown states are left untouched. The
+server polls once per minute and records the observation durably, but the timer
+must be continuous for the same hash, reason, and category. Recovery being
+disabled, a policy or connection change, a qBittorrent outage, disappearance
+from eligibility, or a changed reason/category resets the observation window.
+
+After the timer matures, Keelhaularr still requires exact ownership proof. The
+opaque torrent hash must match exactly one torrent queue record across the
+configured Arr apps; that record must resolve to exactly one enabled
+qBittorrent download client; and grabbed history must identify exactly one
+Radarr movie or one Sonarr series with explicit episode IDs. The hash, policy,
+category, reason, queue record, download client, and search target are checked
+again immediately before action. Ambiguous, missing, malformed, changed, or
+unreachable evidence fails closed and preserves the torrent.
+
+For a proven candidate, Keelhaularr asks the owning Arr app to remove the queue
+item from qBittorrent **with its partial data**, blocklist the bad release, and
+suppress Arr's implicit redownload. It then verifies that qBittorrent no longer
+lists the exact hash before issuing one explicit replacement search for the
+same movie or episode set. If removal cannot be proven, no search is queued. If
+a restart makes an accepted search ambiguous, Keelhaularr refuses to queue a
+duplicate. The durable job and its phases remain visible under **Operations →
+Jobs**.
+
+This policy does not make guesses from names, paths, categories, or a generic
+“torrent” download-client label. Category exclusions are a convenience filter;
+the hash and qBittorrent-backed Arr ownership proof remain mandatory for every
+non-excluded candidate.
 
 ## The Brig
 
@@ -406,8 +514,10 @@ and set:
 APP_COOKIE_SECURE=true
 ```
 
-Radarr and Sonarr API keys entered in Settings are never returned to the
-browser. Do not commit `.env` or `config/settings.json` to source control.
+Radarr and Sonarr API keys and the qBittorrent password entered in Settings are
+never returned to the browser. They are stored unencrypted in the private
+`config/settings.json` file (mode `0600`), so do not commit or casually copy
+`.env` or `config/settings.json`.
 
 ## Uninstall
 

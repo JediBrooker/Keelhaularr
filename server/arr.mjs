@@ -276,6 +276,206 @@ export async function queueSearch(connection, kind, ids) {
   return arrRequest(connection, 'command', { method: 'POST', body: JSON.stringify(body) });
 }
 
+function normalizedHash(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function positiveInteger(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function recordsFrom(value) {
+  if (Array.isArray(value)) return value;
+  return Array.isArray(value?.records) ? value.records : [];
+}
+
+function reconciliationTimestamp(value, label) {
+  const milliseconds = typeof value === 'string' ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(milliseconds) || new Date(milliseconds).toISOString() !== value) {
+    throw new Error(`The Arr ${label} reconciliation timestamp is invalid.`);
+  }
+  return milliseconds;
+}
+
+export async function listArrHistoryByDownloadId(connection, downloadId) {
+  const records = [];
+  const pageSize = 100;
+  const maximumPages = 100;
+  let expectedTotalRecords = null;
+  for (let page = 1; page <= maximumPages; page += 1) {
+    const query = new URLSearchParams({
+      page: String(page),
+      pageSize: String(pageSize),
+      sortKey: 'date',
+      sortDirection: 'descending',
+      downloadId,
+    });
+    const response = await arrRequest(connection, `history?${query}`);
+    const responsePage = response?.page;
+    const responsePageSize = response?.pageSize;
+    const totalRecords = response?.totalRecords;
+    const pageRecords = response?.records;
+    if (!Number.isSafeInteger(responsePage) || responsePage !== page
+      || !Number.isSafeInteger(responsePageSize) || responsePageSize !== pageSize
+      || !Number.isSafeInteger(totalRecords) || totalRecords < 0
+      || !Array.isArray(pageRecords) || pageRecords.length > pageSize) {
+      throw new Error('Arr returned an invalid history pagination contract.');
+    }
+    if (expectedTotalRecords === null) expectedTotalRecords = totalRecords;
+    if (totalRecords !== expectedTotalRecords || records.length + pageRecords.length > totalRecords) {
+      throw new Error('Arr history pagination changed or became inconsistent while it was being read.');
+    }
+    if (pageRecords.some((record) => normalizedHash(record?.downloadId) !== normalizedHash(downloadId))) {
+      throw new Error('Arr history pagination returned a record for a different download id.');
+    }
+    records.push(...pageRecords);
+    if (records.length >= totalRecords) return records;
+    if (!pageRecords.length || pageRecords.length < pageSize) {
+      throw new Error('Arr history pagination ended before all records were returned.');
+    }
+  }
+  throw new Error('Arr history pagination exceeded the safety cap before all records were returned.');
+}
+
+async function arrRecoveryInventory(connection) {
+  if (!connection?.configured) return { queue: [], downloadClients: [] };
+  const [queueResponse, clientsResponse] = await Promise.all([
+    arrRequest(connection, 'queue/details'),
+    arrRequest(connection, 'downloadclient'),
+  ]);
+  return {
+    queue: recordsFrom(queueResponse),
+    downloadClients: recordsFrom(clientsResponse),
+  };
+}
+
+function proveQbittorrentClient(record, downloadClients) {
+  const matches = downloadClients.filter((client) => client?.enable === true
+    && client.name === record.downloadClient
+    && String(client.implementation ?? '').toLowerCase() === 'qbittorrent'
+    && String(client.protocol ?? '').toLowerCase() === 'torrent');
+  return matches.length === 1 ? matches[0] : null;
+}
+
+export async function resolveQbittorrentRecoveryOwnership(config, torrent) {
+  const hash = normalizedHash(torrent?.hash);
+  if (!hash) throw new Error('The qBittorrent torrent hash is missing or malformed.');
+
+  const configuredApps = ['radarr', 'sonarr'].filter((app) => config[app]?.configured);
+  if (!configuredApps.length) throw new Error('Neither Radarr nor Sonarr is configured.');
+  const inventories = await Promise.all(configuredApps.map(async (app) => ({
+    app,
+    connection: config[app],
+    ...(await arrRecoveryInventory(config[app])),
+  })));
+
+  const matches = inventories.flatMap((inventory) => inventory.queue
+    .filter((record) => String(record?.protocol ?? '').toLowerCase() === 'torrent'
+      && normalizedHash(record?.downloadId) === hash)
+    .map((record) => ({ ...inventory, record })));
+  if (matches.length !== 1) {
+    throw new Error(`Expected exactly one Radarr/Sonarr queue match for torrent ${torrent.hash}; found ${matches.length}.`);
+  }
+
+  const match = matches[0];
+  const queueId = positiveInteger(match.record.id);
+  if (!queueId) throw new Error('The matching Arr queue record has an invalid id.');
+  const downloadClient = proveQbittorrentClient(match.record, match.downloadClients);
+  if (!downloadClient) {
+    throw new Error('The matching Arr queue record does not resolve to exactly one enabled qBittorrent download client.');
+  }
+
+  const history = (await listArrHistoryByDownloadId(match.connection, match.record.downloadId))
+    .filter((record) => String(record?.eventType ?? '').toLowerCase() === 'grabbed');
+  if (!history.length) throw new Error('Arr has no grabbed history for the matching torrent, so it cannot be blocklisted safely.');
+
+  let searchIds;
+  let seriesId = null;
+  if (match.app === 'radarr') {
+    const historyMovieIds = history.map((record) => positiveInteger(record.movieId));
+    if (historyMovieIds.some((movieId) => movieId === null)) {
+      throw new Error('Radarr grabbed history contains a missing or malformed movie id.');
+    }
+    const movieIds = [...new Set(historyMovieIds)];
+    const queueMovieId = positiveInteger(match.record.movieId);
+    if (movieIds.length !== 1 || !queueMovieId || movieIds[0] !== queueMovieId) {
+      throw new Error('Radarr grabbed history does not identify exactly one movie matching the queue record.');
+    }
+    searchIds = movieIds;
+  } else {
+    const historySeriesIds = history.map((record) => positiveInteger(record.seriesId));
+    const historyEpisodeIds = history.map((record) => positiveInteger(record.episodeId));
+    if (historySeriesIds.some((value) => value === null) || historyEpisodeIds.some((value) => value === null)) {
+      throw new Error('Sonarr grabbed history contains a missing or malformed series or episode id.');
+    }
+    const seriesIds = [...new Set(historySeriesIds)];
+    const episodeIds = [...new Set(historyEpisodeIds)]
+      .sort((left, right) => left - right);
+    const queueSeriesId = positiveInteger(match.record.seriesId);
+    const queueEpisodeId = positiveInteger(match.record.episodeId);
+    if (seriesIds.length !== 1 || !queueSeriesId || seriesIds[0] !== queueSeriesId || !episodeIds.length
+      || (queueEpisodeId && !episodeIds.includes(queueEpisodeId))) {
+      throw new Error('Sonarr grabbed history does not identify episodes from exactly one series matching the queue record.');
+    }
+    seriesId = seriesIds[0];
+    searchIds = episodeIds;
+  }
+
+  return {
+    id: `qbittorrent:${hash}`,
+    app: match.app,
+    hash,
+    downloadId: match.record.downloadId,
+    queueId,
+    downloadClientName: match.record.downloadClient,
+    downloadClientId: positiveInteger(downloadClient.id),
+    searchIds,
+    seriesId,
+    historyIds: history.map((record) => positiveInteger(record.id)).filter(Boolean),
+    title: torrent.name,
+    subtitle: match.app === 'radarr' ? 'Radarr download' : 'Sonarr download',
+    category: torrent.category,
+    state: torrent.state,
+    downloadSpeedBytesPerSecond: torrent.dlspeed,
+  };
+}
+
+export async function removeQbittorrentRecoveryFromArr(connection, queueId) {
+  const query = new URLSearchParams({
+    removeFromClient: 'true',
+    blocklist: 'true',
+    skipRedownload: 'true',
+    changeCategory: 'false',
+  });
+  return arrRequest(connection, `queue/${queueId}?${query}`, { method: 'DELETE' });
+}
+
+export async function hasArrDownloadFailedSince(connection, downloadId, since) {
+  const sinceMs = reconciliationTimestamp(since, 'deletion');
+  const history = await listArrHistoryByDownloadId(connection, downloadId);
+  return history.some((record) => String(record?.eventType ?? '').toLowerCase() === 'downloadfailed'
+    && Number.isFinite(Date.parse(record.date))
+    && Date.parse(record.date) >= sinceMs);
+}
+
+export async function findMatchingSearchCommand(connection, kind, ids, since) {
+  const expectedName = kind === 'radarr' ? 'moviessearch' : 'episodesearch';
+  const bodyKey = kind === 'radarr' ? 'movieIds' : 'episodeIds';
+  const expectedIds = [...new Set(ids.map(Number))].sort((left, right) => left - right);
+  const sinceMs = reconciliationTimestamp(since, 'search');
+  const commands = recordsFrom(await arrRequest(connection, 'command'));
+  return commands.find((command) => {
+    const commandIds = [...new Set((command?.body?.[bodyKey] ?? []).map(Number))].sort((left, right) => left - right);
+    const queuedMs = Date.parse(command?.queued ?? command?.started ?? '');
+    return String(command?.name ?? command?.commandName ?? '').toLowerCase() === expectedName
+      && commandIds.length === expectedIds.length
+      && commandIds.every((id, index) => id === expectedIds[index])
+      && Number.isFinite(queuedMs)
+      && queuedMs >= sinceMs;
+  }) ?? null;
+}
+
 export async function replacementProgress(connection, candidate, commandId) {
   let command;
   try {

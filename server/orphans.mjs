@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, copyFile, mkdir, readdir, rename, rmdir, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
+import { inspectQbittorrent, pathIsProtected } from './qbittorrent.mjs';
 
 function orphanId(app, filePath) {
   return createHash('sha256').update(`${app}\0${filePath}`).digest('hex').slice(0, 24);
@@ -10,6 +11,41 @@ function orphanId(app, filePath) {
 function isWithin(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+function pathsOverlap(first, second) {
+  const resolvedFirst = path.resolve(first);
+  const resolvedSecond = path.resolve(second);
+  return resolvedFirst === resolvedSecond
+    || isWithin(resolvedFirst, resolvedSecond)
+    || isWithin(resolvedSecond, resolvedFirst);
+}
+
+function pathsOutsideRoots(paths, roots) {
+  return paths.filter((candidatePath) => !roots.some((root) => pathsOverlap(root, candidatePath)));
+}
+
+export async function assertQbittorrentSafe(config, candidate) {
+  if (candidate.source !== 'download' || !config.qbittorrent?.configured) return;
+  let snapshot;
+  try {
+    snapshot = await inspectQbittorrent(config.qbittorrent);
+  } catch (error) {
+    throw new Error(`qBittorrent safety check failed immediately before the file change; file preserved: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (snapshot.unmappedIncompleteCount) {
+    throw new Error('qBittorrent reported an incomplete torrent path that could not be mapped; file preserved.');
+  }
+  const configuredRoots = ['radarr', 'sonarr']
+    .flatMap((app) => config[app]?.downloadRoots ?? [])
+    .map((root) => path.resolve(root));
+  const outsideRoots = pathsOutsideRoots(snapshot.incompletePaths, configuredRoots);
+  if (outsideRoots.length) {
+    throw new Error(`qBittorrent reported ${outsideRoots.length} incomplete torrent path(s) outside the configured completed-download roots; file preserved.`);
+  }
+  if (pathIsProtected(candidate.path, snapshot.incompletePaths)) {
+    throw new Error('qBittorrent reports this file as part of an incomplete torrent; file preserved.');
+  }
 }
 
 async function walk(root, config, output) {
@@ -50,6 +86,37 @@ export async function scanOrphans(config, arrResults) {
   const candidates = [];
   const warnings = [];
   const roots = [];
+  let downloadScanAllowed = true;
+  let protectedDownloadPaths = [];
+
+  const configuredDownloadRoots = ['radarr', 'sonarr']
+    .flatMap((app) => config[app]?.downloadRoots ?? [])
+    .map((root) => path.resolve(root));
+  if (config.qbittorrent?.configured && configuredDownloadRoots.length) {
+    try {
+      const snapshot = await inspectQbittorrent(config.qbittorrent);
+      protectedDownloadPaths = snapshot.incompletePaths;
+      if (snapshot.unmappedIncompleteCount) {
+        downloadScanAllowed = false;
+        warnings.push(
+          `qBittorrent reported ${snapshot.unmappedIncompleteCount} incomplete torrent path(s) that could not be mapped; completed-download orphan scans were withheld.`,
+        );
+      } else {
+        const outsideRoots = pathsOutsideRoots(protectedDownloadPaths, configuredDownloadRoots);
+        if (outsideRoots.length) {
+          downloadScanAllowed = false;
+          warnings.push(
+            `qBittorrent reported ${outsideRoots.length} incomplete torrent path(s) outside the configured completed-download roots; completed-download orphan scans were withheld.`,
+          );
+        }
+      }
+    } catch (error) {
+      downloadScanAllowed = false;
+      warnings.push(
+        `qBittorrent safety check failed; completed-download orphan scans were withheld: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
 
   for (const app of ['radarr', 'sonarr']) {
     const connection = config[app];
@@ -97,6 +164,7 @@ export async function scanOrphans(config, arrResults) {
 
     const minimumModifiedAt = Date.now() - config.hardlinkMinAgeHours * 60 * 60 * 1000;
     for (const configuredRoot of connection.downloadRoots) {
+      if (!downloadScanAllowed) continue;
       let root;
       try {
         await access(configuredRoot, constants.R_OK);
@@ -119,6 +187,7 @@ export async function scanOrphans(config, arrResults) {
       await walk(root, config, files);
       roots.push({ app, kind: 'download', path: root, filesScanned: files.length });
       for (const file of files) {
+        if (pathIsProtected(file.path, protectedDownloadPaths)) continue;
         if (libraryIdentities.has(file.identity)) continue;
         if (new Date(file.modifiedAt).getTime() > minimumModifiedAt) continue;
         candidates.push({
@@ -162,6 +231,8 @@ async function quarantineFile(config, candidate, requestedDestination = null) {
   const timestamp = new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-');
   const destination = requestedDestination ?? await nextAvailablePath(quarantineDestination(config, candidate, timestamp));
   await mkdir(path.dirname(destination), { recursive: true });
+  await assertQbittorrentSafe(config, candidate);
+  await assertCandidateUnchanged(candidate);
   try {
     await rename(candidate.path, destination);
   } catch (error) {
@@ -174,6 +245,8 @@ async function quarantineFile(config, candidate, requestedDestination = null) {
       await copyFile(candidate.path, partial, constants.COPYFILE_EXCL);
       const copied = await stat(partial);
       if (copied.size !== candidate.sizeBytes) throw new Error('Cross-filesystem quarantine copy did not match the source size.');
+      await assertQbittorrentSafe(config, candidate);
+      await assertCandidateUnchanged(candidate);
       await rename(partial, destination);
       await unlink(candidate.path);
     } finally {
@@ -229,15 +302,10 @@ export async function applyOrphans(config, arrResults, requestedIds) {
 export async function applyOrphanCandidate(config, candidate, requestedDestination = null) {
   const resolved = path.resolve(candidate.path);
   if (!isWithin(candidate.root, resolved)) throw new Error('File escaped its configured scan root');
-  const currentStat = await stat(resolved, { bigint: true });
-  const currentIdentity = `${currentStat.dev}:${currentStat.ino}`;
-  if (currentIdentity !== candidate.identity || Number(currentStat.size) !== candidate.sizeBytes
-    || (candidate.linkCount !== undefined && Number(currentStat.nlink) !== candidate.linkCount)
-    || new Date(Number(currentStat.mtimeMs)).toISOString() !== candidate.modifiedAt) {
-    throw new Error('File changed after revalidation and was withheld');
-  }
   let destination = null;
   if (config.orphanAction === 'permanent') {
+    await assertQbittorrentSafe(config, candidate);
+    await assertCandidateUnchanged(candidate);
     await unlink(resolved);
   } else {
     destination = await quarantineFile(config, candidate, requestedDestination);
@@ -247,4 +315,14 @@ export async function applyOrphanCandidate(config, candidate, requestedDestinati
     status: config.orphanAction === 'permanent' ? 'deleted' : 'quarantined',
     destination,
   };
+}
+
+export async function assertCandidateUnchanged(candidate) {
+  const currentStat = await stat(candidate.path, { bigint: true });
+  const currentIdentity = `${currentStat.dev}:${currentStat.ino}`;
+  if (currentIdentity !== candidate.identity || Number(currentStat.size) !== candidate.sizeBytes
+    || (candidate.linkCount !== undefined && Number(currentStat.nlink) !== candidate.linkCount)
+    || new Date(Number(currentStat.mtimeMs)).toISOString() !== candidate.modifiedAt) {
+    throw new Error('File changed after revalidation and was withheld');
+  }
 }

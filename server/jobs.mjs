@@ -1,14 +1,40 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, stat, unlink } from 'node:fs/promises';
-import { deleteCandidate, queueSearch, replacementProgress, scanArr } from './arr.mjs';
+import {
+  deleteCandidate,
+  findMatchingSearchCommand,
+  hasArrDownloadFailedSince,
+  queueSearch,
+  removeQbittorrentRecoveryFromArr,
+  replacementProgress,
+  resolveQbittorrentRecoveryOwnership,
+  scanArr,
+} from './arr.mjs';
 import { filterExcluded } from './exclusions.mjs';
-import { applyOrphanCandidate, quarantineDestination, scanOrphans } from './orphans.mjs';
+import {
+  applyOrphanCandidate,
+  assertCandidateUnchanged,
+  assertQbittorrentSafe,
+  quarantineDestination,
+  scanOrphans,
+} from './orphans.mjs';
 import { recordQuarantine } from './quarantine.mjs';
+import {
+  classifyQbittorrentRecoveryTorrent,
+  qbittorrentRecoveryPolicyIdentity,
+} from './qbittorrent-recovery.mjs';
+import { listQbittorrentTorrents } from './qbittorrent.mjs';
 import { createJsonStore } from './state.mjs';
 
 const store = createJsonStore('jobs.json', { version: 1, jobs: [] });
 const ACTIVE_STATUSES = new Set(['queued', 'running', 'cancelling']);
+const POST_MUTATION_RECOVERY_PHASES = new Set([
+  'delete_requested',
+  'arr_removed',
+  'removed_confirmed',
+  'search_requested',
+]);
 let configProvider = null;
 let workerRunning = false;
 let monitorRunning = false;
@@ -21,13 +47,26 @@ function inputError(message, statusCode = 400) {
   throw error;
 }
 
+function recoveryItemNeedsPermanentResolution(item) {
+  return POST_MUTATION_RECOVERY_PHASES.has(item.phase);
+}
+
+function recoveryItemBlocksNewJob(job, item, policyIdentity) {
+  if (recoveryItemNeedsPermanentResolution(item)) return true;
+  return job.policyIdentity === policyIdentity
+    && ACTIVE_STATUSES.has(job.status)
+    && !['complete', 'cancelled'].includes(item.status);
+}
+
 function trimJobs(document) {
   if (document.jobs.length <= 100) return;
-  const active = document.jobs.filter((job) => ACTIVE_STATUSES.has(job.status));
-  const finished = document.jobs.filter((job) => !ACTIVE_STATUSES.has(job.status))
+  const retained = document.jobs.filter((job) => ACTIVE_STATUSES.has(job.status)
+    || (job.type === 'qbittorrent-recovery' && job.items.some(recoveryItemNeedsPermanentResolution)));
+  const retainedIds = new Set(retained.map((job) => job.id));
+  const finished = document.jobs.filter((job) => !retainedIds.has(job.id))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .slice(0, Math.max(0, 100 - active.length));
-  document.jobs = [...active, ...finished];
+    .slice(0, Math.max(0, 100 - retained.length));
+  document.jobs = [...retained, ...finished];
 }
 
 async function updateJob(jobId, mutator) {
@@ -97,6 +136,67 @@ function makeItems(candidates) {
   }));
 }
 
+function qbittorrentSafetyIdentity(config) {
+  const connection = config.qbittorrent ?? {};
+  return JSON.stringify({
+    configured: Boolean(connection.configured),
+    url: connection.url ?? '',
+    username: connection.username ?? '',
+    pathMaps: connection.pathMaps ?? [],
+  });
+}
+
+function recoveryConnectionIdentity(connection, kind) {
+  const identity = kind === 'qbittorrent'
+    ? {
+      kind,
+      configured: connection?.configured === true,
+      url: connection?.url ?? '',
+      username: connection?.username ?? '',
+      password: connection?.password ?? '',
+    }
+    : {
+      kind,
+      configured: connection?.configured === true,
+      url: connection?.url ?? '',
+      apiKey: connection?.apiKey ?? '',
+      apiKind: connection?.kind ?? kind,
+    };
+  return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+}
+
+function recoveryConnectionIdentities(config) {
+  return {
+    qbittorrent: recoveryConnectionIdentity(config?.qbittorrent, 'qbittorrent'),
+    radarr: recoveryConnectionIdentity(config?.radarr, 'radarr'),
+    sonarr: recoveryConnectionIdentity(config?.sonarr, 'sonarr'),
+  };
+}
+
+function freshRecoveryMutationConfig(job, candidate) {
+  const freshConfig = configProvider?.();
+  if (!freshConfig || freshConfig.qbittorrent?.configured !== true
+    || freshConfig.qbittorrent?.recovery?.enabled !== true) {
+    throw new Error('qBittorrent recovery was disabled during final revalidation. The torrent was preserved.');
+  }
+  if (qbittorrentRecoveryPolicyIdentity(freshConfig) !== job.policyIdentity) {
+    throw new Error('The qBittorrent recovery policy changed during final revalidation. The torrent was preserved.');
+  }
+  const expectedIdentities = job.connectionIdentities;
+  const freshIdentities = recoveryConnectionIdentities(freshConfig);
+  if (!expectedIdentities
+    || job.connectionUrls?.qbittorrent !== freshConfig.qbittorrent.url
+    || expectedIdentities.qbittorrent !== freshIdentities.qbittorrent) {
+    throw new Error('The qBittorrent connection changed during final revalidation. The torrent was preserved.');
+  }
+  if (!freshConfig[candidate.app]?.configured
+    || job.connectionUrls?.[candidate.app] !== freshConfig[candidate.app].url
+    || expectedIdentities[candidate.app] !== freshIdentities[candidate.app]) {
+    throw new Error(`The ${candidate.app} API connection changed during final revalidation. The torrent was preserved.`);
+  }
+  return freshConfig;
+}
+
 export async function createOversizeJob(config, requestedIds) {
   const current = await scanArr(config);
   const requested = new Set(requestedIds);
@@ -139,8 +239,63 @@ export async function createOrphanJob(config, requestedIds) {
     completedAt: null,
     cancelRequested: false,
     connectionUrls: { radarr: config.radarr.url, sonarr: config.sonarr.url },
+    qbittorrentSafetyIdentity: qbittorrentSafetyIdentity(config),
     items: makeItems(candidates),
   });
+}
+
+function unresolvedRecoveryHashes(jobs, policyIdentity) {
+  return new Set(jobs
+    .filter((job) => job.type === 'qbittorrent-recovery')
+    .flatMap((job) => job.items
+      .filter((item) => recoveryItemBlocksNewJob(job, item, policyIdentity))
+      .map((item) => String(item.candidate?.hash ?? '').trim().toLowerCase()))
+    .filter(Boolean));
+}
+
+export async function createQbittorrentRecoveryJob(config, candidates) {
+  if (config?.qbittorrent?.recovery?.enabled !== true || config?.qbittorrent?.configured !== true) return null;
+  const policyIdentity = qbittorrentRecoveryPolicyIdentity(config);
+  let createdJob = null;
+  await store.update((document) => {
+    const alreadyQueued = unresolvedRecoveryHashes(document.jobs, policyIdentity);
+    const seen = new Set();
+    const selected = [];
+    for (const candidate of Array.isArray(candidates) ? candidates : []) {
+      const hash = String(candidate?.hash ?? '').trim().toLowerCase();
+      if (!hash || seen.has(hash) || alreadyQueued.has(hash) || candidate.policyIdentity !== policyIdentity) continue;
+      seen.add(hash);
+      selected.push({ ...candidate, hash, policyIdentity });
+      if (selected.length >= 3) break;
+    }
+    if (!selected.length) return;
+
+    const now = new Date().toISOString();
+    createdJob = {
+      id: randomUUID(),
+      type: 'qbittorrent-recovery',
+      title: `Recover ${selected.length} slow or stalled torrent${selected.length === 1 ? '' : 's'}`,
+      status: 'queued',
+      createdAt: now,
+      updatedAt: now,
+      startedAt: null,
+      completedAt: null,
+      cancelRequested: false,
+      connectionUrls: {
+        qbittorrent: config.qbittorrent?.url,
+        radarr: config.radarr?.url,
+        sonarr: config.sonarr?.url,
+      },
+      connectionIdentities: recoveryConnectionIdentities(config),
+      policyIdentity,
+      items: makeItems(selected),
+    };
+    document.jobs.push(createdJob);
+    trimJobs(document);
+  });
+  if (!createdJob) return null;
+  kickWorker();
+  return getJob(createdJob.id);
 }
 
 export async function cancelJob(id) {
@@ -250,10 +405,8 @@ async function processOrphanItem(job, item, config) {
   if (!sourceExists && destinationExists && await pathHasSize(destination, item.candidate.sizeBytes)) {
     result = { status: 'quarantined', destination };
   } else if (sourceExists && destinationExists && await pathHasSize(destination, item.candidate.sizeBytes)) {
-    const source = await stat(item.candidate.path, { bigint: true });
-    if (`${source.dev}:${source.ino}` !== item.candidate.identity || Number(source.size) !== item.candidate.sizeBytes) {
-      throw new Error('The source changed during quarantine recovery. Both files were preserved.');
-    }
+    await assertQbittorrentSafe(jobConfig, item.candidate);
+    await assertCandidateUnchanged(item.candidate);
     await unlink(item.candidate.path);
     result = { status: 'quarantined', destination };
   } else if (destinationExists) {
@@ -272,6 +425,209 @@ async function processOrphanItem(job, item, config) {
   });
 }
 
+function normalizedHash(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function sortedIds(values) {
+  return [...new Set((values ?? []).map(Number))].sort((left, right) => left - right);
+}
+
+function sameIds(left, right) {
+  const first = sortedIds(left);
+  const second = sortedIds(right);
+  return first.length === second.length && first.every((value, index) => value === second[index]);
+}
+
+function assertRecoveryObservationMature(config, candidate) {
+  const recovery = config.qbittorrent.recovery;
+  const minutes = Number(candidate.reason === 'slow' ? recovery.slowMinutes : recovery.stalledMinutes);
+  const observedSince = Date.parse(candidate.observedSince);
+  if (!Number.isFinite(minutes) || minutes < 0 || !Number.isFinite(observedSince)
+    || Date.now() - observedSince < minutes * 60_000) {
+    throw new Error('The saved slow/stalled observation window is missing, malformed, or no longer satisfies the policy.');
+  }
+}
+
+function assertRecoveryTorrentEligible(config, candidate, torrent) {
+  const classification = classifyQbittorrentRecoveryTorrent(torrent, config.qbittorrent.recovery);
+  if (!classification || classification.reason !== candidate.reason || torrent.category !== candidate.category) {
+    throw new Error('The torrent recovered, changed category, or no longer matches the approved slow/stalled policy.');
+  }
+  assertRecoveryObservationMature(config, candidate);
+}
+
+async function currentRecoveryTorrent(config, candidate) {
+  const torrents = await listQbittorrentTorrents(config.qbittorrent);
+  const matches = torrents.filter((torrent) => normalizedHash(torrent.hash) === normalizedHash(candidate.hash));
+  if (matches.length > 1) throw new Error('qBittorrent returned duplicate torrents for the recovery hash.');
+  return matches[0] ?? null;
+}
+
+async function revalidateRecoveryCandidate(config, candidate, torrent) {
+  assertRecoveryTorrentEligible(config, candidate, torrent);
+  const ownership = await resolveQbittorrentRecoveryOwnership(config, torrent);
+  if (ownership.app !== candidate.app
+    || Number(ownership.queueId) !== Number(candidate.queueId)
+    || normalizedHash(ownership.downloadId) !== normalizedHash(candidate.downloadId)
+    || ownership.downloadClientName !== candidate.downloadClientName
+    || Number(ownership.downloadClientId ?? 0) !== Number(candidate.downloadClientId ?? 0)
+    || !sameIds(ownership.searchIds, candidate.searchIds)
+    || Number(ownership.seriesId ?? 0) !== Number(candidate.seriesId ?? 0)) {
+    throw new Error('The torrent ownership changed after detection; it was preserved.');
+  }
+  const immediateTorrent = await currentRecoveryTorrent(config, candidate);
+  if (!immediateTorrent) {
+    throw new Error('The torrent disappeared during final ownership revalidation; it was preserved for manual review.');
+  }
+  assertRecoveryTorrentEligible(config, candidate, immediateTorrent);
+  return ownership;
+}
+
+async function finishRecoverySearch(job, item, config) {
+  let latest = getJob(job.id)?.items.find((value) => value.id === item.id);
+  if (!latest) return;
+  const connection = config[latest.candidate.app];
+
+  if (latest.phase === 'search_requested') {
+    const existing = await findMatchingSearchCommand(
+      connection,
+      latest.candidate.app,
+      latest.candidate.searchIds,
+      latest.searchStartedAt,
+    );
+    if (!existing) {
+      throw new Error('The replacement-search result is ambiguous after interruption; no duplicate search was queued.');
+    }
+    await updateItem(job.id, item.id, (value) => {
+      value.status = 'complete';
+      value.phase = 'search_queued';
+      value.outcome = 'Slow/stalled torrent removed, blocklisted, and replacement search queued.';
+      value.replacement = {
+        status: 'searching',
+        commandId: existing.id ?? null,
+        detail: 'Recovered the replacement command after interruption.',
+        checkedAt: new Date().toISOString(),
+      };
+    });
+    return;
+  }
+
+  if (latest.phase !== 'removed_confirmed') {
+    throw new Error(`Cannot queue a replacement search from recovery phase ${latest.phase}.`);
+  }
+  const searchStartedAt = new Date().toISOString();
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'searching';
+    value.phase = 'search_requested';
+    value.searchStartedAt = searchStartedAt;
+    value.error = null;
+  });
+  const command = await queueSearch(connection, latest.candidate.app, latest.candidate.searchIds);
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'complete';
+    value.phase = 'search_queued';
+    value.outcome = 'Slow/stalled torrent removed, blocklisted, and replacement search queued.';
+    value.replacement = {
+      status: 'searching',
+      commandId: command?.id ?? null,
+      detail: 'Search accepted by the application.',
+      checkedAt: new Date().toISOString(),
+    };
+  });
+}
+
+async function processQbittorrentRecoveryItem(job, item, config) {
+  let latest = getJob(job.id)?.items.find((value) => value.id === item.id);
+  let continuationConfig = config;
+  if (!latest || ['complete', 'search_queued'].includes(latest.phase)) return;
+  if (job.policyIdentity !== qbittorrentRecoveryPolicyIdentity(config)
+    || latest.candidate.policyIdentity !== job.policyIdentity) {
+    throw new Error('The qBittorrent recovery policy changed after detection. A fresh observation window is required.');
+  }
+  const connection = config[latest.candidate.app];
+  if (!connection?.configured) throw new Error(`${latest.candidate.app} is no longer configured.`);
+
+  if (latest.phase === 'search_requested' || latest.phase === 'removed_confirmed') {
+    await finishRecoverySearch(job, latest, config);
+    return;
+  }
+
+  if (latest.phase === 'delete_requested') {
+    if (!latest.deleteStartedAt) {
+      throw new Error('The interrupted Arr deletion has no valid reconciliation timestamp. It was not repeated.');
+    }
+    if (await currentRecoveryTorrent(config, latest.candidate)) {
+      throw new Error('The interrupted Arr deletion is unresolved and qBittorrent still lists the torrent. The deletion was not repeated.');
+    }
+    if (!await hasArrDownloadFailedSince(connection, latest.candidate.downloadId, latest.deleteStartedAt)) {
+      throw new Error('The interrupted Arr deletion has no matching DownloadFailed/blocklist evidence. The deletion was not repeated.');
+    }
+    await updateItem(job.id, item.id, (value) => {
+      value.status = 'removed';
+      value.phase = 'arr_removed';
+      value.outcome = 'Reconciled the completed Arr removal after interruption.';
+    });
+    latest = getJob(job.id)?.items.find((value) => value.id === item.id);
+  }
+
+  if (latest.phase === 'arr_removed') {
+    if (await currentRecoveryTorrent(config, latest.candidate)) {
+      throw new Error('Arr accepted removal, but qBittorrent still lists the torrent. No replacement search was queued.');
+    }
+    await updateItem(job.id, item.id, (value) => {
+      value.status = 'removed';
+      value.phase = 'removed_confirmed';
+      value.outcome = 'Torrent removal confirmed; preparing replacement search.';
+    });
+    latest = getJob(job.id)?.items.find((value) => value.id === item.id);
+    await finishRecoverySearch(job, latest, config);
+    return;
+  }
+
+  let torrent = await currentRecoveryTorrent(config, latest.candidate);
+  if (!torrent) {
+    throw new Error('The torrent disappeared before its Arr removal and blocklist operation could be proven. No search was queued.');
+  } else {
+    await revalidateRecoveryCandidate(config, latest.candidate, torrent);
+    const freshConfig = freshRecoveryMutationConfig(job, latest.candidate);
+    const freshConnection = freshConfig[latest.candidate.app];
+    continuationConfig = freshConfig;
+    const deleteStartedAt = latest.deleteStartedAt ?? new Date().toISOString();
+    await updateItem(job.id, item.id, (value) => {
+      value.status = 'deleting';
+      value.phase = 'delete_requested';
+      value.deleteStartedAt = deleteStartedAt;
+    });
+    try {
+      await removeQbittorrentRecoveryFromArr(freshConnection, latest.candidate.queueId);
+    } catch (error) {
+      if (error.statusCode !== 404) throw error;
+      torrent = await currentRecoveryTorrent(freshConfig, latest.candidate);
+      const failedRecorded = !torrent
+        && await hasArrDownloadFailedSince(freshConnection, latest.candidate.downloadId, deleteStartedAt);
+      if (!failedRecorded) throw error;
+    }
+    await updateItem(job.id, item.id, (value) => {
+      value.status = 'removed';
+      value.phase = 'arr_removed';
+      value.outcome = 'Arr removed and blocklisted the torrent.';
+    });
+  }
+
+  latest = getJob(job.id)?.items.find((value) => value.id === item.id);
+  if (await currentRecoveryTorrent(continuationConfig, latest.candidate)) {
+    throw new Error('Arr accepted removal, but qBittorrent still lists the torrent. No replacement search was queued.');
+  }
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'removed';
+    value.phase = 'removed_confirmed';
+    value.outcome = 'Torrent removal confirmed; preparing replacement search.';
+  });
+  latest = getJob(job.id)?.items.find((value) => value.id === item.id);
+  await finishRecoverySearch(job, latest, continuationConfig);
+}
+
 async function processJob(job) {
   await updateJob(job.id, (value) => {
     value.status = value.cancelRequested ? 'cancelling' : 'running';
@@ -282,11 +638,30 @@ async function processJob(job) {
   let validationError = null;
   try {
     const config = configProvider();
-    const arr = await scanArr(config);
-    const candidates = job.type === 'orphans'
-      ? (await scanOrphans(config, arr)).candidates
-      : filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
-    eligibleIds = new Set(candidates.map((candidate) => candidate.id));
+    switch (job.type) {
+      case 'oversized': {
+        const arr = await scanArr(config);
+        const candidates = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
+        eligibleIds = new Set(candidates.map((candidate) => candidate.id));
+        break;
+      }
+      case 'orphans': {
+        if (job.qbittorrentSafetyIdentity !== qbittorrentSafetyIdentity(config)) {
+          throw new Error('qBittorrent safety settings changed after this job was approved. Start a fresh orphan scan and job.');
+        }
+        const arr = await scanArr(config);
+        eligibleIds = new Set((await scanOrphans(config, arr)).candidates.map((candidate) => candidate.id));
+        break;
+      }
+      case 'qbittorrent-recovery':
+        if (job.policyIdentity !== qbittorrentRecoveryPolicyIdentity(config)) {
+          throw new Error('The qBittorrent recovery policy changed after detection. A fresh observation window is required.');
+        }
+        eligibleIds = new Set(job.items.map((item) => item.candidate.id));
+        break;
+      default:
+        throw new Error(`Unsupported job type: ${job.type}`);
+    }
   } catch (error) {
     validationError = error instanceof Error ? error.message : String(error);
   }
@@ -303,17 +678,37 @@ async function processJob(job) {
     }
     try {
       const config = configProvider();
+      if (currentJob.type === 'orphans'
+        && currentJob.qbittorrentSafetyIdentity !== qbittorrentSafetyIdentity(config)) {
+        throw new Error('qBittorrent safety settings changed after this job was approved. Start a fresh orphan scan and job.');
+      }
+      if (currentJob.type === 'qbittorrent-recovery'
+        && currentJob.policyIdentity !== qbittorrentRecoveryPolicyIdentity(config)) {
+        throw new Error('The qBittorrent recovery policy changed after detection. A fresh observation window is required.');
+      }
       if (currentJob.connectionUrls?.[item.candidate.app] !== undefined
-        && currentJob.connectionUrls[item.candidate.app] !== config[item.candidate.app].url) {
+        && currentJob.connectionUrls[item.candidate.app] !== config[item.candidate.app]?.url) {
         throw new Error('The application URL changed after this job was approved. Restore the original connection before retrying.');
       }
-      const needsValidation = item.phase === 'waiting'
-        || (currentJob.type === 'orphans' && await pathExists(item.candidate.path));
+      const needsValidation = currentJob.type === 'oversized' && item.phase === 'waiting'
+        || currentJob.type === 'orphans' && (item.phase === 'waiting' || await pathExists(item.candidate.path));
       if (needsValidation && !eligibleIds.has(item.candidate.id)) {
         throw new Error(validationError ?? 'The file is no longer eligible after a fresh scan and was preserved.');
       }
-      if (currentJob.type === 'oversized') await processOversizeItem(currentJob, item, config);
-      else await processOrphanItem(currentJob, item, config);
+      switch (currentJob.type) {
+        case 'oversized':
+          await processOversizeItem(currentJob, item, config);
+          break;
+        case 'orphans':
+          await processOrphanItem(currentJob, item, config);
+          break;
+        case 'qbittorrent-recovery':
+          if (validationError) throw new Error(validationError);
+          await processQbittorrentRecoveryItem(currentJob, item, config);
+          break;
+        default:
+          throw new Error(`Unsupported job type: ${currentJob.type}`);
+      }
     } catch (error) {
       await updateItem(job.id, item.id, (value) => {
         value.status = 'failed';
@@ -389,4 +784,5 @@ export function startJobWorker(getConfig) {
 export function stopJobWorker() {
   clearTimeout(workerTimer);
   clearInterval(monitorTimer);
+  configProvider = null;
 }

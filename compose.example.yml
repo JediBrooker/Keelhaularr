@@ -4,6 +4,10 @@ services:
     container_name: keelhaularr
     restart: unless-stopped
     env_file: .env
+    # QBITTORRENT_URL must be reachable from this container. Add both services
+    # to the same Docker network when using a name such as http://qbittorrent:8080.
+    # Automatic recovery is a separate, destructive opt-in. It stays off unless
+    # QBITTORRENT_RECOVERY_ENABLED=true is set in .env or enabled in Settings.
     ports:
       - "8787:8787"
     volumes:

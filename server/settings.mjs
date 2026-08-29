@@ -10,6 +10,10 @@ const SETTINGS_KEYS = new Set([
   'RADARR_USE_ARR_QUALITY_DEFINITIONS', 'RADARR_INCLUDE_UNMONITORED', 'RADARR_MEDIA_ROOTS', 'RADARR_DOWNLOAD_ROOTS', 'RADARR_PATH_MAPS',
   'SONARR_URL', 'SONARR_API_KEY', 'SONARR_MAX_MB_PER_MIN', 'SONARR_OVERSIZE_TOLERANCE_GIB',
   'SONARR_USE_ARR_QUALITY_DEFINITIONS', 'SONARR_INCLUDE_UNMONITORED', 'SONARR_MEDIA_ROOTS', 'SONARR_DOWNLOAD_ROOTS', 'SONARR_PATH_MAPS',
+  'QBITTORRENT_URL', 'QBITTORRENT_USERNAME', 'QBITTORRENT_PASSWORD', 'QBITTORRENT_PATH_MAPS',
+  'QBITTORRENT_RECOVERY_ENABLED', 'QBITTORRENT_RECOVERY_SLOW_KIB_PER_SECOND',
+  'QBITTORRENT_RECOVERY_SLOW_MINUTES', 'QBITTORRENT_RECOVERY_STALLED_MINUTES',
+  'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON',
   'ORPHAN_ACTION', 'ORPHAN_TRASH_DIR', 'ALLOW_PERMANENT_ORPHAN_DELETE',
   'ORPHAN_IGNORE_DIRECTORIES', 'ORPHAN_MAX_FILES', 'MEDIA_EXTENSIONS', 'HARDLINK_MIN_AGE_HOURS',
   'QUARANTINE_RETENTION_DAYS', 'SCHEDULE_ENABLED', 'SCHEDULE_INTERVAL_HOURS',
@@ -87,6 +91,10 @@ function configuredNumber(key, values, fallback) {
   return raw === undefined || raw === '' || !Number.isFinite(value) ? fallback : value;
 }
 
+function configuredString(key, values, fallback = '') {
+  return Object.hasOwn(values, key) ? values[key] : process.env[key] ?? fallback;
+}
+
 function numberValue(value, label, { min, max, integer = false }) {
   if (typeof value !== 'number' || !Number.isFinite(value)) inputError(`${label} must be a number.`);
   if (integer && !Number.isInteger(value)) inputError(`${label} must be a whole number.`);
@@ -116,6 +124,19 @@ function urlValue(value, label) {
 function stringArray(value, label, { maxItems = 100 } = {}) {
   if (!Array.isArray(value) || value.length > maxItems) inputError(`${label} must contain at most ${maxItems} entries.`);
   return [...new Set(value.map((item, index) => stringValue(item, `${label} entry ${index + 1}`, { max: 4096 })) )];
+}
+
+function exactCategoryArray(value, label) {
+  if (!Array.isArray(value) || value.length > 100) {
+    inputError(`${label} must contain at most 100 entries.`);
+  }
+  for (const [index, category] of value.entries()) {
+    if (typeof category !== 'string' || category.length > 256) {
+      inputError(`${label} entry ${index + 1} must be a string of at most 256 characters.`);
+    }
+  }
+  if (new Set(value).size !== value.length) inputError(`${label} cannot contain duplicate categories.`);
+  return [...value];
 }
 
 function mediaRoots(value, label) {
@@ -191,8 +212,77 @@ function connectionOverrides(kind, input, output) {
   return { mediaRoots: roots, downloadRoots };
 }
 
+function qbittorrentOverrides(input, output) {
+  if (input === undefined) return;
+  const settings = requiredObject(input, 'qBittorrent');
+  const password = secretValue(settings.password ?? '', 'qBittorrent password', { allowEmpty: true, max: 1024 });
+  const clearPassword = booleanValue(settings.clearPassword ?? false, 'qBittorrent clear password');
+  if (password && clearPassword) inputError('qBittorrent password cannot be replaced and cleared at the same time.');
+  const mappings = pathMappings(settings.pathMaps, 'qBittorrent path maps');
+  const nextUrl = urlValue(settings.url, 'qBittorrent URL');
+  const nextUsername = stringValue(settings.username ?? '', 'qBittorrent username', { allowEmpty: true, max: 1024 });
+  const currentUrl = configuredString('QBITTORRENT_URL', output).replace(/\/+$/, '');
+  const currentUsername = configuredString('QBITTORRENT_USERNAME', output);
+  const currentPassword = configuredString('QBITTORRENT_PASSWORD', output);
+  if ((nextUrl !== currentUrl || nextUsername !== currentUsername)
+    && currentPassword && !password && !clearPassword) {
+    inputError('Enter the qBittorrent password again when changing its URL or username.');
+  }
+
+  output.QBITTORRENT_URL = nextUrl;
+  output.QBITTORRENT_USERNAME = nextUsername;
+  output.QBITTORRENT_PATH_MAPS = mappings.map(({ from, to }) => `${from}=>${to}`).join(';');
+  if (password) output.QBITTORRENT_PASSWORD = password;
+  if (clearPassword) output.QBITTORRENT_PASSWORD = '';
+
+  if (settings.recovery !== undefined) {
+    const recovery = requiredObject(settings.recovery, 'qBittorrent automatic recovery');
+    output.QBITTORRENT_RECOVERY_ENABLED = String(booleanValue(
+      recovery.enabled, 'qBittorrent automatic recovery',
+    ));
+    output.QBITTORRENT_RECOVERY_SLOW_KIB_PER_SECOND = numberValue(
+      recovery.slowSpeedKibPerSecond,
+      'qBittorrent slow-speed threshold',
+      { min: 0, max: 1048576, integer: true },
+    ).toString();
+    output.QBITTORRENT_RECOVERY_SLOW_MINUTES = numberValue(
+      recovery.slowMinutes,
+      'qBittorrent slow duration',
+      { min: 1, max: 10080, integer: true },
+    ).toString();
+    output.QBITTORRENT_RECOVERY_STALLED_MINUTES = numberValue(
+      recovery.stalledMinutes,
+      'qBittorrent stalled duration',
+      { min: 1, max: 10080, integer: true },
+    ).toString();
+    output.QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON = JSON.stringify(exactCategoryArray(
+      recovery.excludedCategories,
+      'qBittorrent recovery excluded categories',
+    ));
+  }
+}
+
 export function getSettingsOverrides() {
   return { ...settingsOverrides };
+}
+
+export function buildQbittorrentTestConnection(input, currentConfig) {
+  const settings = requiredObject(input, 'qBittorrent');
+  const url = urlValue(settings.url, 'qBittorrent URL');
+  if (!url) inputError('qBittorrent URL cannot be empty.');
+  const username = stringValue(settings.username ?? '', 'qBittorrent username', { allowEmpty: true, max: 1024 });
+  const enteredPassword = secretValue(settings.password ?? '', 'qBittorrent password', { allowEmpty: true, max: 1024 });
+  let password = enteredPassword;
+  if (!password && currentConfig.password) {
+    if (url !== currentConfig.url || username !== currentConfig.username) {
+      inputError('Enter the qBittorrent password to test a different URL or username.');
+    }
+    password = currentConfig.password;
+  }
+  const mappings = settings.pathMaps === undefined
+    ? currentConfig.pathMaps
+    : pathMappings(settings.pathMaps, 'qBittorrent path maps');
+  return { url, username, password, configured: true, pathMaps: mappings };
 }
 
 export function settingsView(config) {
@@ -217,6 +307,13 @@ export function settingsView(config) {
     defaults: config.defaults,
     radarr: connection(config.radarr),
     sonarr: connection(config.sonarr),
+    qbittorrent: {
+      url: config.qbittorrent.url,
+      username: config.qbittorrent.username,
+      passwordConfigured: Boolean(config.qbittorrent.password),
+      pathMaps: config.qbittorrent.pathMaps,
+      recovery: { ...config.qbittorrent.recovery },
+    },
     orphan: {
       action: config.orphanAction,
       trashDir: config.orphanTrashDir ?? '',
@@ -270,6 +367,21 @@ export function buildSettingsOverrides(input, currentOverrides) {
   output.OVERSIZE_TOLERANCE_GIB = numberValue(defaults.toleranceGib, 'Default oversize tolerance', { min: 0, max: 1000 }).toString();
   const radarrPaths = connectionOverrides('radarr', root.radarr, output);
   const sonarrPaths = connectionOverrides('sonarr', root.sonarr, output);
+  qbittorrentOverrides(root.qbittorrent, output);
+  if (configuredBoolean('QBITTORRENT_RECOVERY_ENABLED', output)) {
+    if (!configuredString('QBITTORRENT_URL', output).trim()) {
+      inputError('qBittorrent automatic recovery requires a configured qBittorrent connection.');
+    }
+    const radarrConfigured = Boolean(
+      configuredString('RADARR_URL', output).trim() && configuredString('RADARR_API_KEY', output).trim(),
+    );
+    const sonarrConfigured = Boolean(
+      configuredString('SONARR_URL', output).trim() && configuredString('SONARR_API_KEY', output).trim(),
+    );
+    if (!radarrConfigured && !sonarrConfigured) {
+      inputError('qBittorrent automatic recovery requires at least one configured Arr connection.');
+    }
+  }
   const scanRoots = [
     ...radarrPaths.mediaRoots.map((value) => ({ label: 'Radarr media root', value })),
     ...radarrPaths.downloadRoots.map((value) => ({ label: 'Radarr completed-download root', value })),

@@ -1,9 +1,17 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import type { KeyboardEvent, MouseEvent } from 'react';
+import { ModalDialog } from './ModalDialog';
 import { OperationsDialog } from './OperationsDialog';
 import { SettingsDialog } from './SettingsDialog';
 
 type AppKind = 'radarr' | 'sonarr';
 type Tab = 'oversized' | 'orphans';
+const manifestTabs: Tab[] = ['oversized', 'orphans'];
+
+function skipToMain(event: MouseEvent<HTMLAnchorElement> | KeyboardEvent<HTMLAnchorElement>) {
+  event.preventDefault();
+  document.getElementById('main-content')?.focus();
+}
 
 interface PublicConnectionConfig {
   configured: boolean;
@@ -18,6 +26,7 @@ interface PublicConnectionConfig {
 interface PublicConfig {
   radarr: PublicConnectionConfig;
   sonarr: PublicConnectionConfig;
+  qbittorrent: { configured: boolean };
   orphanAction: 'quarantine' | 'permanent';
   hardlinkMinAgeHours: number;
   protected: boolean;
@@ -120,16 +129,16 @@ function Login({ setupRequired, onLogin }: { setupRequired: boolean; onLogin: ()
         ) : (
           <form onSubmit={submit} className="login-form">
             <label>
-              Captain’s name
+              Username
               <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required />
             </label>
             <label>
-              Secret phrase
+              Password
               <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required autoFocus />
             </label>
             {error && <p className="form-error" role="alert">{error}</p>}
             <button className="primary-button wide" disabled={busy} type="submit">
-              {busy ? 'Opening the hatch…' : 'Board the deck'}
+              {busy ? 'Signing in…' : 'Sign in'}
             </button>
           </form>
         )}
@@ -145,7 +154,7 @@ function ConnectionPill({ app, scan, configured }: {
   configured: boolean;
 }) {
   const state = scan?.connections[app]?.status ?? (configured ? 'configured' : 'not-configured');
-  const label = state === 'connected' ? 'Connected' : state === 'error' ? 'Error' : state === 'configured' ? 'Ready' : 'Not set';
+  const label = state === 'connected' ? 'Connected' : state === 'error' ? 'Error' : state === 'configured' ? 'Configured' : 'Not set';
   return (
     <div className={`status-pill ${state}`} title={scan?.connections[app]?.error ?? undefined}>
       <span /> {app === 'radarr' ? 'Radarr' : 'Sonarr'} <em>{label}</em>
@@ -153,7 +162,8 @@ function ConnectionPill({ app, scan, configured }: {
   );
 }
 
-function ConfirmDialog({ tab, count, action, busy, onCancel, onConfirm }: {
+function ConfirmDialog({ open, tab, count, action, busy, onCancel, onConfirm }: {
+  open: boolean;
   tab: Tab;
   count: number;
   action: 'quarantine' | 'permanent';
@@ -161,34 +171,39 @@ function ConfirmDialog({ tab, count, action, busy, onCancel, onConfirm }: {
   onCancel: () => void;
   onConfirm: () => void;
 }) {
-  const phrase = tab === 'oversized' ? 'KEELHAUL' : action === 'permanent' ? 'ABANDON SHIP' : 'TO THE BRIG';
-  const [input, setInput] = useState('');
   const oversized = tab === 'oversized';
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onCancel()}>
-      <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <ModalDialog
+      open={open}
+      labelledBy="confirm-title"
+      describedBy="confirm-description"
+      className="confirm-modal"
+      dialogRef={dialogRef}
+      initialFocusRef={cancelRef}
+      dismissible={!busy}
+      onDismiss={() => { if (!busy) onCancel(); }}
+    >
+      <section className="confirm-dialog">
         <div className="danger-emblem" aria-hidden="true">☠</div>
-        <p className="eyebrow coral">FINAL CAPTAIN’S ORDER</p>
-        <h2 id="confirm-title">{oversized ? 'Keelhaul selected cargo?' : action === 'permanent' ? 'Permanently delete orphans?' : 'Move orphans to quarantine?'}</h2>
-        <p>
+        <p className="eyebrow coral">DELETION CONFIRMATION</p>
+        <h2 id="confirm-title">{oversized ? 'Remove selected files and search again?' : action === 'permanent' ? 'Delete selected untracked files permanently?' : 'Quarantine selected untracked files?'}</h2>
+        <p id="confirm-description">
           {oversized
             ? `${count} tracked file(s) will be deleted through their *arr app, then searched again.`
             : action === 'permanent'
               ? `${count} untracked file(s) will be permanently removed from disk. This cannot be undone.`
               : `${count} untracked file(s) will be moved into Keelhaularr’s quarantine area.`}
         </p>
-        <label className="confirm-label">
-          Type <strong>{phrase}</strong> to continue
-          <input value={input} onChange={(event) => setInput(event.target.value)} autoFocus autoComplete="off" />
-        </label>
         <div className="dialog-actions">
-          <button className="ghost-button" onClick={onCancel} disabled={busy}>Cancel</button>
-          <button className="danger-button" onClick={onConfirm} disabled={busy || input !== phrase}>
-            {busy ? 'Carrying out order…' : 'Confirm order'}
+          <button ref={cancelRef} type="button" className="ghost-button" onClick={() => dialogRef.current?.close()} disabled={busy}>CANCEL</button>
+          <button type="button" className="danger-button" onClick={onConfirm} disabled={busy}>
+            {busy ? 'CONFIRMING…' : 'CONFIRM'}
           </button>
         </div>
       </section>
-    </div>
+    </ModalDialog>
   );
 }
 
@@ -206,11 +221,13 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [showOperations, setShowOperations] = useState(false);
   const [operationsTab, setOperationsTab] = useState<'jobs' | 'brig' | 'storage' | 'exclusions' | 'schedule'>('jobs');
+  const [jobsAwaitingRefresh, setJobsAwaitingRefresh] = useState<string[]>([]);
   const [query, setQuery] = useState('');
   const [minimumGib, setMinimumGib] = useState('0');
   const [sort, setSort] = useState<'largest' | 'overage' | 'title' | 'oldest'>('largest');
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const scanRequestId = useRef(0);
 
   useEffect(() => {
     api<{ authenticated: boolean; setupRequired: boolean }>('/api/auth/status')
@@ -231,8 +248,8 @@ export default function App() {
       });
   }, []);
 
+  const source = tab === 'oversized' ? scan?.oversized ?? [] : scan?.orphans ?? [];
   const visible = useMemo(() => {
-    const source = tab === 'oversized' ? scan?.oversized ?? [] : scan?.orphans ?? [];
     const needle = query.trim().toLowerCase();
     const minimum = Math.max(0, Number(minimumGib) || 0) * 1024 ** 3;
     const filtered = source.filter((item) => (
@@ -248,6 +265,13 @@ export default function App() {
     });
   }, [filter, minimumGib, query, scan, sort, tab]);
   const selectedVisible = visible.filter((item) => selected.has(item.id));
+  const scanHasConnectionError = Boolean(scan && (
+    scan.connections.radarr.status === 'error' || scan.connections.sonarr.status === 'error'
+  ));
+  const scanHasNoConfiguredApps = Boolean(scan
+    && !scan.config.radarr.configured
+    && !scan.config.sonarr.configured);
+  const scanIsIncomplete = Boolean(scan?.warnings.length) || scanHasConnectionError || scanHasNoConfiguredApps;
   const totalOversized = scan?.oversized.reduce((sum, item) => sum + item.sizeBytes, 0) ?? 0;
   const totalOrphans = scan?.orphans.reduce((sum, item) => sum + item.sizeBytes, 0) ?? 0;
 
@@ -259,13 +283,20 @@ export default function App() {
   }
 
   async function logout() {
+    scanRequestId.current += 1;
+    setScanning(false);
+    setJobsAwaitingRefresh([]);
     await api('/api/auth/logout', { method: 'POST', body: '{}' }).catch(() => undefined);
+    scanRequestId.current += 1;
+    setScanning(false);
     setAuth('signed-out');
     setScan(null);
     setConfig(null);
   }
 
   async function settingsSaved() {
+    scanRequestId.current += 1;
+    setScanning(false);
     const statusData = await api<{ config: PublicConfig }>('/api/status');
     setConfig(statusData.config);
     setScan(null);
@@ -275,21 +306,70 @@ export default function App() {
   }
 
   async function runScan() {
+    const requestId = ++scanRequestId.current;
     setScanning(true);
     setError('');
     setMessage('');
     try {
       const data = await api<ScanData>('/api/scan', { method: 'POST', body: '{}' });
+      if (requestId !== scanRequestId.current) return false;
       setScan(data);
       setConfig(data.config);
       setSelected(new Set());
       setMessage(`Manifest refreshed at ${new Date(data.scannedAt).toLocaleTimeString()}.`);
+      return true;
     } catch (scanError) {
+      if (requestId !== scanRequestId.current) return false;
       if (scanError instanceof Error && scanError.message.includes('Sign in')) setAuth('signed-out');
       setError(scanError instanceof Error ? scanError.message : String(scanError));
+      return false;
     } finally {
-      setScanning(false);
+      if (requestId === scanRequestId.current) setScanning(false);
     }
+  }
+
+  useEffect(() => {
+    if (auth !== 'signed-in' || !jobsAwaitingRefresh.length) return;
+    let stopped = false;
+    let timer: number | undefined;
+    let refreshRetryDelay = 3000;
+
+    const poll = async () => {
+      try {
+        const result = await api<{ jobs: Array<{ id: string; completedAt: string | null }> }>('/api/jobs');
+        if (stopped) return;
+        const completionTimes = new Map(result.jobs.map((job) => [job.id, job.completedAt]));
+        const allJobsSettled = jobsAwaitingRefresh.every((id) => Boolean(completionTimes.get(id)));
+        if (allJobsSettled) {
+          const refreshed = await runScan();
+          if (stopped) return;
+          if (refreshed) {
+            setJobsAwaitingRefresh((current) => current === jobsAwaitingRefresh ? [] : current);
+            return;
+          }
+          timer = window.setTimeout(poll, refreshRetryDelay);
+          refreshRetryDelay = Math.min(refreshRetryDelay * 2, 60000);
+          return;
+        }
+      } catch (pollError) {
+        if (pollError instanceof Error && pollError.message.includes('Sign in')) {
+          setAuth('signed-out');
+          return;
+        }
+        // A transient polling error should not make the dashboard give up on refreshing.
+      }
+      if (!stopped) timer = window.setTimeout(poll, 3000);
+    };
+
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [auth, jobsAwaitingRefresh]);
+
+  function refreshWhenJobSettles(id: string) {
+    setJobsAwaitingRefresh((current) => [...current.filter((jobId) => jobId !== id), id]);
   }
 
   function toggle(id: string) {
@@ -311,6 +391,32 @@ export default function App() {
 
   function selectFirst(count: number) {
     setSelected(new Set(visible.slice(0, count).map((item) => item.id)));
+  }
+
+  function selectManifestTab(next: Tab) {
+    setTab(next);
+    setSort('largest');
+    setSelected(new Set());
+  }
+
+  function handleManifestTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, current: Tab) {
+    const currentIndex = manifestTabs.indexOf(current);
+    let nextIndex: number | null = null;
+    if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % manifestTabs.length;
+    if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + manifestTabs.length) % manifestTabs.length;
+    if (event.key === 'Home') nextIndex = 0;
+    if (event.key === 'End') nextIndex = manifestTabs.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const next = manifestTabs[nextIndex];
+    selectManifestTab(next);
+    window.requestAnimationFrame(() => document.getElementById(`manifest-tab-${next}`)?.focus());
+  }
+
+  function clearFilters() {
+    setFilter('all');
+    setQuery('');
+    setMinimumGib('0');
   }
 
   async function excludeSelection() {
@@ -337,6 +443,7 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ ids: selectedVisible.map((item) => item.id) }),
       });
+      refreshWhenJobSettles(result.job.id);
       setMessage(`${result.job.title} started. Progress is saved and can be followed in Operations → Jobs.`);
       setConfirming(false);
       setSelected(new Set());
@@ -353,7 +460,14 @@ export default function App() {
   if (auth === 'signed-out') return <Login setupRequired={setupRequired} onLogin={signedIn} />;
 
   return (
-    <main className="shell">
+    <>
+      <a
+        className="skip-link"
+        href="#main-content"
+        onClick={skipToMain}
+        onKeyDown={(event) => { if (event.key === 'Enter') skipToMain(event); }}
+      >Skip to main content</a>
+      <main id="main-content" className="shell" tabIndex={-1}>
       <header className="topbar">
         <div className="brand">
           <span className="brand-mark" aria-hidden="true">K</span>
@@ -374,77 +488,104 @@ export default function App() {
         <div>
           <p className="eyebrow gold">THE *ARR CARGO DECK</p>
           <h2>Keep the treasure.<br />Toss the ballast.</h2>
-          <p className="hero-copy">Inspect oversized tracked media and untracked files across both holds. Nothing leaves the ship without your order.</p>
+          <p className="hero-copy">Review files over configured size limits and files not tracked by Radarr or Sonarr. Nothing changes without confirmation.</p>
         </div>
         <button className="primary-button scan-button" onClick={runScan} disabled={scanning}>
           <span aria-hidden="true" className={scanning ? 'spin' : ''}>↻</span>
-          {scanning ? 'Sounding the holds…' : 'Scan both holds'}
+          {scanning ? 'Scanning Radarr & Sonarr…' : 'Scan Radarr & Sonarr'}
         </button>
       </section>
 
       {(message || error) && <div className={`notice ${error ? 'error' : 'success'}`} role="status">{error || message}</div>}
       {scan?.warnings.map((warning) => <div className="notice warning" key={warning}>{warning}</div>)}
 
-      <section className="stat-grid" aria-label="Cargo summary">
-        <article className="stat-card accent"><p>Oversized cargo</p><strong>{scan?.oversized.length ?? '—'}</strong><span>{scan ? formatBytes(totalOversized) : 'run a scan to inspect'}</span></article>
-        <article className="stat-card"><p>Orphan watch</p><strong>{scan?.orphans.length ?? '—'}</strong><span>{scan ? formatBytes(totalOrphans) : 'untracked media files'}</span></article>
-        <article className="stat-card"><p>Standing orders</p><div className="dual-orders"><strong>{config?.radarr.maxMbPerMinute ?? '—'} <small>Radarr</small></strong><strong>{config?.sonarr.maxMbPerMinute ?? '—'} <small>Sonarr</small></strong></div><span>oversize tolerance applied per hold</span></article>
+      <section className="stat-grid" aria-label="Scan summary">
+        <article className="stat-card accent"><p>Files over size limits</p><strong>{scan?.oversized.length ?? '—'}</strong><span>{scan ? formatBytes(totalOversized) : 'Scan to inspect'}</span></article>
+        <article className="stat-card"><p>Untracked files</p><strong>{scan?.orphans.length ?? '—'}</strong><span>{scan ? formatBytes(totalOrphans) : 'Not tracked by either app'}</span></article>
+        <article className="stat-card"><p>Size rules</p><div className="dual-orders"><strong>{config?.radarr.maxMbPerMinute ?? '—'} <small>Radarr</small></strong><strong>{config?.sonarr.maxMbPerMinute ?? '—'} <small>Sonarr</small></strong></div><span>MB/min before per-app tolerance</span></article>
       </section>
 
-      <section className="manifest">
+      <section className="manifest" aria-labelledby="manifest-title">
         <div className="manifest-head">
           <div>
-            <p className="eyebrow">CARGO MANIFEST</p>
-            <h3>{tab === 'oversized' ? 'Tracked files over standing orders' : 'Media not tracked by either captain'}</h3>
+            <p className="eyebrow">SCAN RESULTS</p>
+            <h3 id="manifest-title">{tab === 'oversized' ? 'Tracked files over configured size limits' : 'Files not tracked by Radarr or Sonarr'}</h3>
           </div>
-          <button className="danger-button" disabled={!selectedVisible.length || scanning || applying} onClick={() => setConfirming(true)}>
-            {tab === 'oversized' ? 'Keelhaul' : config?.orphanAction === 'permanent' ? 'Delete' : 'Quarantine'} selected · {selectedVisible.length}
-          </button>
+          {selectedVisible.length > 0 && <button className="danger-button" disabled={scanning || applying} onClick={() => setConfirming(true)}>
+            {tab === 'oversized' ? 'Remove & search again' : config?.orphanAction === 'permanent' ? 'Delete permanently' : 'Quarantine'} · {selectedVisible.length}
+          </button>}
         </div>
 
         <div className="manifest-tools">
-          <div className="tabs" role="tablist">
-            <button className={tab === 'oversized' ? 'active' : ''} onClick={() => { setTab('oversized'); setSort('largest'); setSelected(new Set()); }}>Oversized <span>{scan?.oversized.length ?? 0}</span></button>
-            <button className={tab === 'orphans' ? 'active' : ''} onClick={() => { setTab('orphans'); setSort('largest'); setSelected(new Set()); }}>Orphan watch <span>{scan?.orphans.length ?? 0}</span></button>
-          </div>
-          <div className="filters" aria-label="Filter by application">
-            {(['all', 'radarr', 'sonarr'] as const).map((value) => <button key={value} className={filter === value ? 'active' : ''} onClick={() => setFilter(value)}>{value === 'all' ? 'Both holds' : value}</button>)}
+          <div className="tabs" role="tablist" aria-label="Scan result type">
+            {manifestTabs.map((value) => <button
+              key={value}
+              id={`manifest-tab-${value}`}
+              type="button"
+              role="tab"
+              aria-selected={tab === value}
+              aria-controls={`manifest-panel-${value}`}
+              tabIndex={tab === value ? 0 : -1}
+              className={tab === value ? 'active' : ''}
+              onClick={() => selectManifestTab(value)}
+              onKeyDown={(event) => handleManifestTabKeyDown(event, value)}
+            >
+              {value === 'oversized' ? 'Size limits' : 'Untracked files'} <span>{value === 'oversized' ? scan?.oversized.length ?? 0 : scan?.orphans.length ?? 0}</span>
+            </button>)}
           </div>
         </div>
-        <div className="manifest-filters">
-          <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search title, quality or path" aria-label="Search manifest" />
-          <label>Minimum {tab === 'oversized' ? 'overage' : 'size'}<span><input inputMode="decimal" value={minimumGib} onChange={(event) => setMinimumGib(event.target.value)} /> GiB</span></label>
-          <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="largest">Largest first</option>{tab === 'oversized' && <option value="overage">Most over limit</option>}<option value="title">Title</option>{tab === 'orphans' && <option value="oldest">Oldest first</option>}</select></label>
-          <div className="batch-tools"><button onClick={() => selectFirst(25)} disabled={!visible.length}>Select first 25</button><button onClick={() => selectFirst(100)} disabled={!visible.length}>First 100</button>{tab === 'oversized' && <button onClick={excludeSelection} disabled={!selectedVisible.length || applying}>Exclude selected</button>}</div>
-        </div>
 
-        {!scan ? (
-          <div className="empty-state"><div aria-hidden="true">⌁</div><h4>No manifest yet</h4><p>Scan both holds to compare real files with your current standing orders.</p><button className="primary-button" onClick={runScan}>Begin first scan</button></div>
-        ) : visible.length === 0 ? (
-          <div className="empty-state clear"><div aria-hidden="true">✓</div><h4>All clear in this hold</h4><p>No matching cargo needs your attention.</p></div>
-        ) : tab === 'oversized' ? (
-          <OversizedTable items={visible as OversizedItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} />
-        ) : (
-          <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} action={config?.orphanAction ?? 'quarantine'} />
-        )}
+        {manifestTabs.map((value) => <div
+          key={value}
+          id={`manifest-panel-${value}`}
+          role="tabpanel"
+          aria-labelledby={`manifest-tab-${value}`}
+          tabIndex={0}
+          hidden={tab !== value}
+          className="manifest-panel"
+        >
+          {tab === value && <>
+            {scan && <>
+              <div className="result-tools">
+                <div className="filters" role="group" aria-label="Filter by application">
+                  {(['all', 'radarr', 'sonarr'] as const).map((filterValue) => <button type="button" key={filterValue} aria-pressed={filter === filterValue} className={filter === filterValue ? 'active' : ''} onClick={() => setFilter(filterValue)}>{filterValue === 'all' ? 'Both apps' : filterValue === 'radarr' ? 'Radarr' : 'Sonarr'}</button>)}
+                </div>
+              </div>
+              <div className="manifest-filters">
+                <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search title, quality or path" aria-label="Search scan results" />
+                <label>Minimum {tab === 'oversized' ? 'overage' : 'size'}<span><input inputMode="decimal" value={minimumGib} onChange={(event) => setMinimumGib(event.target.value)} /> GiB</span></label>
+                <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="largest">Largest first</option>{tab === 'oversized' && <option value="overage">Most over limit</option>}<option value="title">Title</option>{tab === 'orphans' && <option value="oldest">Oldest first</option>}</select></label>
+                <div className="batch-tools"><button type="button" onClick={() => selectFirst(25)} disabled={!visible.length}>Select first 25</button><button type="button" onClick={() => selectFirst(100)} disabled={!visible.length}>Select first 100</button>{tab === 'oversized' && <button type="button" onClick={excludeSelection} disabled={!selectedVisible.length || applying}>Exclude selected</button>}</div>
+              </div>
+            </>}
 
-        <p className="safety-note"><span aria-hidden="true">⚓</span>{tab === 'oversized' ? 'Tracked files are deleted through Radarr or Sonarr, then searched again using that app’s existing profiles.' : config?.orphanAction === 'permanent' ? 'Permanent orphan removal is enabled. Selected files are revalidated immediately before deletion.' : 'Orphans are moved to quarantine by default. Selected files are revalidated immediately before moving.'}</p>
+            {!scan ? (
+              <div className="empty-state"><div aria-hidden="true">⌁</div><h4>No scan results yet</h4><p>Use “Scan Radarr & Sonarr” above to inspect files against the configured rules.</p></div>
+            ) : source.length === 0 && scanHasNoConfiguredApps ? (
+              <div className="empty-state"><div aria-hidden="true">!</div><h4>Scan incomplete</h4><p>Connect Radarr or Sonarr in Settings before treating this view as clear.</p><button type="button" className="ghost-button" onClick={() => setShowSettings(true)}>Open Settings</button></div>
+            ) : source.length === 0 && scanIsIncomplete ? (
+              <div className="empty-state"><div aria-hidden="true">!</div><h4>Scan incomplete</h4><p>No files were returned for this view. Review the connection errors or warnings above before treating it as clear.</p></div>
+            ) : source.length === 0 ? (
+              <div className="empty-state clear"><div aria-hidden="true">✓</div><h4>All clear</h4><p>No {tab === 'oversized' ? 'files exceed the configured size limits' : 'untracked files need attention'}.</p></div>
+            ) : visible.length === 0 ? (
+              <div className="empty-state"><div aria-hidden="true">⌕</div><h4>No matching files</h4><p>{source.length} file(s) are hidden by the current filters.</p><button type="button" className="ghost-button" onClick={clearFilters}>Clear filters</button></div>
+            ) : tab === 'oversized' ? (
+              <OversizedTable items={visible as OversizedItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} />
+            ) : (
+              <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} action={config?.orphanAction ?? 'quarantine'} />
+            )}
+
+            <p className="safety-note"><span aria-hidden="true">⚓</span>{tab === 'oversized' ? 'Tracked files are removed through Radarr or Sonarr, then searched again using that app’s existing profiles.' : config?.orphanAction === 'permanent' ? 'Permanent deletion is enabled. Selected files are revalidated immediately before deletion.' : 'Selected untracked files are revalidated immediately before moving to quarantine.'}</p>
+          </>}
+        </div>)}
       </section>
 
-      <section className="orders-panel">
-        <div><p className="eyebrow">STANDING ORDERS</p><h3>Server-side settings</h3></div>
-        {(['radarr', 'sonarr'] as AppKind[]).map((app) => {
-          const item = config?.[app];
-          return <article key={app}><AppBadge app={app} /><strong>{item?.useArrQualityDefinitions ? '*arr limits' : `${item?.maxMbPerMinute ?? '—'} MB/min`}</strong><span>+ {item?.toleranceGib ?? '—'} GiB tolerance</span><span>{item?.mediaRoots.length ? `${item.mediaRoots.length} media · ${item.downloadRoots.length} download root(s)` : 'orphan scan off'}</span></article>;
-        })}
-        <article><span className="app-chip orphan">Orphans</span><strong>{config?.orphanAction ?? '—'}</strong><span>editable from Settings</span></article>
-      </section>
-
-      <footer><span>Keelhaularr</span> · No automatic library deletions · Every order is revalidated server-side</footer>
-      {confirming && <ConfirmDialog tab={tab} count={selectedVisible.length} action={config?.orphanAction ?? 'quarantine'} busy={applying} onCancel={() => setConfirming(false)} onConfirm={applySelection} />}
+      <footer><span>Keelhaularr</span> · Library file changes require confirmation · Every file action is revalidated server-side</footer>
+      <ConfirmDialog open={confirming} tab={tab} count={selectedVisible.length} action={config?.orphanAction ?? 'quarantine'} busy={applying} onCancel={() => setConfirming(false)} onConfirm={applySelection} />
       {showSettings && <SettingsDialog onboarding={!config?.radarr.configured && !config?.sonarr.configured} onClose={() => setShowSettings(false)} onSaved={settingsSaved} />}
-      {showOperations && <OperationsDialog initialTab={operationsTab} onClose={() => { setShowOperations(false); if (scan) runScan(); }} onChanged={async () => { if (scan) await runScan(); }} />}
-    </main>
+      {showOperations && <OperationsDialog initialTab={operationsTab} onClose={() => setShowOperations(false)} onChanged={async () => { if (scan) await runScan(); }} onJobQueued={refreshWhenJobSettles} />}
+      </main>
+    </>
   );
 }
 
@@ -454,9 +595,9 @@ function SelectAll({ items, selected, onToggleAll }: { items: Array<{ id: string
 }
 
 function OversizedTable({ items, selected, onToggle, onToggleAll }: { items: OversizedItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void }) {
-  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>Hold</th><th>Actual size</th><th>Allowed</th><th>Over by</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td><span className="excess-chip">+{formatBytes(item.overageBytes)}</span></td></tr>)}</tbody></table></div>;
+  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td><span className="excess-chip">+{formatBytes(item.overageBytes)}</span></td></tr>)}</tbody></table></div>;
 }
 
 function OrphanTable({ items, selected, onToggle, onToggleAll, action }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; action: string }) {
-  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked media</th><th>Hold</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell">{new Date(item.modifiedAt).toLocaleDateString()}</td><td><span className={`action-chip ${action}`}>{action}</span></td></tr>)}</tbody></table></div>;
+  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell">{new Date(item.modifiedAt).toLocaleDateString()}</td><td><span className={`action-chip ${action}`}>{action === 'permanent' ? 'Delete permanently' : 'Quarantine'}</span></td></tr>)}</tbody></table></div>;
 }

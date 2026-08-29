@@ -1,13 +1,83 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { ModalDialog } from './ModalDialog';
 
 type OpsTab = 'jobs' | 'brig' | 'storage' | 'exclusions' | 'schedule';
+
+const opsTabs: OpsTab[] = ['jobs', 'brig', 'storage', 'exclusions', 'schedule'];
+const opsTabLabels: Record<OpsTab, string> = {
+  jobs: 'Jobs',
+  brig: 'Quarantine',
+  storage: 'Storage health',
+  exclusions: 'Exclusions',
+  schedule: 'Maintenance',
+};
+const activeJobStatuses = new Set(['queued', 'running', 'cancelling']);
+const jobStatusLabels: Record<string, string> = {
+  queued: 'Queued',
+  running: 'Running',
+  cancelling: 'Cancelling',
+  completed: 'Completed',
+  completed_with_errors: 'Completed with errors',
+  cancelled: 'Cancelled',
+};
+const itemStatusLabels: Record<string, string> = {
+  waiting: 'Waiting',
+  deleting: 'Removing',
+  deleted: 'Removed',
+  processing: 'Processing',
+  removed: 'Removed',
+  searching: 'Requesting search',
+  complete: 'Cleanup complete',
+  failed: 'Failed',
+  cancelled: 'Cancelled',
+  skipped: 'Skipped',
+};
+const itemPhaseLabels: Record<string, string> = {
+  waiting: 'Waiting',
+  deleting: 'Removing tracked file',
+  deleted: 'Tracked file removed',
+  processing: 'Processing untracked file',
+  quarantined: 'Moved to quarantine',
+  delete_requested: 'Removal requested',
+  arr_removed: 'Removed and blocklisted',
+  removed_confirmed: 'Removal confirmed',
+  search_requested: 'Replacement search requested',
+  search_queued: 'Replacement search queued',
+};
+const replacementStatusLabels: Record<string, string> = {
+  pending: 'Search pending',
+  searching: 'Searching',
+  download_queued: 'Replacement queued',
+  downloaded: 'Replacement downloaded',
+  search_failed: 'Search failed',
+  no_result: 'No replacement found',
+  unknown: 'Replacement status unknown',
+};
+const notificationStatusLabels: Record<string, string> = {
+  pending: 'Pending',
+  sent: 'Sent',
+  failed: 'Failed',
+  'not-configured': 'Not configured',
+  'skipped-clear': 'Skipped because no findings were reported',
+};
+const outcomeLabels: Record<string, string> = {
+  'Moved to the Brig.': 'Moved to quarantine.',
+};
 
 interface JobItem {
   id: string;
   status: string;
+  phase?: string;
   error: string | null;
   outcome: string | null;
-  candidate: { title: string; app: 'radarr' | 'sonarr'; path: string; sizeBytes: number };
+  candidate: {
+    title: string;
+    app: 'radarr' | 'sonarr';
+    path?: string;
+    sizeBytes?: number;
+    category?: string;
+    reason?: string;
+  };
   replacement: null | { status: string; detail: string | null };
 }
 
@@ -49,7 +119,7 @@ interface StorageResult {
 interface ScheduleState {
   lastRunAt: string | null;
   nextRunAt: string | null;
-  lastReport: null | { oversizedCount: number; oversizedBytes: number; orphanCount: number; orphanBytes: number; purgedQuarantineCount: number; warnings: string[]; notification: { status: string; error?: string } };
+  lastReport: null | { oversizedCount: number; oversizedBytes: number; orphanCount: number; orphanBytes: number; purgedQuarantineCount?: number; warnings: string[]; notification: { status: string; error?: string } };
 }
 
 async function api<T>(url: string, options?: RequestInit): Promise<T> {
@@ -66,128 +136,267 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 ** order).toFixed(order >= 3 ? 2 : 1)} ${units[order]}`;
 }
 
-function Status({ value }: { value: string }) {
-  return <span className={`ops-status ${value.replaceAll('_', '-')}`}>{value.replaceAll('_', ' ')}</span>;
+function fallbackLabel(value: string) {
+  const words = value.replace(/[_-]+/g, ' ').trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : 'Unknown';
 }
 
-export function OperationsDialog({ initialTab = 'jobs', onClose, onChanged }: { initialTab?: OpsTab; onClose: () => void; onChanged: () => Promise<void> }) {
+function statusLabel(value: string, labels: Record<string, string>) {
+  return labels[value] ?? `Unknown (${fallbackLabel(value)})`;
+}
+
+function Status({ value, label }: { value: string; label: string }) {
+  return <span className={`ops-status ${value.replaceAll('_', '-')}`}>{label}</span>;
+}
+
+function JobItemRow({ item, recovery }: { item: JobItem; recovery: boolean }) {
+  const phase = item.phase ?? item.status;
+  const category = item.candidate.category === ''
+    ? 'Uncategorized'
+    : item.candidate.category === undefined ? 'Unknown category' : `Category ${JSON.stringify(item.candidate.category)}`;
+  const reason = item.candidate.reason === 'slow'
+    ? 'Slow download'
+    : item.candidate.reason === 'stalled' ? 'Stalled download' : 'Automatic replacement candidate';
+  const terminal = ['failed', 'cancelled', 'skipped'].includes(item.status);
+  let badgeValue = item.status;
+  let badgeLabel = statusLabel(item.status, itemStatusLabels);
+  if (recovery && !terminal) {
+    if (phase === 'search_queued' && item.replacement) {
+      badgeValue = item.replacement.status;
+      badgeLabel = statusLabel(item.replacement.status, replacementStatusLabels);
+    } else {
+      badgeValue = phase;
+      badgeLabel = statusLabel(phase, itemPhaseLabels);
+    }
+  } else if (!recovery && item.replacement) {
+    badgeValue = item.replacement.status;
+    badgeLabel = statusLabel(item.replacement.status, replacementStatusLabels);
+  }
+  const detail = item.error
+    || item.replacement?.detail
+    || (item.outcome ? outcomeLabels[item.outcome] ?? item.outcome : null)
+    || statusLabel(item.status, itemStatusLabels);
+  return <div>
+    <span className={`app-chip ${item.candidate.app}`}>{item.candidate.app}</span>
+    <div>
+      <strong>{item.candidate.title}</strong>
+      {recovery && <small>{reason} · {category} · Phase: {statusLabel(phase, itemPhaseLabels)}</small>}
+      <small>{detail}</small>
+    </div>
+    <Status value={badgeValue} label={badgeLabel} />
+  </div>;
+}
+
+export function OperationsDialog({ initialTab = 'jobs', onClose, onChanged, onJobQueued }: { initialTab?: OpsTab; onClose: () => void; onChanged: () => Promise<void>; onJobQueued: (id: string) => void }) {
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
   const [tab, setTab] = useState<OpsTab>(initialTab);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [jobDetails, setJobDetails] = useState<Record<string, JobItem[]>>({});
+  const [openJobIds, setOpenJobIds] = useState<string[]>([]);
   const [records, setRecords] = useState<QuarantineRecord[]>([]);
   const [exclusions, setExclusions] = useState<Exclusion[]>([]);
   const [storage, setStorage] = useState<StorageResult | null>(null);
   const [schedule, setSchedule] = useState<ScheduleState | null>(null);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
-  const [loadError, setLoadError] = useState('');
-  const loadedJobIds = useRef(new Set<string>());
+  const [loadErrors, setLoadErrors] = useState<Partial<Record<OpsTab, string>>>({});
+  const actionLockRef = useRef(false);
 
-  const load = useCallback(async () => {
+  const setLoadError = useCallback((section: OpsTab, value: string) => {
+    setLoadErrors((current) => ({ ...current, [section]: value }));
+  }, []);
+
+  const loadJobs = useCallback(async (detailIds: string[] = []) => {
     try {
-      const detailIds = [...loadedJobIds.current];
-      const [jobData, quarantineData, exclusionData, scheduleData, ...details] = await Promise.all([
+      const [jobData, ...details] = await Promise.all([
         api<{ jobs: Job[] }>('/api/jobs'),
-        api<{ records: QuarantineRecord[] }>('/api/quarantine'),
-        api<{ exclusions: Exclusion[] }>('/api/exclusions'),
-        api<ScheduleState>('/api/schedule'),
         ...detailIds.map((id) => api<{ job: { items: JobItem[] } }>(`/api/jobs/${id}`).catch(() => null)),
       ]);
       setJobs(jobData.jobs);
-      setRecords(quarantineData.records);
-      setExclusions(exclusionData.exclusions);
-      setSchedule(scheduleData);
-      if (detailIds.length) setJobDetails(Object.fromEntries(detailIds.flatMap((id, index) => {
-        const detail = details[index];
-        return detail ? [[id, detail.job.items]] : [];
-      })));
-      setLoadError('');
+      const availableJobIds = new Set(jobData.jobs.map((job) => job.id));
+      setOpenJobIds((current) => {
+        const next = current.filter((id) => availableJobIds.has(id));
+        return next.length === current.length ? current : next;
+      });
+      setJobDetails((current) => {
+        const entries = Object.entries(current).filter(([id]) => availableJobIds.has(id));
+        return entries.length === Object.keys(current).length ? current : Object.fromEntries(entries);
+      });
+      if (detailIds.length) {
+        setJobDetails((current) => {
+          const next = { ...current };
+          detailIds.forEach((id, index) => {
+            const detail = details[index];
+            if (detail && availableJobIds.has(id)) next[id] = detail.job.items;
+          });
+          return next;
+        });
+      }
+      setLoadError('jobs', '');
     } catch (loadError) {
-      setLoadError(loadError instanceof Error ? loadError.message : String(loadError));
+      setLoadError('jobs', loadError instanceof Error ? loadError.message : String(loadError));
     }
-  }, []);
+  }, [setLoadError]);
+
+  const loadQuarantine = useCallback(async () => {
+    try {
+      const result = await api<{ records: QuarantineRecord[] }>('/api/quarantine');
+      setRecords(result.records);
+      setLoadError('brig', '');
+    } catch (loadError) {
+      setLoadError('brig', loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }, [setLoadError]);
+
+  const loadExclusions = useCallback(async () => {
+    try {
+      const result = await api<{ exclusions: Exclusion[] }>('/api/exclusions');
+      setExclusions(result.exclusions);
+      setLoadError('exclusions', '');
+    } catch (loadError) {
+      setLoadError('exclusions', loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }, [setLoadError]);
+
+  const loadStorage = useCallback(async () => {
+    try {
+      setStorage(await api<StorageResult>('/api/storage/health'));
+      setLoadError('storage', '');
+    } catch (loadError) {
+      setLoadError('storage', loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }, [setLoadError]);
+
+  const loadSchedule = useCallback(async () => {
+    try {
+      setSchedule(await api<ScheduleState>('/api/schedule'));
+      setLoadError('schedule', '');
+    } catch (loadError) {
+      setLoadError('schedule', loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }, [setLoadError]);
 
   useEffect(() => {
-    load();
-    const timer = window.setInterval(load, 3000);
-    return () => window.clearInterval(timer);
-  }, [load]);
+    if (tab === 'brig') void loadQuarantine();
+    if (tab === 'storage') void loadStorage();
+    if (tab === 'exclusions') void loadExclusions();
+    if (tab === 'schedule') void loadSchedule();
+  }, [loadExclusions, loadQuarantine, loadSchedule, loadStorage, tab]);
 
-  async function action(key: string, work: () => Promise<void>, refreshMain = false) {
+  useEffect(() => {
+    let stopped = false;
+    let timer: number | undefined;
+    const interval = tab === 'jobs' ? 3000 : 15000;
+    const poll = async () => {
+      await loadJobs(tab === 'jobs' ? openJobIds : []);
+      if (!stopped) timer = window.setTimeout(poll, interval);
+    };
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [loadJobs, openJobIds, tab]);
+
+  async function action(key: string, work: () => Promise<void>, refresh?: () => Promise<void>, refreshMain = false) {
+    if (actionLockRef.current) return;
+    actionLockRef.current = true;
     setBusy(key);
     setError('');
     try {
       await work();
-      await load();
+      if (refresh) await refresh();
       if (refreshMain) await onChanged();
     } catch (actionError) {
       setError(actionError instanceof Error ? actionError.message : String(actionError));
     } finally {
+      actionLockRef.current = false;
       setBusy('');
     }
   }
 
   async function checkStorage() {
-    await action('storage', async () => setStorage(await api<StorageResult>('/api/storage/health')));
+    await action('storage', loadStorage);
   }
 
-  async function loadJob(id: string) {
-    if (jobDetails[id]) return;
-    loadedJobIds.current.add(id);
-    await action(`job-${id}`, async () => {
-      const result = await api<{ job: { items: JobItem[] } }>(`/api/jobs/${id}`);
-      setJobDetails((current) => ({ ...current, [id]: result.job.items }));
-    });
+  function setJobDetailsOpen(id: string, open: boolean) {
+    setOpenJobIds((current) => open
+      ? current.includes(id) ? current : [...current, id]
+      : current.filter((value) => value !== id));
+  }
+
+  function selectTab(value: OpsTab) {
+    if (actionLockRef.current) return;
+    if (value !== 'jobs') setOpenJobIds([]);
+    setTab(value);
   }
 
   async function runScheduled() {
-    await action('schedule', async () => { await api('/api/schedule/run', { method: 'POST', body: '{}' }); });
+    await action('schedule', async () => { await api('/api/schedule/run', { method: 'POST', body: '{}' }); }, loadSchedule);
   }
 
+  const activeJobCount = jobs.filter((job) => activeJobStatuses.has(job.status)).length;
+  const currentLoadError = loadErrors[tab] ?? '';
+
   return (
-    <div className="settings-backdrop" role="presentation">
-      <section className="settings-dialog operations-dialog" role="dialog" aria-modal="true" aria-labelledby="operations-title">
+    <ModalDialog
+      open
+      labelledBy="operations-title"
+      describedBy="operations-description"
+      className="settings-modal operations-modal"
+      dialogRef={dialogRef}
+      initialFocusRef={titleRef}
+      onDismiss={onClose}
+    >
+      <section className="settings-dialog operations-dialog">
         <header className="settings-header">
-          <div><p className="eyebrow gold">SHIP’S OPERATIONS</p><h2 id="operations-title">Jobs, Brig & health</h2><p>Track work, recover quarantined files and inspect the storage beneath both holds.</p></div>
-          <button type="button" className="settings-close" onClick={onClose} aria-label="Close operations">×</button>
+          <div><p className="eyebrow gold">SHIP’S OPERATIONS</p><h2 ref={titleRef} id="operations-title" tabIndex={-1}>Jobs, quarantine & health</h2><p id="operations-description">Track file actions, restore quarantined files, and inspect storage and maintenance reports.</p></div>
+          <button type="button" className="settings-close" onClick={() => dialogRef.current?.close()} aria-label="Close operations">×</button>
         </header>
         <nav className="operations-tabs" aria-label="Operations sections">
-          {(['jobs', 'brig', 'storage', 'exclusions', 'schedule'] as OpsTab[]).map((value) => <button key={value} className={tab === value ? 'active' : ''} onClick={() => setTab(value)}>{value === 'brig' ? `Brig · ${records.length}` : value === 'jobs' ? `Jobs · ${jobs.filter((job) => ['queued', 'running', 'cancelling'].includes(job.status)).length}` : value}</button>)}
+          {opsTabs.map((value) => {
+            const count = value === 'jobs' ? activeJobCount : value === 'brig' ? records.length : null;
+            return <button type="button" key={value} className={tab === value ? 'active' : ''} aria-current={tab === value ? 'page' : undefined} disabled={Boolean(busy)} onClick={() => selectTab(value)}>{opsTabLabels[value]}{count === null ? '' : ` · ${count}`}</button>;
+          })}
         </nav>
         <div className="settings-scroll operations-scroll">
-          {(error || loadError) && <div className="notice error">{error || loadError}</div>}
+          {(error || currentLoadError) && <div className="notice error" role="alert">{error || currentLoadError}</div>}
 
           {tab === 'jobs' && <div className="ops-list">
-            <p className="ops-explanation">Completed means file actions and search requests finished. Replacement download progress is shown separately inside each job.</p>
-            {!jobs.length && <div className="ops-empty"><h3>No jobs yet</h3><p>Confirmed file actions will appear here and survive restarts.</p></div>}
+            <p className="ops-explanation">A completed job means its cleanup actions and replacement search requests finished. Any later replacement download progress appears inside the job.</p>
+            {!jobs.length && <div className="ops-empty"><h3>No jobs yet</h3><p>Confirmed file actions and automatic replacements will appear here and persist across restarts.</p></div>}
             {jobs.map((job) => {
-              const done = job.settledCount;
+              const finished = job.settledCount;
               const items = jobDetails[job.id];
               return <article className="job-card" key={job.id}>
-                <div className="job-card-head"><div><h3>{job.title}</h3><p>{new Date(job.createdAt).toLocaleString()}</p></div><Status value={job.status} /></div>
-                <div className="job-progress"><span style={{ width: `${job.itemCount ? done / job.itemCount * 100 : 0}%` }} /></div>
-                <p className="job-count">{done} of {job.itemCount} item(s) settled</p>
+                <div className="job-card-head"><div><h3>{job.title}</h3><p>{new Date(job.createdAt).toLocaleString()}</p></div><Status value={job.status} label={statusLabel(job.status, jobStatusLabels)} /></div>
+                <div className="job-progress"><span style={{ width: `${job.itemCount ? finished / job.itemCount * 100 : 0}%` }} /></div>
+                <p className="job-count">{finished} of {job.itemCount} item(s) finished</p>
                 <div className="job-actions">
-                  {['queued', 'running', 'cancelling'].includes(job.status) && <button className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`cancel-${job.id}`, async () => { await api(`/api/jobs/${job.id}/cancel`, { method: 'POST', body: '{}' }); })}>Cancel remaining</button>}
-                  {job.failedCount > 0 && !['queued', 'running', 'cancelling'].includes(job.status) && <button className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`retry-${job.id}`, async () => { await api(`/api/jobs/${job.id}/retry`, { method: 'POST', body: '{}' }); })}>Retry failures</button>}
+                  {activeJobStatuses.has(job.status) && <button type="button" className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`cancel-${job.id}`, async () => { await api(`/api/jobs/${job.id}/cancel`, { method: 'POST', body: '{}' }); }, () => loadJobs(openJobIds))}>Cancel remaining</button>}
+                  {job.failedCount > 0 && !activeJobStatuses.has(job.status) && <button type="button" className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`retry-${job.id}`, async () => { const result = await api<{ job: { id: string } }>(`/api/jobs/${job.id}/retry`, { method: 'POST', body: '{}' }); onJobQueued(result.job.id); }, () => loadJobs(openJobIds))}>Retry failures</button>}
                 </div>
-                <details onToggle={(event) => event.currentTarget.open && loadJob(job.id)}><summary>{items ? 'Item progress' : 'Load item progress'}</summary>{items && <div className="job-items">{items.map((item) => <div key={item.id}><span className={`app-chip ${item.candidate.app}`}>{item.candidate.app}</span><div><strong>{item.candidate.title}</strong><small>{item.error || item.replacement?.detail || item.outcome || item.status}</small></div><Status value={item.replacement?.status ?? item.status} /></div>)}</div>}</details>
+                <details onToggle={(event) => setJobDetailsOpen(job.id, event.currentTarget.open)}><summary>{items ? 'Item progress' : 'Load item progress'}</summary>{items && <div className="job-items">{items.map((item) => <JobItemRow item={item} recovery={job.type === 'qbittorrent-recovery'} key={item.id} />)}</div>}</details>
               </article>;
             })}
           </div>}
 
           {tab === 'brig' && <div className="ops-list">
-            {!records.length && <div className="ops-empty"><h3>The Brig is empty</h3><p>Files quarantined by this version will be recoverable here. Older quarantine folders remain untouched.</p></div>}
-            {records.map((record) => <article className="record-card" key={record.id}><div><span className={`app-chip ${record.app}`}>{record.app}</span><h3>{record.title}</h3><p title={record.originalPath}>{record.originalPath}</p><small>{formatBytes(record.sizeBytes)} · {new Date(record.quarantinedAt).toLocaleString()}</small></div><div className="record-actions"><button className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`restore-${record.id}`, async () => { await api(`/api/quarantine/${record.id}/restore`, { method: 'POST', body: '{}' }); }, true)}>Restore</button><button className="danger-button compact" disabled={Boolean(busy)} onClick={() => window.confirm(`Permanently delete ${record.title} from quarantine?`) && action(`purge-${record.id}`, async () => { await api(`/api/quarantine/${record.id}`, { method: 'DELETE' }); })}>Purge</button></div></article>)}
+            {!records.length && <div className="ops-empty"><h3>Quarantine is empty</h3><p>Files quarantined by this version can be restored here. Older quarantine folders remain untouched.</p></div>}
+            {records.map((record) => <article className="record-card" key={record.id}><div><span className={`app-chip ${record.app}`}>{record.app}</span><h3>{record.title}</h3><p title={record.originalPath}>{record.originalPath}</p><small>{formatBytes(record.sizeBytes)} · {new Date(record.quarantinedAt).toLocaleString()}</small></div><div className="record-actions"><button type="button" className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`restore-${record.id}`, async () => { await api(`/api/quarantine/${record.id}/restore`, { method: 'POST', body: '{}' }); }, loadQuarantine, true)}>Restore</button><button type="button" className="danger-button compact" disabled={Boolean(busy)} onClick={() => window.confirm(`Permanently delete ${record.title} from quarantine?`) && action(`purge-${record.id}`, async () => { await api(`/api/quarantine/${record.id}`, { method: 'DELETE' }); }, loadQuarantine)}>Delete permanently</button></div></article>)}
           </div>}
 
-          {tab === 'storage' && <div className="ops-list"><div className="ops-toolbar"><div><h3>Storage health</h3><p>Checks access, free space and whether hardlinks can cross each configured path.</p></div><button className="primary-button compact" disabled={busy === 'storage'} onClick={checkStorage}>{busy === 'storage' ? 'Checking…' : 'Run health check'}</button></div>{storage?.roots.map((root) => <article className="health-row" key={root.id}><div><span className={`app-chip ${root.app}`}>{root.app}</span><strong>{root.kind}</strong><p>{root.path}</p></div><div><Status value={root.error ? 'error' : root.readable && root.writable ? 'healthy' : 'warning'} /><small>{root.freeBytes === null ? root.error : `${formatBytes(root.freeBytes)} free`}</small></div></article>)}{storage?.compatibility.map((item) => <div className={`hardlink-check ${item.hardlinksPossible ? 'success' : 'warning'}`} key={`${item.app}-${item.downloadRoot}`}><strong>{item.hardlinksPossible ? 'Hardlinks possible' : 'Filesystem mismatch'}</strong><span>{item.downloadRoot}</span><p>{item.detail}</p></div>)}</div>}
+          {tab === 'storage' && <div className="ops-list"><div className="ops-toolbar"><div><h3>Storage health</h3><p>Checks access, free space, and whether hardlinks can cross each configured path.</p></div><button type="button" className="primary-button compact" disabled={Boolean(busy)} onClick={checkStorage}>{busy === 'storage' ? 'Checking…' : 'Run health check'}</button></div>{storage?.roots.map((root) => {
+            const health = root.error ? 'error' : root.readable && root.writable ? 'healthy' : 'warning';
+            return <article className="health-row" key={root.id}><div><span className={`app-chip ${root.app}`}>{root.app}</span><strong>{fallbackLabel(root.kind)}</strong><p>{root.path}</p></div><div><Status value={health} label={statusLabel(health, { healthy: 'Healthy', warning: 'Needs attention', error: 'Error' })} /><small>{root.freeBytes === null ? root.error : `${formatBytes(root.freeBytes)} free`}</small></div></article>;
+          })}{storage?.compatibility.map((item) => <div className={`hardlink-check ${item.hardlinksPossible ? 'success' : 'warning'}`} key={`${item.app}-${item.downloadRoot}`}><strong>{item.hardlinksPossible ? 'Hardlinks possible' : 'Filesystem mismatch'}</strong><span>{item.downloadRoot}</span><p>{item.detail}</p></div>)}</div>}
 
-          {tab === 'exclusions' && <div className="ops-list">{!exclusions.length && <div className="ops-empty"><h3>No permanent exclusions</h3><p>Exclude selected oversized items from the manifest’s batch controls.</p></div>}{exclusions.map((record) => <article className="record-card" key={record.id}><div><span className={`app-chip ${record.app}`}>{record.app}</span><h3>{record.title}</h3><p>{record.subtitle}</p><small>Excluded {new Date(record.createdAt).toLocaleString()}</small></div><button className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`exclude-${record.id}`, async () => { await api(`/api/exclusions/${record.id}`, { method: 'DELETE' }); }, true)}>Include again</button></article>)}</div>}
+          {tab === 'exclusions' && <div className="ops-list">{!exclusions.length && <div className="ops-empty"><h3>No exclusions</h3><p>Use the scan result batch controls to exclude selected files from size-limit findings.</p></div>}{exclusions.map((record) => <article className="record-card" key={record.id}><div><span className={`app-chip ${record.app}`}>{record.app}</span><h3>{record.title}</h3><p>{record.subtitle}</p><small>Excluded {new Date(record.createdAt).toLocaleString()}</small></div><button type="button" className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`exclude-${record.id}`, async () => { await api(`/api/exclusions/${record.id}`, { method: 'DELETE' }); }, loadExclusions, true)}>Remove exclusion</button></article>)}</div>}
 
-          {tab === 'schedule' && <div className="ops-list"><div className="ops-toolbar"><div><h3>Scheduled reports</h3><p>Reports never delete findings. Optional Brig retention is managed separately in Settings.</p></div><button className="primary-button compact" disabled={busy === 'schedule'} onClick={runScheduled}>{busy === 'schedule' ? 'Scanning…' : 'Run report now'}</button></div>{schedule?.lastReport ? <article className="schedule-report"><h3>Latest report</h3><div><strong>{schedule.lastReport.oversizedCount}</strong><span>oversized · {formatBytes(schedule.lastReport.oversizedBytes)}</span></div><div><strong>{schedule.lastReport.orphanCount}</strong><span>orphans · {formatBytes(schedule.lastReport.orphanBytes)}</span></div><p>Notification: {schedule.lastReport.notification.status}{schedule.lastReport.notification.error ? ` · ${schedule.lastReport.notification.error}` : ''}</p>{schedule.lastReport.warnings?.map((warning, index) => <p className="notice warning" key={index}>{warning}</p>)}<small>Last run {schedule.lastRunAt ? new Date(schedule.lastRunAt).toLocaleString() : 'never'}{schedule.nextRunAt ? ` · next ${new Date(schedule.nextRunAt).toLocaleString()}` : ''}</small></article> : <div className="ops-empty"><h3>No reports yet</h3><p>Run one now or enable scheduled scans in Settings.</p></div>}</div>}
+          {tab === 'schedule' && <div className="ops-list"><div className="ops-toolbar"><div><h3>Scheduled maintenance</h3><p>Scheduled and manual maintenance scan for findings, apply configured quarantine retention, and may permanently delete expired quarantined files.</p></div><button type="button" className="primary-button compact" disabled={Boolean(busy)} onClick={runScheduled}>{busy === 'schedule' ? 'Running maintenance…' : 'Run maintenance now'}</button></div>{schedule?.lastReport ? <article className="schedule-report"><h3>Latest maintenance run</h3><div><strong>{schedule.lastReport.oversizedCount}</strong><span>over size limits · {formatBytes(schedule.lastReport.oversizedBytes)}</span></div><div><strong>{schedule.lastReport.orphanCount}</strong><span>untracked · {formatBytes(schedule.lastReport.orphanBytes)}</span></div>{typeof schedule.lastReport.purgedQuarantineCount === 'number' && <div><strong>{schedule.lastReport.purgedQuarantineCount}</strong><span>expired quarantine file(s) permanently deleted</span></div>}<p>Notification: {statusLabel(schedule.lastReport.notification.status, notificationStatusLabels)}{schedule.lastReport.notification.error ? ` · ${schedule.lastReport.notification.error}` : ''}</p>{schedule.lastReport.warnings?.map((warning, index) => <p className="notice warning" key={index}>{warning}</p>)}<small>Last run {schedule.lastRunAt ? new Date(schedule.lastRunAt).toLocaleString() : 'never'}{schedule.nextRunAt ? ` · next ${new Date(schedule.nextRunAt).toLocaleString()}` : ''}</small></article> : <div className="ops-empty"><h3>No maintenance runs yet</h3><p>Run maintenance now or enable scheduled maintenance in Settings.</p></div>}</div>}
         </div>
       </section>
-    </div>
+    </ModalDialog>
   );
 }

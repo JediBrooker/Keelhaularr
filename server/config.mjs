@@ -31,6 +31,42 @@ function readBoolean(name, fallback, overrides) {
   return ['1', 'true', 'yes', 'on'].includes(raw.trim().toLowerCase());
 }
 
+function readStrictBoolean(name, fallback, overrides) {
+  const raw = envValue(name, overrides);
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const normalized = raw.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  throw new Error(`${name} must be true or false`);
+}
+
+function readBoundedInteger(name, fallback, min, max, overrides) {
+  const value = readNumber(name, fallback, overrides);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be a whole number from ${min} to ${max}`);
+  }
+  return value;
+}
+
+function readExactStringArray(name, overrides) {
+  const raw = envValue(name, overrides);
+  if (raw === undefined || raw.trim() === '') return [];
+  let values;
+  try {
+    values = JSON.parse(raw);
+  } catch {
+    throw new Error(`${name} must be a JSON string array`);
+  }
+  if (!Array.isArray(values) || values.length > 100
+    || values.some((value) => typeof value !== 'string' || value.length > 256)) {
+    throw new Error(`${name} must contain at most 100 strings of at most 256 characters each`);
+  }
+  if (new Set(values).size !== values.length) {
+    throw new Error(`${name} must not contain duplicate categories`);
+  }
+  return values;
+}
+
 function readList(name, overrides) {
   return (envValue(name, overrides) ?? '')
     .split(',')
@@ -48,7 +84,7 @@ function readPathMaps(name, overrides) {
   return raw.split(';').map((entry) => {
     const [from, to, ...rest] = entry.split('=>');
     if (!from?.trim() || !to?.trim() || rest.length) {
-      throw new Error(`${name} entries must use /arr/path=>/local/path`);
+      throw new Error(`${name} entries must use /remote/path=>/local/path`);
     }
     return { from: from.trim(), to: path.resolve(to.trim()) };
   }).sort((a, b) => b.from.length - a.from.length);
@@ -84,6 +120,32 @@ function connection(kind, defaults, overrides) {
     mediaRoots: readRoots(`${prefix}_MEDIA_ROOTS`, overrides),
     downloadRoots: readRoots(`${prefix}_DOWNLOAD_ROOTS`, overrides),
     pathMaps: readPathMaps(`${prefix}_PATH_MAPS`, overrides),
+  };
+}
+
+function qbittorrentConnection(overrides) {
+  const url = (envValue('QBITTORRENT_URL', overrides) ?? '').replace(/\/+$/, '');
+  return {
+    url,
+    username: envValue('QBITTORRENT_USERNAME', overrides) ?? '',
+    password: envValue('QBITTORRENT_PASSWORD', overrides) ?? '',
+    configured: Boolean(url),
+    pathMaps: readPathMaps('QBITTORRENT_PATH_MAPS', overrides),
+    recovery: {
+      enabled: readStrictBoolean('QBITTORRENT_RECOVERY_ENABLED', false, overrides),
+      slowSpeedKibPerSecond: readBoundedInteger(
+        'QBITTORRENT_RECOVERY_SLOW_KIB_PER_SECOND', 100, 0, 1048576, overrides,
+      ),
+      slowMinutes: readBoundedInteger(
+        'QBITTORRENT_RECOVERY_SLOW_MINUTES', 30, 1, 10080, overrides,
+      ),
+      stalledMinutes: readBoundedInteger(
+        'QBITTORRENT_RECOVERY_STALLED_MINUTES', 30, 1, 10080, overrides,
+      ),
+      excludedCategories: readExactStringArray(
+        'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON', overrides,
+      ),
+    },
   };
 }
 
@@ -133,6 +195,16 @@ export function getConfig(overrides = {}) {
     throw new Error('NOTIFICATION_TYPE must be generic, discord, or gotify');
   }
 
+  const radarr = connection('radarr', defaults, overrides);
+  const sonarr = connection('sonarr', defaults, overrides);
+  const qbittorrent = qbittorrentConnection(overrides);
+  if (qbittorrent.recovery.enabled && !qbittorrent.configured) {
+    throw new Error('qBittorrent automatic recovery requires a configured qBittorrent connection');
+  }
+  if (qbittorrent.recovery.enabled && !radarr.configured && !sonarr.configured) {
+    throw new Error('qBittorrent automatic recovery requires at least one configured Arr connection');
+  }
+
   return {
     port: readNumber('PORT', 8787, overrides),
     username: envValue('APP_USERNAME', overrides) ?? 'captain',
@@ -141,8 +213,9 @@ export function getConfig(overrides = {}) {
     sessionDays: readNumber('APP_SESSION_DAYS', 30, overrides),
     cookieSecure: readBoolean('APP_COOKIE_SECURE', false, overrides),
     defaults,
-    radarr: connection('radarr', defaults, overrides),
-    sonarr: connection('sonarr', defaults, overrides),
+    radarr,
+    sonarr,
+    qbittorrent,
     orphanAction,
     orphanTrashDir: envValue('ORPHAN_TRASH_DIR', overrides)
       ? path.resolve(envValue('ORPHAN_TRASH_DIR', overrides))
@@ -180,6 +253,10 @@ export function publicConfig(config) {
   return {
     radarr: expose(config.radarr),
     sonarr: expose(config.sonarr),
+    qbittorrent: {
+      configured: config.qbittorrent.configured,
+      recovery: { ...config.qbittorrent.recovery },
+    },
     orphanAction: config.orphanAction,
     hardlinkMinAgeHours: config.hardlinkMinAgeHours,
     quarantineRetentionDays: config.quarantineRetentionDays,

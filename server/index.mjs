@@ -13,6 +13,7 @@ import {
   cancelJob,
   createOrphanJob,
   createOversizeJob,
+  createQbittorrentRecoveryJob,
   getJob,
   listJobSummaries,
   retryJob,
@@ -21,9 +22,16 @@ import {
 } from './jobs.mjs';
 import { scanOrphans } from './orphans.mjs';
 import { listQuarantine, purgeQuarantine, reconcileQuarantine, restoreQuarantine } from './quarantine.mjs';
+import {
+  qbittorrentRecoveryStatus,
+  startQbittorrentRecovery,
+  stopQbittorrentRecovery,
+} from './qbittorrent-recovery.mjs';
+import { inspectQbittorrent, listQbittorrentCategories } from './qbittorrent.mjs';
 import { runScheduledScan, scheduleStatus, startScheduler, stopScheduler } from './scheduler.mjs';
 import {
   buildSettingsOverrides,
+  buildQbittorrentTestConnection,
   getSettingsOverrides,
   saveSettingsOverrides,
   settingsView,
@@ -48,6 +56,14 @@ function safeEqual(left, right) {
   const leftBuffer = Buffer.from(String(left));
   const rightBuffer = Buffer.from(String(right));
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function pathsOverlap(first, second) {
+  const relative = path.relative(path.resolve(first), path.resolve(second));
+  const reverse = path.relative(path.resolve(second), path.resolve(first));
+  return relative === ''
+    || (!relative.startsWith('..') && !path.isAbsolute(relative))
+    || (!reverse.startsWith('..') && !path.isAbsolute(reverse));
 }
 
 function parseCookies(request) {
@@ -172,15 +188,66 @@ app.put('/api/settings', async (request, response, next) => {
   }
 });
 
+app.get('/api/settings/qbittorrent/categories', async (request, response, next) => {
+  try {
+    const connection = currentConfig().qbittorrent;
+    if (!connection.configured) {
+      const error = new Error('qBittorrent is not configured.');
+      error.statusCode = 400;
+      throw error;
+    }
+    response.json({ categories: await listQbittorrentCategories(connection) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/qbittorrent/recovery/status', (request, response) => {
+  response.json(qbittorrentRecoveryStatus(currentConfig()));
+});
+
 app.post('/api/settings/test', async (request, response, next) => {
   try {
     const kind = request.body?.app;
-    if (!['radarr', 'sonarr'].includes(kind)) {
-      const error = new Error('Choose Radarr or Sonarr to test.');
+    if (!['radarr', 'sonarr', 'qbittorrent'].includes(kind)) {
+      const error = new Error('Choose Radarr, Sonarr, or qBittorrent to test.');
       error.statusCode = 400;
       throw error;
     }
     const config = currentConfig();
+    if (kind === 'qbittorrent') {
+      const connection = buildQbittorrentTestConnection(request.body, config.qbittorrent);
+      const suppliedRoots = request.body?.downloadRoots ?? [
+        ...config.radarr.downloadRoots,
+        ...config.sonarr.downloadRoots,
+      ];
+      if (!Array.isArray(suppliedRoots) || suppliedRoots.length > 100
+        || suppliedRoots.some((root) => typeof root !== 'string' || !path.isAbsolute(root.trim()))) {
+        const error = new Error('qBittorrent connection-test download roots must be absolute container paths.');
+        error.statusCode = 400;
+        throw error;
+      }
+      const downloadRoots = suppliedRoots.map((root) => path.resolve(root.trim()));
+      const [snapshot, categories] = await Promise.all([
+        inspectQbittorrent(connection),
+        listQbittorrentCategories(connection),
+      ]);
+      const outsideDownloadRootCount = downloadRoots.length
+        ? snapshot.incompletePaths.filter((candidatePath) => (
+          !downloadRoots.some((root) => pathsOverlap(root, candidatePath))
+        )).length
+        : 0;
+      response.json({
+        connected: true,
+        version: snapshot.version,
+        totalTorrentCount: snapshot.totalTorrentCount,
+        incompleteTorrentCount: snapshot.incompleteTorrentCount,
+        unmappedIncompleteCount: snapshot.unmappedIncompleteCount,
+        outsideDownloadRootCount,
+        categories,
+      });
+      return;
+    }
     const rawUrl = typeof request.body?.url === 'string' ? request.body.url.trim().replace(/\/+$/, '') : '';
     const apiKey = typeof request.body?.apiKey === 'string' && request.body.apiKey.trim()
       ? request.body.apiKey.trim()
@@ -408,10 +475,12 @@ const server = app.listen(config.port, '0.0.0.0', () => {
 
 startJobWorker(currentConfig);
 startScheduler(currentConfig);
+startQbittorrentRecovery(currentConfig, createQbittorrentRecoveryJob);
 reconcileQuarantine().catch((error) => console.error('Quarantine reconciliation failed:', error));
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
+    stopQbittorrentRecovery();
     stopScheduler();
     stopJobWorker();
     server.close(() => process.exit(0));
