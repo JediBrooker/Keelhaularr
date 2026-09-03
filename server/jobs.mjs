@@ -11,6 +11,8 @@ import {
   replacementProgress,
   resolveQbittorrentRecoveryOwnership,
   scanArr,
+  allArrCandidates,
+  arrInstanceUrls,
 } from './arr.mjs';
 import { filterExcluded } from './exclusions.mjs';
 import { recordRun, summarizeJobOutcome } from './history.mjs';
@@ -208,7 +210,7 @@ export async function createOversizeJob(config, requestedIds, action = 'permanen
   }
   const current = await scanArr(config);
   const requested = new Set(requestedIds);
-  const candidates = filterExcluded([...current.radarr.candidates, ...current.sonarr.candidates])
+  const candidates = filterExcluded(allArrCandidates(current))
     .filter((candidate) => requested.has(candidate.id));
   if (!candidates.length) inputError('None of the selected files are still oversized.', 409);
   if (action === 'quarantine' && candidates.every((candidate) => !candidate.localPath || !candidate.root)) {
@@ -228,7 +230,7 @@ export async function createOversizeJob(config, requestedIds, action = 'permanen
     startedAt: null,
     completedAt: null,
     cancelRequested: false,
-    connectionUrls: { radarr: config.radarr.url, sonarr: config.sonarr.url },
+    connectionUrls: arrInstanceUrls(config),
     items: makeItems(candidates),
   });
 }
@@ -255,7 +257,7 @@ export async function createOrphanJob(config, requestedIds, action) {
     startedAt: null,
     completedAt: null,
     cancelRequested: false,
-    connectionUrls: { radarr: config.radarr.url, sonarr: config.sonarr.url },
+    connectionUrls: arrInstanceUrls(config),
     qbittorrentSafetyIdentity: qbittorrentSafetyIdentity(config),
     items: makeItems(candidates),
   });
@@ -300,8 +302,7 @@ export async function createQbittorrentRecoveryJob(config, candidates) {
       cancelRequested: false,
       connectionUrls: {
         qbittorrent: config.qbittorrent?.url,
-        radarr: config.radarr?.url,
-        sonarr: config.sonarr?.url,
+        ...arrInstanceUrls(config),
       },
       connectionIdentities: recoveryConnectionIdentities(config),
       policyIdentity,
@@ -789,7 +790,7 @@ async function processJob(job) {
     switch (job.type) {
       case 'oversized': {
         const arr = await scanArr(config);
-        const candidates = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
+        const candidates = filterExcluded(allArrCandidates(arr));
         eligibleIds = new Set(candidates.map((candidate) => candidate.id));
         break;
       }

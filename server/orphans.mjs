@@ -2,7 +2,9 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, copyFile, mkdir, readdir, rename, rmdir, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
+import { arrInstances } from './arr.mjs';
 import { inspectQbittorrent, pathIsProtected } from './qbittorrent.mjs';
+
 
 function orphanId(app, filePath) {
   return createHash('sha256').update(`${app}\0${filePath}`).digest('hex').slice(0, 24);
@@ -40,8 +42,8 @@ export async function assertQbittorrentSafe(config, candidate) {
   if (snapshot.unmappedIncompleteCount) {
     throw new Error('qBittorrent reported an incomplete torrent path that could not be mapped; file preserved.');
   }
-  const configuredRoots = ['radarr', 'sonarr']
-    .flatMap((app) => config[app]?.downloadRoots ?? [])
+  const configuredRoots = arrInstances(config)
+    .flatMap((instance) => instance.downloadRoots ?? [])
     .map((root) => path.resolve(root));
   const outsideRoots = pathsOutsideRoots(snapshot.incompletePaths, configuredRoots);
   if (outsideRoots.length) {
@@ -104,8 +106,8 @@ export async function scanOrphans(config, arrResults) {
     warning: null,
   };
 
-  const configuredDownloadRoots = ['radarr', 'sonarr']
-    .flatMap((app) => config[app]?.downloadRoots ?? [])
+  const configuredDownloadRoots = arrInstances(config)
+    .flatMap((instance) => instance.downloadRoots ?? [])
     .map((root) => path.resolve(root));
   if (config.qbittorrent?.configured && configuredDownloadRoots.length) {
     try {
@@ -141,8 +143,8 @@ export async function scanOrphans(config, arrResults) {
     }
   }
 
-  for (const app of ['radarr', 'sonarr']) {
-    const connection = config[app];
+  for (const connection of arrInstances(config)) {
+    const app = connection.id;
     const arrResult = arrResults[app];
     if (!connection.mediaRoots.length && !connection.downloadRoots.length) continue;
     if (arrResult.status !== 'connected') {

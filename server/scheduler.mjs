@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { scanArr } from './arr.mjs';
+import { scanArr, allArrCandidates, arrScanResults } from './arr.mjs';
 import { filterExcluded, refreshExclusionOverages } from './exclusions.mjs';
 import { scanOrphans } from './orphans.mjs';
 import { cleanupExpiredQuarantine } from './quarantine.mjs';
@@ -57,7 +57,7 @@ export async function runScheduledScan(config, trigger = 'manual') {
     const arr = await scanArr(config);
     await refreshExclusionOverages(arr);
     const orphans = await scanOrphans(config, arr);
-    const oversized = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
+    const oversized = filterExcluded(allArrCandidates(arr));
     const orphanCandidates = filterExcluded(orphans.candidates);
     const purged = await cleanupExpiredQuarantine(config.quarantineRetentionDays);
     const report = {
@@ -70,8 +70,8 @@ export async function runScheduledScan(config, trigger = 'manual') {
       orphanBytes: bytes(orphanCandidates),
       purgedQuarantineCount: purged.length,
       warnings: [
-        ...arr.radarr.warnings, ...arr.sonarr.warnings, ...orphans.warnings,
-        ...Object.values(arr).filter((result) => result.status === 'error').map((result) => `${result.kind}: ${result.error}`),
+        ...arrScanResults(arr).flatMap((result) => result.warnings), ...orphans.warnings,
+        ...arrScanResults(arr).filter((result) => result.status === 'error').map((result) => `${result.app}: ${result.error}`),
       ],
       notification: { status: 'pending' },
     };

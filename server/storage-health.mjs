@@ -35,13 +35,15 @@ async function inspectRoot(app, kind, root) {
 }
 
 export async function storageHealth(config) {
+  const instances = config.instances ?? [config.radarr, config.sonarr].filter(Boolean);
   const roots = [];
-  for (const app of ['radarr', 'sonarr']) {
-    roots.push(...await Promise.all(config[app].mediaRoots.map((root) => inspectRoot(app, 'library', root))));
-    roots.push(...await Promise.all(config[app].downloadRoots.map((root) => inspectRoot(app, 'download', root))));
+  for (const instance of instances) {
+    const app = instance.id;
+    roots.push(...await Promise.all(instance.mediaRoots.map((root) => inspectRoot(app, 'library', root))));
+    roots.push(...await Promise.all(instance.downloadRoots.map((root) => inspectRoot(app, 'download', root))));
   }
   const compatibility = [];
-  for (const app of ['radarr', 'sonarr']) {
+  for (const { id: app } of instances) {
     const libraries = roots.filter((root) => root.app === app && root.kind === 'library' && root.device);
     const downloads = roots.filter((root) => root.app === app && root.kind === 'download');
     for (const download of downloads) {

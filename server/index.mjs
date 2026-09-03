@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
-import { scanArr } from './arr.mjs';
+import { allArrCandidates, scanArr } from './arr.mjs';
 import { getConfig, publicConfig } from './config.mjs';
 import { suggestDirectories } from './directories.mjs';
 import {
@@ -430,7 +430,7 @@ app.post('/api/scan', async (request, response, next) => {
     const arr = await scanArr(config);
     await refreshExclusionOverages(arr);
     const orphans = await scanOrphans(config, arr);
-    const oversized = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
+    const oversized = filterExcluded(allArrCandidates(arr));
     const orphanCandidates = filterExcluded(orphans.candidates);
     response.json({
       scannedAt: new Date().toISOString(),
@@ -502,7 +502,7 @@ app.post('/api/preview', async (request, response, next) => {
 
     let rows;
     if (tab === 'oversized') {
-      const all = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
+      const all = filterExcluded(allArrCandidates(arr));
       const eligibleIds = new Set(all.map((candidate) => candidate.id));
       const candidates = all.filter((candidate) => requested.has(candidate.id));
       if (!candidates.length) {
@@ -540,7 +540,7 @@ app.post('/api/oversized/replacements', async (request, response, next) => {
     const config = currentConfig();
     const scan = await scanArr(config);
     const requested = new Set(ids);
-    const candidates = filterExcluded([...scan.radarr.candidates, ...scan.sonarr.candidates])
+    const candidates = filterExcluded(allArrCandidates(scan))
       .filter((candidate) => requested.has(candidate.id));
     if (!candidates.length) {
       response.status(409).json({ error: 'None of the selected files are still oversized.' });
@@ -629,7 +629,7 @@ app.post('/api/exclusions', async (request, response, next) => {
     await refreshExclusionOverages(arr);
     const requested = new Set(ids);
     const currentCandidates = scope === 'oversized'
-      ? [...arr.radarr.candidates, ...arr.sonarr.candidates]
+      ? allArrCandidates(arr)
       : (await scanOrphans(config, arr)).candidates;
     const candidates = currentCandidates
       .filter((candidate) => requested.has(candidate.id))
