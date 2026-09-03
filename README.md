@@ -16,7 +16,7 @@ Both destructive automations are opt-in and disabled by default.
 
 ## Features
 
-- Radarr and Sonarr connections with independent settings
+- Multiple Radarr and Sonarr instances, each with independent settings and size rules
 - Oversized movie and episode scanning
 - Multi-episode Sonarr runtime calculations
 - Fresh Radarr/Sonarr searches after tracked files are removed
@@ -205,6 +205,40 @@ written atomically to `config/settings.json` with mode `0600`. They override
 the bootstrap `.env` and survive container rebuilds through the `/config`
 volume. The externally published web port remains a Docker Compose deployment
 setting and is therefore shown with instructions rather than edited at runtime.
+
+## Multiple Radarr and Sonarr instances
+
+A separate 4K instance is common, and one instance handles it badly: point the 1080p
+Radarr at the 4K library so it gets scanned, and every 4K file looks untracked - a
+mass false positive on files you very much want to keep.
+
+List extra instances as `id:kind` pairs:
+
+```dotenv
+ARR_INSTANCES=radarr:radarr,radarr4k:radarr,sonarr:sonarr
+RADARR4K_URL=http://radarr4k:7878
+RADARR4K_API_KEY=your-key
+RADARR4K_MEDIA_ROOTS=/movies-4k
+RADARR4K_LABEL=Radarr 4K
+```
+
+The default is `radarr:radarr,sonarr:sonarr`, which reads exactly the `RADARR_*` and
+`SONARR_*` variables it always did. Each additional instance reads its own prefix
+derived from its id, and supports every per-app setting, including its own size rules.
+
+Existing installations are unaffected. The first instance of each kind keeps the ids
+`radarr` and `sonarr`, and those ids are what candidate ids, ignore-list entries,
+quarantine records and durable jobs are built from - so everything already stored
+stays valid.
+
+Each instance is scanned independently and owns only its own media roots, so a file
+tracked by one instance is never reported as untracked merely because another
+instance does not know about it. If one application is unreachable, only its own roots
+are withheld; the others carry on. Scan results are labelled and filterable per
+instance.
+
+Additional instances are configured through the environment for now; the Settings
+screen still edits the two primary connections.
 
 ## Size rules
 

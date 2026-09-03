@@ -180,6 +180,28 @@ test('untracked-file requests carry the selected action and explicit permanent c
   assert.match(appSource, /onConfirmPermanent=\{\(\) => \{ void applySelection\('permanent'\); \}\}/);
 });
 
+test('the manifest names and filters by instance rather than two fixed apps', () => {
+  // A second Radarr must be filterable and labelled, not rendered as a raw id.
+  assert.match(appSource, /type AppKind = string;/);
+  assert.match(appSource, /function instanceLabel\(/);
+
+  const badge = sourceSection('function AppBadge', 'function ConnectionPill');
+  // The chip class keeps the KIND so an extra Radarr is coloured like a Radarr,
+  // while the visible text is the instance's own label.
+  assert.match(badge, /instances\?\.find\(\(instance\) => instance\.id === app\)\?\.kind/);
+  assert.match(badge, /\{instanceLabel\(instances, app\)\}/);
+
+  const filters = sourceSection('const filterOptions = useMemo', 'const selectedVisible');
+  assert.match(filters, /arrInstances\.filter\(\(instance\) => instance\.configured\)/);
+  assert.match(filters, /shown\.map\(\(instance\) => \(\{ value: instance\.id, label: instance\.label \}\)\)/);
+  // The old hardcoded pair is gone.
+  assert.doesNotMatch(appSource, /\['all', 'radarr', 'sonarr'\]/);
+
+  // Falls back to the historical pair when the server predates instances.
+  const derived = sourceSection('const arrInstances = useMemo', 'const filterOptions');
+  assert.match(derived, /if \(config\?\.instances\?\.length\) return config\.instances/);
+});
+
 test('oversized rows explain why the file is over its limit', () => {
   assert.match(appSource, /function oversizeDiagnosis/);
   assert.match(appSource, /its limit/);
