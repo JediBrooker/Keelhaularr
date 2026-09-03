@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import { matchSizeRule } from './config.mjs';
 
 const MIB = 1024 ** 2;
 const GIB = 1024 ** 3;
@@ -45,6 +46,21 @@ export function mapArrPath(input, pathMaps) {
 // Resolves which configured media root contains a mapped library file, so an
 // oversized file can be quarantined relative to its own root. Returns null when the
 // path is outside every configured root, which makes quarantine fail closed.
+function tagLabelMap(tags) {
+  const labels = new Map();
+  for (const tag of Array.isArray(tags) ? tags : []) {
+    const id = Number(tag?.id);
+    const label = typeof tag?.label === 'string' ? tag.label.trim().toLowerCase() : '';
+    if (Number.isFinite(id) && label) labels.set(id, label);
+  }
+  return labels;
+}
+
+function resolveTagNames(ids, labels) {
+  if (!Array.isArray(ids) || !labels.size) return [];
+  return ids.map((id) => labels.get(Number(id))).filter(Boolean);
+}
+
 export function resolveMediaRoot(localPath, mediaRoots = []) {
   if (!localPath) return null;
   const resolved = path.resolve(localPath);
@@ -81,6 +97,27 @@ export async function arrRequest(connection, endpoint, init = {}) {
   if (response.status === 204) return null;
   const text = await response.text();
   return text ? JSON.parse(text) : null;
+}
+
+/**
+ * Resolves the limit for one file. Precedence, most specific first:
+ *   1. a matching size rule, which is an explicit instruction from the user
+ *   2. the application's quality definition, when that option is enabled
+ *   3. the connection's own configured MB/min
+ * A file that matches no rule therefore behaves exactly as it did before rules existed.
+ */
+function resolveLimit(connection, mediaFile, definitions, context) {
+  const rule = matchSizeRule(connection.sizeRules ?? [], context);
+  if (rule) {
+    return {
+      maxMbPerMinute: rule.maxMbPerMinute,
+      toleranceGib: rule.toleranceGib,
+      limitSource: 'size-rule',
+      ruleLabel: rule.label,
+    };
+  }
+  const { maxMbPerMinute, limitSource } = qualityMaximum(connection, mediaFile, definitions);
+  return { maxMbPerMinute, toleranceGib: connection.toleranceGib, limitSource, ruleLabel: null };
 }
 
 function qualityMaximum(connection, mediaFile, definitions) {
@@ -127,7 +164,7 @@ export async function scanRadarr(connection) {
   if (!connection.configured) return result;
 
   try {
-    const [movies, status, definitions] = await Promise.all([
+    const [movies, status, definitions, tags] = await Promise.all([
       arrRequest(connection, 'movie'),
       arrRequest(connection, 'system/status'),
       connection.useArrQualityDefinitions
@@ -136,9 +173,17 @@ export async function scanRadarr(connection) {
           return [];
         })
         : Promise.resolve([]),
+      // Tag labels are only needed when a rule matches on one.
+      (connection.sizeRules ?? []).some((rule) => rule.tag)
+        ? arrRequest(connection, 'tag').catch((error) => {
+          result.warnings.push(`Radarr tags could not be read, so tag-based size rules were skipped: ${error.message}`);
+          return [];
+        })
+        : Promise.resolve([]),
     ]);
     result.status = 'connected';
     result.version = status?.version ?? null;
+    const tagLabels = tagLabelMap(tags);
 
     for (const movie of movies) {
       const mediaFile = movie.movieFile;
@@ -149,9 +194,13 @@ export async function scanRadarr(connection) {
 
       if (!connection.includeUnmonitored && !movie.monitored) continue;
       const runtimeMinutes = Number(movie.runtime) || 110;
-      const { maxMbPerMinute, limitSource } = qualityMaximum(connection, mediaFile, definitions);
+      const mediaRoot = resolveMediaRoot(localPath, connection.mediaRoots);
+      const { maxMbPerMinute, toleranceGib, limitSource, ruleLabel } = resolveLimit(
+        connection, mediaFile, definitions,
+        { tags: resolveTagNames(movie.tags, tagLabels), root: mediaRoot, quality: qualityName(mediaFile) },
+      );
       const configuredLimitBytes = Math.round(maxMbPerMinute * MIB) * runtimeMinutes;
-      const toleranceBytes = Math.round(connection.toleranceGib * GIB);
+      const toleranceBytes = Math.round(toleranceGib * GIB);
       const limitBytes = configuredLimitBytes + toleranceBytes;
       const sizeBytes = safeSizeBytes(mediaFile.size);
       if (sizeBytes === null) continue;
@@ -171,7 +220,7 @@ export async function scanRadarr(connection) {
         subtitle: [movie.year, qualityName(mediaFile)].filter(Boolean).join(' · '),
         path: arrPath,
         localPath,
-        root: resolveMediaRoot(localPath, connection.mediaRoots),
+        root: mediaRoot,
         sizeBytes,
         configuredLimitBytes,
         toleranceBytes,
@@ -180,6 +229,7 @@ export async function scanRadarr(connection) {
         runtimeMinutes,
         maxMbPerMinute,
         limitSource,
+        ruleLabel,
       });
     }
   } catch (error) {
@@ -202,7 +252,7 @@ export async function scanSonarr(connection) {
   if (!connection.configured) return result;
 
   try {
-    const [seriesList, status, definitions] = await Promise.all([
+    const [seriesList, status, definitions, tags] = await Promise.all([
       arrRequest(connection, 'series'),
       arrRequest(connection, 'system/status'),
       connection.useArrQualityDefinitions
@@ -211,9 +261,16 @@ export async function scanSonarr(connection) {
           return [];
         })
         : Promise.resolve([]),
+      (connection.sizeRules ?? []).some((rule) => rule.tag)
+        ? arrRequest(connection, 'tag').catch((error) => {
+          result.warnings.push(`Sonarr tags could not be read, so tag-based size rules were skipped: ${error.message}`);
+          return [];
+        })
+        : Promise.resolve([]),
     ]);
     result.status = 'connected';
     result.version = status?.version ?? null;
+    const tagLabels = tagLabelMap(tags);
     let unknownRuntimeFiles = 0;
 
     const perSeries = await mapLimit(seriesList, 6, async (series) => {
@@ -253,9 +310,13 @@ export async function scanSonarr(connection) {
           continue;
         }
         const runtimeMinutes = runtimes.reduce((sum, runtime) => sum + runtime, 0);
-        const { maxMbPerMinute, limitSource } = qualityMaximum(connection, mediaFile, definitions);
+        const mediaRoot = resolveMediaRoot(localPath, connection.mediaRoots);
+        const { maxMbPerMinute, toleranceGib, limitSource, ruleLabel } = resolveLimit(
+          connection, mediaFile, definitions,
+          { tags: resolveTagNames(series.tags, tagLabels), root: mediaRoot, quality: qualityName(mediaFile) },
+        );
         const configuredLimitBytes = Math.round(maxMbPerMinute * MIB) * runtimeMinutes;
-        const toleranceBytes = Math.round(connection.toleranceGib * GIB);
+        const toleranceBytes = Math.round(toleranceGib * GIB);
         const limitBytes = configuredLimitBytes + toleranceBytes;
         const sizeBytes = safeSizeBytes(mediaFile.size);
         if (sizeBytes === null) continue;
@@ -277,7 +338,7 @@ export async function scanSonarr(connection) {
           subtitle: [firstTitle, qualityName(mediaFile)].filter(Boolean).join(' · '),
           path: arrPath,
           localPath,
-          root: resolveMediaRoot(localPath, connection.mediaRoots),
+          root: mediaRoot,
           sizeBytes,
           configuredLimitBytes,
           toleranceBytes,
@@ -286,6 +347,7 @@ export async function scanSonarr(connection) {
           runtimeMinutes,
           maxMbPerMinute,
           limitSource,
+          ruleLabel,
         });
       }
     }

@@ -51,6 +51,7 @@ interface ConnectionSettings {
   mediaRoots: string[];
   downloadRoots: string[];
   pathMaps: PathMap[];
+  sizeRules: SizeRule[];
 }
 
 interface QBittorrentSettings {
@@ -111,6 +112,7 @@ interface ConnectionForm {
   mediaRoots: string[];
   downloadRoots: string[];
   pathMapsText: string;
+  sizeRules: SizeRuleRow[];
 }
 
 interface QBittorrentForm {
@@ -190,7 +192,37 @@ function connectionForm(settings: ConnectionSettings): ConnectionForm {
     mediaRoots: settings.mediaRoots,
     downloadRoots: settings.downloadRoots,
     pathMapsText: settings.pathMaps.map(({ from, to }) => `${from}=>${to}`).join('\n'),
+    sizeRules: sizeRuleRows(settings.sizeRules ?? []),
   };
+}
+
+interface SizeRule {
+  label?: string;
+  tag?: string | null;
+  root?: string | null;
+  quality?: string | null;
+  maxMbPerMinute: number;
+  toleranceGib: number;
+}
+
+interface SizeRuleRow {
+  label: string;
+  tag: string;
+  root: string;
+  quality: string;
+  maxMbPerMinute: string;
+  toleranceGib: string;
+}
+
+function sizeRuleRows(rules: SizeRule[]): SizeRuleRow[] {
+  return rules.map((rule) => ({
+    label: rule.label ?? '',
+    tag: rule.tag ?? '',
+    root: rule.root ?? '',
+    quality: rule.quality ?? '',
+    maxMbPerMinute: rule.maxMbPerMinute.toString(),
+    toleranceGib: rule.toleranceGib.toString(),
+  }));
 }
 
 interface MediaServerSettings {
@@ -264,6 +296,47 @@ function MediaServerSection({ form, testing, testMessage, onChange, onTest }: {
         </details>
       </div>
     </section>
+  );
+}
+
+function SizeRulesEditor({ label, rows, onChange }: {
+  label: string;
+  rows: SizeRuleRow[];
+  onChange: (next: SizeRuleRow[]) => void;
+}) {
+  const update = (index: number, key: keyof SizeRuleRow, value: string) => {
+    onChange(rows.map((row, position) => (position === index ? { ...row, [key]: value } : row)));
+  };
+  return (
+    <details className="advanced-settings wide-field" open={rows.length > 0}>
+      <summary>Size rules <span>Different limits for tagged, foldered or specific-quality media</span></summary>
+      <div>
+        <p>
+          Rules are checked in order and the first match wins; a file matching nothing keeps the
+          {' '}{label} limit above. A rule applies only when every field it fills in matches, so a
+          narrow rule placed above a broad one carves out an exception. Tag and quality names are
+          matched exactly but ignore capitalisation.
+        </p>
+        {rows.map((row, index) => (
+          <div className="size-rule-row" key={index}>
+            <label className="field">Name<input value={row.label} onChange={(event) => update(index, 'label', event.target.value)} placeholder="4K exempt" /></label>
+            <label className="field">{label} tag<input value={row.tag} onChange={(event) => update(index, 'tag', event.target.value)} placeholder="anime" /></label>
+            <label className="field">Library folder<input value={row.root} onChange={(event) => update(index, 'root', event.target.value)} placeholder="/movies/kids" /></label>
+            <label className="field">Quality<input value={row.quality} onChange={(event) => update(index, 'quality', event.target.value)} placeholder="Bluray-2160p Remux" /></label>
+            <label className="field">MB/min<input inputMode="decimal" value={row.maxMbPerMinute} onChange={(event) => update(index, 'maxMbPerMinute', event.target.value)} placeholder="40" /></label>
+            <label className="field">Tolerance GiB<input inputMode="decimal" value={row.toleranceGib} onChange={(event) => update(index, 'toleranceGib', event.target.value)} placeholder="0" /></label>
+            <button type="button" className="ghost-button compact" onClick={() => onChange(rows.filter((_, position) => position !== index))}>Remove</button>
+          </div>
+        ))}
+        <button
+          type="button"
+          className="ghost-button compact"
+          onClick={() => onChange([...rows, { label: '', tag: '', root: '', quality: '', maxMbPerMinute: '', toleranceGib: '0' }])}
+        >
+          Add size rule
+        </button>
+      </div>
+    </details>
   );
 }
 
@@ -403,6 +476,7 @@ function ArrConnectionSection({ app, form, testing, testMessage, onChange, onTes
           <summary>Advanced path mapping <span>Most installations leave this blank</span></summary>
           <div><p>Use this only when {label} reports one path but Keelhaularr sees the same folder under another path. Format each line as <code>/arr/path=&gt;/keelhaularr/path</code>.</p><label className="field">Mappings<textarea rows={2} value={form.pathMapsText} onChange={(event) => update('pathMapsText', event.target.value)} /></label></div>
         </details>
+        <SizeRulesEditor label={label} rows={form.sizeRules} onChange={(rows) => update('sizeRules', rows)} />
       </div>
     </section>
   );
@@ -723,6 +797,16 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
         mediaRoots: form[app].mediaRoots.map((root) => root.trim()).filter(Boolean),
         downloadRoots: form[app].downloadRoots.map((root) => root.trim()).filter(Boolean),
         pathMaps: pathMapsFromText(form[app].pathMapsText, app),
+        sizeRules: form[app].sizeRules
+          .filter((rule) => rule.tag.trim() || rule.root.trim() || rule.quality.trim() || rule.maxMbPerMinute.trim())
+          .map((rule, index) => ({
+            label: rule.label.trim(),
+            tag: rule.tag.trim(),
+            root: rule.root.trim(),
+            quality: rule.quality.trim(),
+            maxMbPerMinute: numeric(rule.maxMbPerMinute, `${app} size rule ${index + 1} MB/min`),
+            toleranceGib: numeric(rule.toleranceGib || '0', `${app} size rule ${index + 1} tolerance`),
+          })),
       });
       const result = await api<{ settings: SettingsData }>('/api/settings', {
         method: 'PUT',

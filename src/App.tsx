@@ -119,6 +119,7 @@ interface OversizedItem {
   runtimeMinutes: number;
   maxMbPerMinute: number;
   limitSource: string;
+  ruleLabel: string | null;
 }
 
 interface OrphanItem {
@@ -284,7 +285,9 @@ function oversizeDiagnosis(item: OversizedItem) {
 }
 
 function limitSourceExplanation(item: OversizedItem) {
-  const basis = item.limitSource === 'arr-quality-definition'
+  const basis = item.limitSource === 'size-rule'
+    ? `your size rule "${item.ruleLabel ?? 'unnamed'}"`
+    : item.limitSource === 'arr-quality-definition'
     ? `the ${item.app === 'radarr' ? 'Radarr' : 'Sonarr'} quality definition for this file`
     : item.limitSource === 'keelhaularr-fallback'
       ? 'the Keelhaularr fallback, because no matching quality definition was found'
