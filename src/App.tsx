@@ -100,6 +100,8 @@ interface OrphanItem {
   source: 'library' | 'download';
 }
 
+type ManifestItem = OversizedItem | OrphanItem;
+
 interface QBittorrentPathDetail {
   name: string | null;
   hash: string | null;
@@ -203,6 +205,29 @@ function formatBytes(bytes: number) {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   const order = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** order).toFixed(order >= 3 ? 2 : 1)} ${units[order]}`;
+}
+
+const MIB = 1024 ** 2;
+
+// Turns the raw numbers into a reading of WHY a file is oversized: how many times
+// over its own limit it is, and the bitrate it actually uses versus what is allowed.
+function oversizeDiagnosis(item: OversizedItem) {
+  const parts: string[] = [];
+  if (item.limitBytes > 0) parts.push(`${(item.sizeBytes / item.limitBytes).toFixed(1)}× its limit`);
+  if (item.runtimeMinutes > 0 && item.maxMbPerMinute > 0) {
+    const observed = Math.round(item.sizeBytes / item.runtimeMinutes / MIB);
+    parts.push(`${observed} vs ${Math.round(item.maxMbPerMinute)} MB/min`);
+  }
+  return parts.join(' · ');
+}
+
+function limitSourceExplanation(item: OversizedItem) {
+  const basis = item.limitSource === 'arr-quality-definition'
+    ? `the ${item.app === 'radarr' ? 'Radarr' : 'Sonarr'} quality definition for this file`
+    : item.limitSource === 'keelhaularr-fallback'
+      ? 'the Keelhaularr fallback, because no matching quality definition was found'
+      : 'your configured MB/min';
+  return `${Math.round(item.maxMbPerMinute)} MB/min from ${basis}, × ${item.runtimeMinutes} min runtime, + ${formatBytes(item.toleranceBytes)} tolerance.`;
 }
 
 function formatGib(bytes: number) {
@@ -878,8 +903,30 @@ export default function App() {
     });
   }
 
-  function selectFirst(count: number) {
-    setSelected(new Set(visible.slice(0, count).map((item) => item.id)));
+  // Predicate-based selection. "first N" keeps whatever order the user sorted by;
+  // the multiplier and wasted-space options pick by the numbers instead, which is
+  // what you actually want when hunting for space.
+  function applyQuickSelect(kind: string) {
+    if (!kind) return;
+    const wasted = (item: ManifestItem) => (
+      tab === 'oversized' ? (item as OversizedItem).overageBytes : item.sizeBytes
+    );
+    let chosen: ManifestItem[] = [];
+    if (kind === 'shown') chosen = visible;
+    else if (kind === 'first25') chosen = visible.slice(0, 25);
+    else if (kind === 'first100') chosen = visible.slice(0, 100);
+    else if (kind === 'x2' || kind === 'x3') {
+      const factor = kind === 'x2' ? 2 : 3;
+      chosen = visible.filter((item) => {
+        const oversizedItem = item as OversizedItem;
+        return oversizedItem.limitBytes > 0 && oversizedItem.sizeBytes >= oversizedItem.limitBytes * factor;
+      });
+    } else if (kind === 'top10' || kind === 'top25') {
+      const count = kind === 'top10' ? 10 : 25;
+      chosen = [...visible].sort((left, right) => wasted(right) - wasted(left)).slice(0, count);
+    }
+    setSelected(new Set(chosen.map((item) => item.id)));
+    if (!chosen.length) setMessage('No files in the current view matched that selection.');
   }
 
   function selectManifestTab(next: Tab) {
@@ -1136,7 +1183,7 @@ export default function App() {
                 <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search title, quality or path" aria-label="Search scan results" />
                 <label>Minimum {tab === 'oversized' ? 'overage' : 'size'}<span><input inputMode="decimal" value={minimumGib} onChange={(event) => setMinimumGib(event.target.value)} /> GiB</span></label>
                 <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="largest">Largest first</option>{tab === 'oversized' && <option value="overage">Most over limit</option>}<option value="title">Title</option>{tab === 'orphans' && <option value="oldest">Oldest first</option>}</select></label>
-                <div className="batch-tools"><button type="button" onClick={() => selectFirst(25)} disabled={!visible.length}>Select first 25</button><button type="button" onClick={() => selectFirst(100)} disabled={!visible.length}>Select first 100</button><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button>{tab === 'oversized' && <button type="button" onClick={() => { void checkReplacements(); }} disabled={!selectedVisible.length || applying || checkingReplacements.length > 0} title="Ask Radarr/Sonarr whether a release exists that fits your size limit. Nothing is deleted.">{checkingReplacements.length ? 'Checking indexers…' : 'Check replacements'}</button>}</div>
+                <div className="batch-tools"><label className="quick-select"><span className="sr-only">Quick select</span><select aria-label="Quick select" value="" disabled={!visible.length} onChange={(event) => { applyQuickSelect(event.target.value); event.currentTarget.value = ''; }}><option value="">Quick select…</option><option value="shown">Everything shown ({visible.length})</option>{tab === 'oversized' && <option value="x2">At least 2× its limit</option>}{tab === 'oversized' && <option value="x3">At least 3× its limit</option>}<option value="top10">Top 10 by wasted space</option><option value="top25">Top 25 by wasted space</option><option value="first25">First 25 in this order</option><option value="first100">First 100 in this order</option></select></label><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button>{tab === 'oversized' && <button type="button" onClick={() => { void checkReplacements(); }} disabled={!selectedVisible.length || applying || checkingReplacements.length > 0} title="Ask Radarr/Sonarr whether a release exists that fits your size limit. Nothing is deleted.">{checkingReplacements.length ? 'Checking indexers…' : 'Check replacements'}</button>}</div>
               </div>
             </>}
 
@@ -1188,9 +1235,9 @@ function SelectAll({ items, selected, onToggleAll }: { items: Array<{ id: string
 
 function OversizedTable({ items, selected, onToggle, onToggleAll, replacements, checking }: { items: OversizedItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; replacements: Record<string, ReplacementVerdict>; checking: string[] }) {
   const checkingIds = new Set(checking);
-  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th><th>Replacement</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td><span className="excess-chip">+{formatBytes(item.overageBytes)}</span></td><td><ReplacementChip verdict={replacements[item.id]} checking={checkingIds.has(item.id)} /></td></tr>)}</tbody></table></div>;
+  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th><th>Replacement</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Title"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} /></td><td className="numeric" data-label="Actual size">{formatBytes(item.sizeBytes)}</td><td data-label="Allowed" title={limitSourceExplanation(item)}><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td data-label="Over by"><span className="excess-chip">+{formatBytes(item.overageBytes)}</span><div className="diagnosis-line" title={limitSourceExplanation(item)}>{oversizeDiagnosis(item)}</div></td><td data-label="Replacement"><ReplacementChip verdict={replacements[item.id]} checking={checkingIds.has(item.id)} /></td></tr>)}</tbody></table></div>;
 }
 
 function OrphanTable({ items, selected, onToggle, onToggleAll }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void }) {
-  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell">{new Date(item.modifiedAt).toLocaleDateString()}</td></tr>)}</tbody></table></div>;
+  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Untracked file"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} /></td><td className="numeric" data-label="Size">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell" data-label="Modified">{new Date(item.modifiedAt).toLocaleDateString()}</td></tr>)}</tbody></table></div>;
 }

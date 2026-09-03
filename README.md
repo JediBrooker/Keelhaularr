@@ -35,7 +35,9 @@ Both destructive automations are opt-in and disabled by default.
 - Durable background jobs, restart recovery, cancellation, retries, and item history
 - Replacement search/download status tracking
 - Optional per-quality size limits read directly from Radarr and Sonarr
-- Search, sorting, minimum-overage filters, batch selection, and a persistent ignore list
+- Search, sorting, minimum-overage filters, predicate batch selection, and a persistent ignore list
+- Per-file explanation of why a file exceeds its limit, and where that limit came from
+- Card layout so the manifest is usable on a phone
 - Brig interface for restoring or purging quarantined files
 - Optional automatic quarantine retention
 - Scheduled scan reports with generic, Discord, or Gotify webhooks
@@ -337,8 +339,25 @@ does not advance to a search.
 ## Manifest controls and ignore list
 
 Search by title, quality, or path; filter by application; sort by size, overage,
-title, or orphan age; and set a minimum overage/size in GiB. **Select first 25**
-and **First 100** apply to the current filtered order.
+title, or orphan age; and set a minimum overage/size in GiB.
+
+**Quick select** picks files by the numbers rather than by position:
+
+- **Everything shown** takes the whole current filtered view
+- **At least 2× / 3× its limit** selects by how far each file exceeds *its own*
+  effective limit, so a short episode and a long film are judged on equal terms
+- **Top 10 / Top 25 by wasted space** ranks by overage for size-limit results and
+  by file size for untracked results
+- **First 25 / First 100 in this order** follow whatever sort is applied
+
+Each size-limit row also explains *why* it was flagged: how many times over its
+limit it is, and the bitrate it actually uses against the maximum allowed, for
+example `3.2× its limit · 299 vs 85 MB/min`. Hovering the allowed figure shows
+where that limit came from - your configured MB/min, the application's quality
+definition for that file, or the Keelhaularr fallback when no definition matched.
+
+On a narrow screen the manifest becomes one labelled card per file instead of a
+horizontally scrolling table, so results are readable on a phone.
 
 **Ignore selected** adds the current selection to a persistent ignore list. For
 size-limit results, the ignored scope is the Radarr movie or Sonarr episode, so

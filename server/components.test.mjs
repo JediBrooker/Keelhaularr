@@ -180,6 +180,61 @@ test('untracked-file requests carry the selected action and explicit permanent c
   assert.match(appSource, /onConfirmPermanent=\{\(\) => \{ void applySelection\('permanent'\); \}\}/);
 });
 
+test('oversized rows explain why the file is over its limit', () => {
+  assert.match(appSource, /function oversizeDiagnosis/);
+  assert.match(appSource, /its limit/);
+  assert.match(appSource, /vs \$\{Math\.round\(item\.maxMbPerMinute\)\} MB\/min/);
+
+  // The limit's provenance is explained rather than left as a bare number.
+  assert.match(appSource, /function limitSourceExplanation/);
+  assert.match(appSource, /the Keelhaularr fallback, because no matching quality definition was found/);
+  assert.match(appSource, /quality definition for this file/);
+
+  const table = sourceSection('function OversizedTable', 'function OrphanTable');
+  assert.match(table, /<div className="diagnosis-line" title=\{limitSourceExplanation\(item\)\}>\{oversizeDiagnosis\(item\)\}<\/div>/);
+});
+
+test('quick select offers predicates, not just fixed counts', () => {
+  const quickSelect = sourceSection('function applyQuickSelect', 'async function checkReplacements');
+
+  // Multiplier selection must compare against each file's own limit.
+  assert.match(quickSelect, /oversizedItem\.sizeBytes >= oversizedItem\.limitBytes \* factor/);
+  assert.match(quickSelect, /kind === 'x2' \? 2 : 3/);
+  // Wasted space means overage for size limits and plain size for untracked files.
+  assert.match(quickSelect, /tab === 'oversized' \? \(item as OversizedItem\)\.overageBytes : item\.sizeBytes/);
+  // An empty match tells the user rather than silently clearing the selection.
+  assert.match(quickSelect, /No files in the current view matched that selection/);
+
+  const manifestControls = sourceSection('<div className="manifest-tools">', '{!scan ? (');
+  assert.match(manifestControls, /At least 2× its limit/);
+  assert.match(manifestControls, /Top 10 by wasted space/);
+  assert.match(manifestControls, /First 25 in this order/);
+  assert.match(manifestControls, /aria-label="Quick select"/);
+  // The old fixed-count buttons are gone, replaced by the menu.
+  assert.doesNotMatch(appSource, />Select first 25</);
+  assert.doesNotMatch(appSource, /function selectFirst/);
+});
+
+test('manifest rows carry cell labels so they can render as mobile cards', () => {
+  const oversizedTable = sourceSection('function OversizedTable', 'function OrphanTable');
+  const orphanTable = appSource.slice(appSource.indexOf('function OrphanTable'));
+
+  for (const label of ['Title', 'App', 'Actual size', 'Allowed', 'Over by', 'Replacement']) {
+    assert.match(oversizedTable, new RegExp(`data-label="${label}"`));
+  }
+  for (const label of ['Untracked file', 'App', 'Size', 'Modified']) {
+    assert.match(orphanTable, new RegExp(`data-label="${label}"`));
+  }
+  assert.match(oversizedTable, /className="manifest-table"/);
+  assert.match(orphanTable, /className="manifest-table"/);
+  assert.match(oversizedTable, /className="cell-select"/);
+
+  // The card layout has to beat `.table-wrap table { min-width: 760px }`, so the
+  // reset must be specific enough to win.
+  assert.match(stylesSource, /\.table-wrap \.manifest-table\{min-width:0/);
+  assert.match(stylesSource, /td\[data-label\]::before\{[^}]*content:attr\(data-label\)/);
+});
+
 test('oversized confirmation offers the Brig and a second permanent-delete confirmation', () => {
   const dialog = sourceSection('function ConfirmDialog', 'export default function App');
 
