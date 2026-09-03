@@ -172,12 +172,66 @@ test('untracked-file confirmation offers all actions and adds a second permanent
 test('untracked-file requests carry the selected action and explicit permanent confirmation', () => {
   const applySelection = sourceSection('async function applySelection', "if (auth === 'loading')");
 
-  assert.match(applySelection, /if \(tab === 'orphans' && !orphanAction\) return/);
+  assert.match(applySelection, /if \(!orphanAction\) return/);
   assert.match(applySelection, /action: orphanAction/);
   assert.match(applySelection, /confirmPermanent: orphanAction === 'permanent'/);
   assert.match(appSource, /onQuarantine=\{\(\) => \{ void applySelection\('quarantine'\); \}\}/);
   assert.match(appSource, /onChoosePermanent=\{\(\) => setConfirmationStage\('permanent'\)\}/);
   assert.match(appSource, /onConfirmPermanent=\{\(\) => \{ void applySelection\('permanent'\); \}\}/);
+});
+
+test('oversized confirmation offers the Brig and a second permanent-delete confirmation', () => {
+  const dialog = sourceSection('function ConfirmDialog', 'export default function App');
+
+  // The oversized tab must reach the same three-way choice the untracked tab has,
+  // rather than a single destructive CONFIRM button.
+  assert.doesNotMatch(dialog, /onConfirmTracked/);
+  assert.doesNotMatch(appSource, /onConfirmTracked/);
+  assert.match(dialog, /OVERSIZED-FILE HANDLING/);
+  assert.match(dialog, /How should these oversized files be handled\?/);
+  assert.match(dialog, /Permanently delete the selected tracked files\?/);
+  assert.match(dialog, /NOT recoverable from the Brig/);
+
+  // The permanent stage is no longer gated on the untracked tab only.
+  assert.match(dialog, /const finalPermanentConfirmation = stage === 'permanent'/);
+
+  // Both destructive paths send an explicit action plus confirmation.
+  const applySelection = sourceSection('async function applySelection', "if (auth === 'loading')");
+  assert.match(applySelection, /action: orphanAction/);
+  assert.match(applySelection, /confirmPermanent: orphanAction === 'permanent'/);
+  assert.doesNotMatch(applySelection, /tab === 'orphans' \?/);
+});
+
+test('the replacement check is explicit, read-only, and shown per row', () => {
+  const check = sourceSection('async function checkReplacements', 'const replacementSummary');
+
+  assert.match(check, /['"]\/api\/oversized\/replacements['"]/);
+  assert.match(check, /REPLACEMENT_CHECK_LIMIT/);
+  // Never fired automatically: it is wired to a button, not to a scan effect.
+  assert.match(appSource, /onClick=\{\(\) => \{ void checkReplacements\(\); \}\}/);
+  assert.match(appSource, /'Check replacements'/);
+  // Verdicts are cleared when a fresh scan lands so a chip cannot describe a stale file.
+  assert.match(appSource, /setReplacements\(\{\}\)/);
+
+  const chip = sourceSection('function ReplacementChip', 'function ConfirmDialog');
+  assert.match(chip, /Replacement · \{formatBytes\(verdict\.best\.sizeBytes\)\}/);
+  assert.match(chip, /No compliant replacement/);
+  assert.match(chip, /Replacement not checked/);
+  assert.match(chip, /Checking indexers/);
+
+  const table = sourceSection('function OversizedTable', 'function OrphanTable');
+  assert.match(table, /<th>Replacement<\/th>/);
+  assert.match(table, /<ReplacementChip verdict=\{replacements\[item\.id\]\}/);
+});
+
+test('the require-replacement policy is settable and surfaced in the confirmation', () => {
+  assert.match(settingsSource, /requireReplacement: settings\.orphan\.requireReplacement/);
+  assert.match(settingsSource, /requireReplacement: form\.orphan\.requireReplacement/);
+  assert.match(settingsSource, /Require a compliant replacement before removing an oversized file/);
+
+  const dialog = sourceSection('function ConfirmDialog', 'export default function App');
+  assert.match(dialog, /re-checked for a compliant replacement immediately before it is removed/);
+  assert.match(appSource, /requireReplacement=\{Boolean\(config\?\.oversizeRequireReplacement\)\}/);
 });
 
 test('untracked-file settings no longer contain a global action or permanent-delete switch', () => {

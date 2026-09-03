@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, stat, unlink } from 'node:fs/promises';
+import path from 'node:path';
 import {
   deleteCandidate,
   findMatchingSearchCommand,
@@ -17,9 +18,11 @@ import {
   assertCandidateUnchanged,
   assertQbittorrentSafe,
   quarantineDestination,
+  quarantineFile,
   scanOrphans,
 } from './orphans.mjs';
 import { recordQuarantine } from './quarantine.mjs';
+import { REPLACEMENT_AVAILABLE, findReplacements } from './replacements.mjs';
 import {
   classifyQbittorrentRecoveryTorrent,
   qbittorrentRecoveryPolicyIdentity,
@@ -197,17 +200,26 @@ function freshRecoveryMutationConfig(job, candidate) {
   return freshConfig;
 }
 
-export async function createOversizeJob(config, requestedIds) {
+export async function createOversizeJob(config, requestedIds, action = 'permanent') {
+  if (action !== 'quarantine' && action !== 'permanent') {
+    inputError('Oversized jobs require either quarantine or permanent action.');
+  }
   const current = await scanArr(config);
   const requested = new Set(requestedIds);
   const candidates = filterExcluded([...current.radarr.candidates, ...current.sonarr.candidates])
     .filter((candidate) => requested.has(candidate.id));
   if (!candidates.length) inputError('None of the selected files are still oversized.', 409);
+  if (action === 'quarantine' && candidates.every((candidate) => !candidate.localPath || !candidate.root)) {
+    inputError('None of the selected files can be quarantined because Keelhaularr cannot reach them inside a configured media root. Add a path mapping, or use permanent deletion.', 409);
+  }
   const now = new Date().toISOString();
   return saveNewJob({
     id: randomUUID(),
     type: 'oversized',
-    title: `Replace ${candidates.length} oversized file${candidates.length === 1 ? '' : 's'}`,
+    title: `${action === 'quarantine' ? 'Quarantine' : 'Replace'} ${candidates.length} oversized file${candidates.length === 1 ? '' : 's'}`,
+    action,
+    trashDir: config.orphanTrashDir,
+    requireReplacement: config.oversizeRequireReplacement === true,
     status: 'queued',
     createdAt: now,
     updatedAt: now,
@@ -332,24 +344,144 @@ export async function retryJob(id) {
   return updated;
 }
 
+const OVERSIZE_REMOVED_STATUSES = ['deleted', 'search_queued', 'complete'];
+
+function summarizeReplacementVerdict(verdict) {
+  return {
+    status: verdict.status,
+    reason: verdict.reason,
+    inspected: verdict.inspected,
+    compliantCount: verdict.compliantCount,
+    multiEpisode: verdict.multiEpisode ?? false,
+    checkedAt: verdict.checkedAt,
+    best: verdict.best
+      ? { title: verdict.best.title, sizeBytes: verdict.best.sizeBytes, quality: verdict.best.quality }
+      : null,
+  };
+}
+
+// Builds a filesystem view of a tracked oversized file so it can go through the same
+// revalidation the orphan path uses. Refuses when the file cannot be located inside a
+// configured media root, or when what is on disk no longer matches what Arr reported -
+// a size mismatch means the Arr record is stale and the file may already be compliant.
+async function localOversizeCandidate(candidate) {
+  const localPath = candidate.localPath ? path.resolve(candidate.localPath) : null;
+  const root = candidate.root ? path.resolve(candidate.root) : null;
+  if (!localPath || !root) {
+    throw new Error('The Brig needs this file inside a configured media root that Keelhaularr can reach. Add a path mapping for this application, or choose permanent deletion.');
+  }
+  let stats;
+  try {
+    stats = await stat(localPath, { bigint: true });
+  } catch (error) {
+    throw new Error(`The file could not be read at ${localPath}, so it was not quarantined: ${error.code ?? error.message}`);
+  }
+  if (!stats.isFile()) throw new Error(`The quarantine source at ${localPath} is not a regular file.`);
+  if (Number(stats.size) !== candidate.sizeBytes) {
+    throw new Error('The file on disk no longer matches the size its application reported, so it was preserved. Run a fresh scan.');
+  }
+  return {
+    app: candidate.app,
+    title: candidate.title,
+    sizeBytes: candidate.sizeBytes,
+    path: localPath,
+    root,
+    relativePath: path.relative(root, localPath),
+    identity: `${stats.dev}:${stats.ino}`,
+    linkCount: Number(stats.nlink),
+    modifiedAt: new Date(Number(stats.mtimeMs)).toISOString(),
+  };
+}
+
+// Moves a tracked oversized file into the Brig BEFORE its Arr record is removed, so a
+// failure at any point leaves the file recoverable rather than gone.
+async function quarantineOversizeItem(job, item, config) {
+  const local = await localOversizeCandidate(item.candidate);
+  const quarantineConfig = { ...config, orphanAction: 'quarantine', orphanTrashDir: job.trashDir };
+
+  let destination = item.plannedDestination ?? null;
+  if (!destination) {
+    destination = quarantineDestination(quarantineConfig, local, `job-${job.id}-${item.id}`);
+    await updateItem(job.id, item.id, (value) => {
+      value.plannedDestination = destination;
+    });
+  }
+
+  const sourceExists = await pathExists(local.path);
+  const destinationSettled = await pathHasSize(destination, local.sizeBytes);
+  if (!sourceExists && destinationSettled) return { local, destination };
+  if (!sourceExists) {
+    throw new Error('The file is no longer at its expected path, so it was not quarantined.');
+  }
+  if (await pathExists(destination) && !destinationSettled) {
+    throw new Error('The planned quarantine destination already exists with an unexpected size. Both files were preserved.');
+  }
+  return { local, destination: await quarantineFile(quarantineConfig, local, destination) };
+}
+
 async function processOversizeItem(job, item, config) {
   const connection = config[item.candidate.app];
   if (!connection?.configured) throw new Error(`${item.candidate.app} is no longer configured.`);
-  if (!['deleted', 'search_queued', 'complete'].includes(item.status)) {
+  const alreadyRemoved = OVERSIZE_REMOVED_STATUSES.includes(item.status);
+
+  // Replacement gate. Re-checked here, immediately before the destructive step, rather
+  // than trusting whatever the browser saw when the job was approved. Anything other
+  // than an explicitly available replacement preserves the file.
+  if (job.requireReplacement && !alreadyRemoved) {
     await updateItem(job.id, item.id, (value) => {
-      value.status = 'deleting';
-      value.phase = 'deleting';
+      value.status = 'verifying';
+      value.phase = 'verifying_replacement';
       value.error = null;
     });
+    const verdict = await findReplacements(connection, item.candidate);
+    await updateItem(job.id, item.id, (value) => {
+      value.replacementCheck = summarizeReplacementVerdict(verdict);
+    });
+    if (verdict.status !== REPLACEMENT_AVAILABLE) {
+      throw new Error(`No compliant replacement is available, so the file was preserved. ${verdict.reason ?? ''}`.trim());
+    }
+  }
+
+  if (!alreadyRemoved) {
+    const quarantining = job.action === 'quarantine';
+    await updateItem(job.id, item.id, (value) => {
+      value.status = quarantining ? 'quarantining' : 'deleting';
+      value.phase = quarantining ? 'quarantining' : 'deleting';
+      value.error = null;
+    });
+
+    let destination = null;
+    if (quarantining) {
+      const moved = await quarantineOversizeItem(job, item, config);
+      destination = moved.destination;
+      // `moved.local` carries the real on-disk path and media root, which is what the
+      // Brig needs in order to restore the file to where it came from.
+      await recordQuarantine(moved.local, destination);
+      await updateItem(job.id, item.id, (value) => {
+        value.phase = 'quarantined';
+        value.destination = destination;
+      });
+    }
+
+    // The file is already safe in the Brig at this point, so a failure removing the Arr
+    // record leaves a recoverable state rather than a lost file.
     try {
       await deleteCandidate(connection, item.candidate);
     } catch (error) {
-      if (error.statusCode !== 404) throw error;
+      if (error.statusCode !== 404) {
+        if (quarantining) {
+          throw new Error(`The file is in the Brig, but its ${item.candidate.app} record could not be removed: ${error.message}. Restore it from the Brig or remove the record manually.`);
+        }
+        throw error;
+      }
     }
     await updateItem(job.id, item.id, (value) => {
       value.status = 'deleted';
-      value.phase = 'deleted';
-      value.outcome = 'File removed through its application.';
+      value.phase = quarantining ? 'quarantined' : 'deleted';
+      value.removal = quarantining ? 'quarantined' : 'deleted';
+      value.outcome = quarantining
+        ? 'Moved to the Brig and removed from its application.'
+        : 'File removed through its application.';
     });
   }
 
@@ -359,7 +491,12 @@ async function processOversizeItem(job, item, config) {
   await updateItem(job.id, item.id, (value) => {
     value.status = 'complete';
     value.phase = 'search_queued';
-    value.outcome = 'Replacement search queued.';
+    const removedTo = value.removal === 'quarantined'
+      ? 'Moved to the Brig'
+      : value.removal === 'deleted' ? 'File removed through its application' : null;
+    value.outcome = removedTo
+      ? `${removedTo}. Replacement search queued.`
+      : 'Replacement search queued.';
     value.replacement = {
       status: 'searching',
       commandId: command?.id ?? null,

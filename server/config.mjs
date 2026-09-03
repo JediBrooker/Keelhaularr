@@ -159,6 +159,8 @@ export function getConfig(overrides = {}) {
     throw new Error('ORPHAN_ACTION must be quarantine or permanent');
   }
   const allowPermanentOrphanDelete = readBoolean('ALLOW_PERMANENT_ORPHAN_DELETE', false, overrides);
+  // Opt-in so existing installations keep their current behaviour on upgrade.
+  const oversizeRequireReplacement = readBoolean('OVERSIZE_REQUIRE_REPLACEMENT', false, overrides);
   if (orphanAction === 'permanent' && !allowPermanentOrphanDelete) {
     throw new Error(
       'Set ALLOW_PERMANENT_ORPHAN_DELETE=true before using ORPHAN_ACTION=permanent',
@@ -221,6 +223,7 @@ export function getConfig(overrides = {}) {
       ? path.resolve(envValue('ORPHAN_TRASH_DIR', overrides))
       : null,
     allowPermanentOrphanDelete,
+    oversizeRequireReplacement,
     mediaExtensions,
     extensions: new Set(mediaExtensions),
     customIgnoreDirectories,
@@ -259,6 +262,7 @@ export function publicConfig(config) {
     },
     hardlinkMinAgeHours: config.hardlinkMinAgeHours,
     quarantineRetentionDays: config.quarantineRetentionDays,
+    oversizeRequireReplacement: config.oversizeRequireReplacement,
     schedule: {
       enabled: config.schedule.enabled,
       intervalHours: config.schedule.intervalHours,

@@ -700,7 +700,11 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(restoredOrphanScanResponse.status, 200);
   assert.equal((await restoredOrphanScanResponse.json()).orphans.some((item) => item.id === ignoredOrphan.id), true);
 
-  const oversized = await request('/api/oversized/apply', { ids: scan.oversized.map((item) => item.id) });
+  const oversized = await request('/api/oversized/apply', {
+    ids: scan.oversized.map((item) => item.id),
+    action: 'permanent',
+    confirmPermanent: true,
+  });
   assert.equal(oversized.status, 202);
   const oversizedResult = await oversized.json();
   const oversizedJob = await waitForJob(base, cookie, oversizedResult.job.id);
@@ -1066,7 +1070,7 @@ test('an interrupted deletion resumes safely and still queues its replacement se
   const createResponse = await fetch(`${first.base}/api/oversized/apply`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Cookie: first.cookie },
-    body: JSON.stringify({ ids: [candidate.id] }),
+    body: JSON.stringify({ ids: [candidate.id], action: 'permanent', confirmPermanent: true }),
   });
   assert.equal(createResponse.status, 202);
   const jobId = (await createResponse.json()).job.id;

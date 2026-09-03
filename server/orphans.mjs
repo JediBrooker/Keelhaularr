@@ -260,7 +260,7 @@ export function quarantineDestination(config, candidate, token = new Date().toIS
   return path.join(trashRoot, token, candidate.app, candidate.relativePath);
 }
 
-async function quarantineFile(config, candidate, requestedDestination = null) {
+export async function quarantineFile(config, candidate, requestedDestination = null) {
   const timestamp = new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-');
   const destination = requestedDestination ?? await nextAvailablePath(quarantineDestination(config, candidate, timestamp));
   await mkdir(path.dirname(destination), { recursive: true });

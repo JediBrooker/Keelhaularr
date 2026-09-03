@@ -82,6 +82,7 @@ interface SettingsData {
     mediaExtensions: string[];
     hardlinkMinAgeHours: number;
     retentionDays: number;
+    requireReplacement: boolean;
   };
   schedule: {
     enabled: boolean;
@@ -150,6 +151,7 @@ interface SettingsForm {
     mediaExtensionsText: string;
     hardlinkMinAgeHours: string;
     retentionDays: string;
+    requireReplacement: boolean;
   };
   schedule: {
     enabled: boolean;
@@ -231,6 +233,7 @@ function formFromSettings(settings: SettingsData): SettingsForm {
       mediaExtensionsText: settings.orphan.mediaExtensions.join(', '),
       hardlinkMinAgeHours: settings.orphan.hardlinkMinAgeHours.toString(),
       retentionDays: settings.orphan.retentionDays.toString(),
+      requireReplacement: settings.orphan.requireReplacement,
     },
     schedule: {
       enabled: settings.schedule.enabled,
@@ -648,6 +651,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
             hardlinkMinAgeHours: numeric(form.orphan.hardlinkMinAgeHours, 'Minimum unlinked age'),
             mediaExtensions: listFromText(form.orphan.mediaExtensionsText, /[,\n]/),
             retentionDays: numeric(form.orphan.retentionDays, 'Quarantine retention'),
+            requireReplacement: form.orphan.requireReplacement,
           },
           schedule: {
             enabled: form.schedule.enabled,
@@ -729,6 +733,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
                       <label className="field">Maximum files per scan<input type="number" min="1" max="1000000" value={form.orphan.maxFiles} onChange={(event) => updateSection('orphan', { ...form.orphan, maxFiles: event.target.value })} /></label>
                       <label className="field">Minimum unlinked age (hours) <span>allows completed imports to finish</span><input type="number" min="0" max="8760" step="0.5" value={form.orphan.hardlinkMinAgeHours} onChange={(event) => updateSection('orphan', { ...form.orphan, hardlinkMinAgeHours: event.target.value })} /></label>
                       <label className="field">Media extensions <span>comma separated</span><input value={form.orphan.mediaExtensionsText} onChange={(event) => updateSection('orphan', { ...form.orphan, mediaExtensionsText: event.target.value })} /></label>
+                      <label className="check-row wide-field feature-toggle"><input type="checkbox" checked={form.orphan.requireReplacement} onChange={(event) => updateSection('orphan', { ...form.orphan, requireReplacement: event.target.checked })} /><span><strong>Require a compliant replacement before removing an oversized file</strong><small>Before each oversized file is removed, ask Radarr/Sonarr whether a release exists that fits your size limit and is smaller than the current file. Files without one are preserved. Interactive search queries your indexers, so jobs take longer.</small></span></label>
                       <label className="field">Quarantine retention (days) <span>0 keeps files; a positive value permanently deletes expired quarantined files during maintenance</span><input type="number" min="0" max="3650" value={form.orphan.retentionDays} onChange={(event) => updateSection('orphan', { ...form.orphan, retentionDays: event.target.value })} /></label>
                     </div>
                   </section>
