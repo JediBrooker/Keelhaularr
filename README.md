@@ -41,6 +41,7 @@ Both destructive automations are opt-in and disabled by default.
 - Brig interface for restoring or purging quarantined files
 - Optional automatic quarantine retention
 - Scheduled scan reports with generic, Discord, or Gotify webhooks
+- Dry run that evaluates every safety gate per file and changes nothing
 - Reclaimed-space history that separates freed bytes from bytes still held in quarantine
 - Storage access, free-space, and filesystem compatibility checks
 - Installer checks that block normal updates during active file jobs
@@ -575,6 +576,31 @@ Webhook types are `generic` (JSON event and report), `discord` (Discord webhook
 URL), and `gotify` (a Gotify message endpoint including its application token).
 Webhook URLs are stored server-side and never returned to the browser. Leave
 the field blank when saving to keep the current URL, or use its removal switch.
+
+## Dry run
+
+Any destructive confirmation offers **DRY RUN** before you commit. It evaluates the
+same gates a real job would, in the same order, against your library as it is right
+now, and reports each verdict per file - without moving, removing or downloading
+anything.
+
+Each file is shown as **Would proceed** or **Would be preserved**, with every gate
+listed: whether the application is connected, whether a fresh scan still reports the
+file, whether it is reachable inside a configured media root, whether its inode and
+size still match the scan, whether qBittorrent rules out an incomplete torrent, and
+where the file would land.
+
+The destination shows a `<run>` segment because a real job names that folder after
+its own job id, which does not exist until the job is created. Everything else is
+the literal path that would be used.
+
+Where the require-a-replacement policy is enabled, the dry run reports the
+replacement gate as pending rather than guessing, because it is deliberately checked
+against your indexers at the moment of removal. Ticking the replacement check runs it
+during the dry run too.
+
+Only a genuine gate failure makes a file ineligible. Permanent removal is flagged as
+unrecoverable, which is a warning to you rather than a reason to withhold the file.
 
 ## Space reclaimed
 

@@ -7,7 +7,41 @@ import { SettingsDialog } from './SettingsDialog';
 type AppKind = 'radarr' | 'sonarr';
 type Tab = 'oversized' | 'orphans';
 type OrphanAction = 'quarantine' | 'permanent';
-type ConfirmationStage = 'closed' | 'choose' | 'permanent';
+type ConfirmationStage = 'closed' | 'choose' | 'preview' | 'permanent';
+type GateStatus = 'pass' | 'fail' | 'warn' | 'unknown';
+
+interface PreviewGate {
+  name: string;
+  status: GateStatus;
+  detail: string | null;
+}
+
+interface PreviewRow {
+  id: string;
+  title: string;
+  path: string;
+  sizeBytes: number;
+  action: OrphanAction;
+  destination: string | null;
+  eligible: boolean;
+  gates: PreviewGate[];
+}
+
+interface PreviewSummary {
+  total: number;
+  eligibleCount: number;
+  withheldCount: number;
+  eligibleBytes: number;
+  recoverable: boolean;
+}
+
+interface PreviewState {
+  loading: boolean;
+  error: string;
+  action: OrphanAction;
+  rows: PreviewRow[];
+  summary: PreviewSummary | null;
+}
 type ReplacementStatus = 'available' | 'none' | 'unsupported' | 'error';
 
 interface ReplacementRelease {
@@ -416,7 +450,45 @@ function ReplacementChip({ verdict, checking }: { verdict?: ReplacementVerdict; 
   );
 }
 
-function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireReplacement, onCancel, onQuarantine, onChoosePermanent, onConfirmPermanent }: {
+function PreviewPanel({ state }: { state: PreviewState }) {
+  if (state.loading) return <p className="confirm-note ok">Running every safety gate against your current library…</p>;
+  if (state.error) return <p className="confirm-note warn">The dry run failed: {state.error}</p>;
+  if (!state.summary) return null;
+
+  const { summary } = state;
+  return (
+    <div className="preview-panel">
+      <p className={`confirm-note ${summary.withheldCount > 0 ? 'warn' : 'ok'}`}>
+        {summary.eligibleCount} of {summary.total} file(s) would be {state.action === 'quarantine' ? 'moved to the Brig' : 'removed'}, freeing {formatBytes(summary.eligibleBytes)}.
+        {summary.withheldCount > 0 ? ` ${summary.withheldCount} would be preserved.` : ' Nothing would be withheld.'}
+      </p>
+      <ul className="preview-rows">
+        {state.rows.map((row) => (
+          <li key={row.id} className={row.eligible ? 'eligible' : 'withheld'}>
+            <div className="preview-row-head">
+              <strong>{row.title}</strong>
+              <span className={`preview-verdict ${row.eligible ? 'eligible' : 'withheld'}`}>
+                {row.eligible ? 'Would proceed' : 'Would be preserved'}
+              </span>
+            </div>
+            <code>{row.path}</code>
+            {row.destination && <code className="preview-destination">→ {row.destination}</code>}
+            <ul className="preview-gates">
+              {row.gates.map((entry) => (
+                <li key={entry.name} className={entry.status}>
+                  <span aria-hidden="true">{entry.status === 'pass' ? '✓' : entry.status === 'fail' ? '✗' : '!'}</span>
+                  <span>{entry.name}{entry.detail ? <em> — {entry.detail}</em> : null}</span>
+                </li>
+              ))}
+            </ul>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireReplacement, preview, onDryRun, onCancel, onQuarantine, onChoosePermanent, onConfirmPermanent }: {
   stage: ConfirmationStage;
   tab: Tab;
   count: number;
@@ -424,12 +496,15 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireRep
   onCancel: () => void;
   replacementSummary: { checked: number; available: number } | null;
   requireReplacement: boolean;
+  preview: PreviewState | null;
+  onDryRun: () => void;
   onQuarantine: () => void;
   onChoosePermanent: () => void;
   onConfirmPermanent: () => void;
 }) {
   const oversized = tab === 'oversized';
   const finalPermanentConfirmation = stage === 'permanent';
+  const previewing = stage === 'preview';
   const unavailable = replacementSummary ? replacementSummary.checked - replacementSummary.available : 0;
   const cancelRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -453,9 +528,11 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireRep
     >
       <section className="confirm-dialog">
         <div className="danger-emblem" aria-hidden="true">☠</div>
-        <p className="eyebrow coral">{finalPermanentConfirmation ? 'FINAL DELETION CONFIRMATION' : oversized ? 'OVERSIZED-FILE HANDLING' : 'UNTRACKED-FILE HANDLING'}</p>
+        <p className="eyebrow coral">{previewing ? 'DRY RUN — NOTHING HAS CHANGED' : finalPermanentConfirmation ? 'FINAL DELETION CONFIRMATION' : oversized ? 'OVERSIZED-FILE HANDLING' : 'UNTRACKED-FILE HANDLING'}</p>
         <h2 id="confirm-title">
-          {finalPermanentConfirmation
+          {previewing
+            ? 'This is exactly what would happen'
+            : finalPermanentConfirmation
             ? oversized
               ? 'Permanently delete the selected tracked files?'
               : 'Permanently delete the selected untracked files?'
@@ -464,7 +541,9 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireRep
               : 'How should these untracked files be handled?'}
         </h2>
         <p id="confirm-description">
-          {finalPermanentConfirmation
+          {previewing
+            ? 'A dry run against your library right now. Nothing has been moved, removed or downloaded.'
+            : finalPermanentConfirmation
             ? oversized
               ? `${count} tracked file(s) will be removed through their *arr app and are NOT recoverable from the Brig. A replacement search is still requested.`
               : `${count} untracked file(s) will be permanently removed from disk. This cannot be undone.`
@@ -472,6 +551,7 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireRep
               ? `${count} tracked file(s) can be moved to the recoverable Brig or removed permanently. Either way a replacement search is requested afterwards.`
               : `${count} untracked file(s) can be moved to recoverable quarantine or deleted permanently.`}
         </p>
+        {(previewing || finalPermanentConfirmation) && preview && <PreviewPanel state={preview} />}
         {oversized && replacementSummary && (
           <p className={`confirm-note ${unavailable > 0 ? 'warn' : 'ok'}`}>
             {unavailable > 0
@@ -491,6 +571,7 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireRep
               {busy ? 'DELETING…' : 'DELETE PERMANENTLY'}
             </button>
           ) : <>
+            {!previewing && <button type="button" className="ghost-button" onClick={onDryRun} disabled={busy || Boolean(preview?.loading)}>{preview?.loading ? 'DRY RUN…' : 'DRY RUN'}</button>}
             <button type="button" className="primary-button" onClick={onQuarantine} disabled={busy}>
               {busy ? 'QUARANTINING…' : 'QUARANTINE'}
             </button>
@@ -516,6 +597,7 @@ export default function App() {
   const [applying, setApplying] = useState(false);
   const [confirmationStage, setConfirmationStage] = useState<ConfirmationStage>('closed');
   const [reclaimed, setReclaimed] = useState<ReclaimedSummary>(emptyReclaimed);
+  const [preview, setPreview] = useState<PreviewState | null>(null);
   const [replacements, setReplacements] = useState<Record<string, ReplacementVerdict>>({});
   const [checkingReplacements, setCheckingReplacements] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState(false);
@@ -1070,6 +1152,34 @@ export default function App() {
     }
   }
 
+  // The dry run previews the recoverable action where one exists, since the gates are
+  // the same either way; only recoverability and the destination differ.
+  async function runDryRun() {
+    const action: OrphanAction = 'quarantine';
+    setPreview({ loading: true, error: '', action, rows: [], summary: null });
+    setConfirmationStage('preview');
+    try {
+      const result = await api<{ preview: { rows: PreviewRow[]; summary: PreviewSummary } }>('/api/preview', {
+        method: 'POST',
+        body: JSON.stringify({
+          tab,
+          action,
+          ids: selectedVisible.map((item) => item.id),
+          checkReplacements: tab === 'oversized' && Boolean(config?.oversizeRequireReplacement),
+        }),
+      });
+      setPreview({ loading: false, error: '', action, rows: result.preview.rows, summary: result.preview.summary });
+    } catch (previewError) {
+      setPreview({
+        loading: false,
+        action,
+        rows: [],
+        summary: null,
+        error: previewError instanceof Error ? previewError.message : String(previewError),
+      });
+    }
+  }
+
   async function applySelection(orphanAction?: OrphanAction) {
     if (!orphanAction) return;
     setApplying(true);
@@ -1089,6 +1199,7 @@ export default function App() {
       setConfirmationStage('closed');
       setSelected(new Set());
       setReplacements({});
+      setPreview(null);
       setOperationsTab('jobs');
       setShowOperations(true);
     } catch (applyError) {
@@ -1264,9 +1375,11 @@ export default function App() {
         tab={tab}
         count={selectedVisible.length}
         busy={applying}
+        preview={preview}
+        onDryRun={() => { void runDryRun(); }}
         replacementSummary={replacementSummary}
         requireReplacement={Boolean(config?.oversizeRequireReplacement)}
-        onCancel={() => setConfirmationStage('closed')}
+        onCancel={() => { setConfirmationStage('closed'); setPreview(null); }}
         onQuarantine={() => { void applySelection('quarantine'); }}
         onChoosePermanent={() => setConfirmationStage('permanent')}
         onConfirmPermanent={() => { void applySelection('permanent'); }}

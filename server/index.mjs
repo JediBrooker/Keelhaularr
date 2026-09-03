@@ -28,6 +28,7 @@ import {
   stopJobWorker,
 } from './jobs.mjs';
 import { historySummary } from './history.mjs';
+import { previewOrphans, previewOversized, summarizePreview } from './preview.mjs';
 import { scanOrphans } from './orphans.mjs';
 import { findReplacementsForCandidates } from './replacements.mjs';
 import { listQuarantine, purgeQuarantine, reconcileQuarantine, restoreQuarantine } from './quarantine.mjs';
@@ -445,6 +446,59 @@ app.post('/api/oversized/apply', async (request, response, next) => {
     const config = currentConfig();
     const job = await createOversizeJob(config, ids, action);
     response.status(202).json({ job });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Dry run. Evaluates the very gates a real job would and reports each verdict without
+// moving, deleting or downloading anything.
+app.post('/api/preview', async (request, response, next) => {
+  try {
+    const tab = request.body?.tab;
+    if (tab !== 'oversized' && tab !== 'orphans') {
+      response.status(400).json({ error: 'Preview requires either oversized or orphans.' });
+      return;
+    }
+    const ids = Array.isArray(request.body?.ids) ? request.body.ids.filter((id) => typeof id === 'string') : [];
+    if (!ids.length || ids.length > 500) {
+      response.status(400).json({ error: 'Preview between 1 and 500 files at a time.' });
+      return;
+    }
+    const action = request.body?.action;
+    if (action !== 'quarantine' && action !== 'permanent') {
+      response.status(400).json({ error: 'Preview requires either quarantine or permanent.' });
+      return;
+    }
+    const checkReplacements = request.body?.checkReplacements === true;
+
+    const config = currentConfig();
+    const arr = await scanArr(config);
+    const requested = new Set(ids);
+
+    let rows;
+    if (tab === 'oversized') {
+      const all = filterExcluded([...arr.radarr.candidates, ...arr.sonarr.candidates]);
+      const eligibleIds = new Set(all.map((candidate) => candidate.id));
+      const candidates = all.filter((candidate) => requested.has(candidate.id));
+      if (!candidates.length) {
+        response.status(409).json({ error: 'None of the selected files are still oversized.' });
+        return;
+      }
+      rows = await previewOversized(config, candidates, { action, eligibleIds, checkReplacements });
+    } else {
+      const orphans = await scanOrphans(config, arr);
+      const all = filterExcluded(orphans.candidates);
+      const eligibleIds = new Set(all.map((candidate) => candidate.id));
+      const candidates = all.filter((candidate) => requested.has(candidate.id));
+      if (!candidates.length) {
+        response.status(409).json({ error: 'None of the selected files are still eligible.' });
+        return;
+      }
+      rows = await previewOrphans(config, candidates, { action, eligibleIds });
+    }
+
+    response.json({ preview: { rows, summary: summarizePreview(rows) } });
   } catch (error) {
     next(error);
   }
