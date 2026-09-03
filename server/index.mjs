@@ -28,6 +28,7 @@ import {
   stopJobWorker,
 } from './jobs.mjs';
 import { scanOrphans } from './orphans.mjs';
+import { findReplacementsForCandidates } from './replacements.mjs';
 import { listQuarantine, purgeQuarantine, reconcileQuarantine, restoreQuarantine } from './quarantine.mjs';
 import {
   qbittorrentRecoveryStatus,
@@ -430,9 +431,42 @@ app.post('/api/oversized/apply', async (request, response, next) => {
       response.status(400).json({ error: 'Select between 1 and 10,000 oversized files.' });
       return;
     }
+    const action = request.body?.action ?? 'permanent';
+    if (action !== 'quarantine' && action !== 'permanent') {
+      response.status(400).json({ error: 'Choose either quarantine or permanent for the selected oversized files.' });
+      return;
+    }
+    if (action === 'permanent' && request.body?.confirmPermanent !== true) {
+      response.status(400).json({ error: 'Permanent removal of a tracked file requires explicit confirmation.' });
+      return;
+    }
     const config = currentConfig();
-    const job = await createOversizeJob(config, ids);
+    const job = await createOversizeJob(config, ids, action);
     response.status(202).json({ job });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Read-only: asks each application's interactive search whether a release exists that
+// would satisfy the same size limit that flagged the file. Never mutates anything.
+app.post('/api/oversized/replacements', async (request, response, next) => {
+  try {
+    const ids = Array.isArray(request.body?.ids) ? request.body.ids.filter((id) => typeof id === 'string') : [];
+    if (!ids.length || ids.length > 50) {
+      response.status(400).json({ error: 'Check between 1 and 50 files at a time. Interactive search queries live indexers.' });
+      return;
+    }
+    const config = currentConfig();
+    const scan = await scanArr(config);
+    const requested = new Set(ids);
+    const candidates = filterExcluded([...scan.radarr.candidates, ...scan.sonarr.candidates])
+      .filter((candidate) => requested.has(candidate.id));
+    if (!candidates.length) {
+      response.status(409).json({ error: 'None of the selected files are still oversized.' });
+      return;
+    }
+    response.json({ replacements: await findReplacementsForCandidates(config, candidates) });
   } catch (error) {
     next(error);
   }

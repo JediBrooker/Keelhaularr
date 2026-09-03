@@ -8,6 +8,24 @@ type AppKind = 'radarr' | 'sonarr';
 type Tab = 'oversized' | 'orphans';
 type OrphanAction = 'quarantine' | 'permanent';
 type ConfirmationStage = 'closed' | 'choose' | 'permanent';
+type ReplacementStatus = 'available' | 'none' | 'unsupported' | 'error';
+
+interface ReplacementRelease {
+  title: string;
+  sizeBytes: number;
+  quality: string | null;
+}
+
+interface ReplacementVerdict {
+  id: string;
+  status: ReplacementStatus;
+  reason: string | null;
+  inspected: number;
+  compliantCount: number;
+  multiEpisode: boolean;
+  checkedAt: string;
+  best: ReplacementRelease | null;
+}
 type ConnectionState = 'checking' | 'connected' | 'error' | 'not-configured';
 const manifestTabs: Tab[] = ['oversized', 'orphans'];
 const arrConnectionRecheckMs = 30_000;
@@ -42,6 +60,7 @@ interface PublicConfig {
   sonarr: PublicConnectionConfig;
   qbittorrent: { configured: boolean };
   hardlinkMinAgeHours: number;
+  oversizeRequireReplacement: boolean;
   protected: boolean;
 }
 
@@ -321,19 +340,44 @@ function QBittorrentSafetyNotices({ safety }: { safety: QBittorrentSafety }) {
   );
 }
 
-function ConfirmDialog({ stage, tab, count, busy, onCancel, onConfirmTracked, onQuarantine, onChoosePermanent, onConfirmPermanent }: {
+function ReplacementChip({ verdict, checking }: { verdict?: ReplacementVerdict; checking: boolean }) {
+  if (checking) return <span className="replacement-chip pending">Checking indexers…</span>;
+  if (!verdict) return <span className="replacement-chip unknown">Replacement not checked</span>;
+  if (verdict.status === 'available' && verdict.best) {
+    return (
+      <span
+        className="replacement-chip available"
+        title={`${verdict.best.title}${verdict.best.quality ? ` · ${verdict.best.quality}` : ''}`}
+      >
+        Replacement · {formatBytes(verdict.best.sizeBytes)}
+      </span>
+    );
+  }
+  if (verdict.status === 'none') {
+    return <span className="replacement-chip none" title={verdict.reason ?? undefined}>No compliant replacement</span>;
+  }
+  return (
+    <span className="replacement-chip error" title={verdict.reason ?? undefined}>
+      {verdict.status === 'unsupported' ? 'Replacement cannot be judged' : 'Replacement check failed'}
+    </span>
+  );
+}
+
+function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireReplacement, onCancel, onQuarantine, onChoosePermanent, onConfirmPermanent }: {
   stage: ConfirmationStage;
   tab: Tab;
   count: number;
   busy: boolean;
   onCancel: () => void;
-  onConfirmTracked: () => void;
+  replacementSummary: { checked: number; available: number } | null;
+  requireReplacement: boolean;
   onQuarantine: () => void;
   onChoosePermanent: () => void;
   onConfirmPermanent: () => void;
 }) {
   const oversized = tab === 'oversized';
-  const finalPermanentConfirmation = !oversized && stage === 'permanent';
+  const finalPermanentConfirmation = stage === 'permanent';
+  const unavailable = replacementSummary ? replacementSummary.checked - replacementSummary.available : 0;
   const cancelRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
 
@@ -356,28 +400,40 @@ function ConfirmDialog({ stage, tab, count, busy, onCancel, onConfirmTracked, on
     >
       <section className="confirm-dialog">
         <div className="danger-emblem" aria-hidden="true">☠</div>
-        <p className="eyebrow coral">{oversized ? 'DELETION CONFIRMATION' : finalPermanentConfirmation ? 'FINAL DELETION CONFIRMATION' : 'UNTRACKED-FILE HANDLING'}</p>
+        <p className="eyebrow coral">{finalPermanentConfirmation ? 'FINAL DELETION CONFIRMATION' : oversized ? 'OVERSIZED-FILE HANDLING' : 'UNTRACKED-FILE HANDLING'}</p>
         <h2 id="confirm-title">
-          {oversized
-            ? 'Remove selected files and search again?'
-            : finalPermanentConfirmation
-              ? 'Permanently delete the selected untracked files?'
+          {finalPermanentConfirmation
+            ? oversized
+              ? 'Permanently delete the selected tracked files?'
+              : 'Permanently delete the selected untracked files?'
+            : oversized
+              ? 'How should these oversized files be handled?'
               : 'How should these untracked files be handled?'}
         </h2>
         <p id="confirm-description">
-          {oversized
-            ? `${count} tracked file(s) will be deleted through their *arr app, then searched again.`
-            : finalPermanentConfirmation
-              ? `${count} untracked file(s) will be permanently removed from disk. This cannot be undone.`
+          {finalPermanentConfirmation
+            ? oversized
+              ? `${count} tracked file(s) will be removed through their *arr app and are NOT recoverable from the Brig. A replacement search is still requested.`
+              : `${count} untracked file(s) will be permanently removed from disk. This cannot be undone.`
+            : oversized
+              ? `${count} tracked file(s) can be moved to the recoverable Brig or removed permanently. Either way a replacement search is requested afterwards.`
               : `${count} untracked file(s) can be moved to recoverable quarantine or deleted permanently.`}
         </p>
-        <div className={`dialog-actions ${!oversized && !finalPermanentConfirmation ? 'orphan-choice-actions' : ''}`}>
+        {oversized && replacementSummary && (
+          <p className={`confirm-note ${unavailable > 0 ? 'warn' : 'ok'}`}>
+            {unavailable > 0
+              ? `${unavailable} of ${replacementSummary.checked} checked file(s) have no compliant replacement available right now.`
+              : `All ${replacementSummary.checked} checked file(s) have a compliant replacement available.`}
+          </p>
+        )}
+        {oversized && requireReplacement && (
+          <p className="confirm-note ok">
+            Each file is re-checked for a compliant replacement immediately before it is removed. Any file without one is preserved.
+          </p>
+        )}
+        <div className={`dialog-actions ${!finalPermanentConfirmation ? 'orphan-choice-actions' : ''}`}>
           <button ref={cancelRef} type="button" className="ghost-button" onClick={() => dialogRef.current?.close()} disabled={busy}>CANCEL</button>
-          {oversized ? (
-            <button type="button" className="danger-button" onClick={onConfirmTracked} disabled={busy}>
-              {busy ? 'CONFIRMING…' : 'CONFIRM'}
-            </button>
-          ) : finalPermanentConfirmation ? (
+          {finalPermanentConfirmation ? (
             <button type="button" className="danger-button" onClick={onConfirmPermanent} disabled={busy}>
               {busy ? 'DELETING…' : 'DELETE PERMANENTLY'}
             </button>
@@ -406,6 +462,8 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [applying, setApplying] = useState(false);
   const [confirmationStage, setConfirmationStage] = useState<ConfirmationStage>('closed');
+  const [replacements, setReplacements] = useState<Record<string, ReplacementVerdict>>({});
+  const [checkingReplacements, setCheckingReplacements] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [showOperations, setShowOperations] = useState(false);
   const [operationsTab, setOperationsTab] = useState<'jobs' | 'brig' | 'storage' | 'exclusions' | 'schedule'>('jobs');
@@ -856,6 +914,45 @@ export default function App() {
     if (scan) await runScan();
   }
 
+  // Interactive search hits live indexers, so this is always an explicit user action
+  // and never fired automatically on scan.
+  const REPLACEMENT_CHECK_LIMIT = 50;
+
+  async function checkReplacements() {
+    const batch = selectedVisible.slice(0, REPLACEMENT_CHECK_LIMIT).map((item) => item.id);
+    if (!batch.length) return;
+    setError('');
+    setCheckingReplacements(batch);
+    try {
+      const result = await api<{ replacements: ReplacementVerdict[] }>('/api/oversized/replacements', {
+        method: 'POST',
+        body: JSON.stringify({ ids: batch }),
+      });
+      setReplacements((current) => {
+        const next = { ...current };
+        for (const verdict of result.replacements) next[verdict.id] = verdict;
+        return next;
+      });
+      if (selectedVisible.length > REPLACEMENT_CHECK_LIMIT) {
+        setMessage(`Checked the first ${REPLACEMENT_CHECK_LIMIT} of ${selectedVisible.length} selected files. Interactive search queries live indexers, so it runs in batches.`);
+      }
+    } catch (checkError) {
+      setError(checkError instanceof Error ? checkError.message : String(checkError));
+    } finally {
+      setCheckingReplacements([]);
+    }
+  }
+
+  const replacementSummary = useMemo(() => {
+    if (tab !== 'oversized') return null;
+    const checked = selectedVisible.filter((item) => replacements[item.id]);
+    if (!checked.length) return null;
+    return {
+      checked: checked.length,
+      available: checked.filter((item) => replacements[item.id].status === 'available').length,
+    };
+  }, [replacements, selectedVisible, tab]);
+
   async function ignoreSelection() {
     if (!selectedVisible.length) return;
     const ignoredCount = selectedVisible.length;
@@ -881,7 +978,7 @@ export default function App() {
   }
 
   async function applySelection(orphanAction?: OrphanAction) {
-    if (tab === 'orphans' && !orphanAction) return;
+    if (!orphanAction) return;
     setApplying(true);
     setError('');
     try {
@@ -890,16 +987,15 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({
           ids: selectedVisible.map((item) => item.id),
-          ...(tab === 'orphans' ? {
-            action: orphanAction,
-            confirmPermanent: orphanAction === 'permanent',
-          } : {}),
+          action: orphanAction,
+          confirmPermanent: orphanAction === 'permanent',
         }),
       });
       refreshWhenJobSettles(result.job.id);
       setMessage(`${result.job.title} started. Progress is saved and can be followed in Operations → Jobs.`);
       setConfirmationStage('closed');
       setSelected(new Set());
+      setReplacements({});
       setOperationsTab('jobs');
       setShowOperations(true);
     } catch (applyError) {
@@ -984,7 +1080,7 @@ export default function App() {
             <h3 id="manifest-title">{tab === 'oversized' ? 'Tracked files over configured size limits' : 'Files not tracked by Radarr or Sonarr'}</h3>
           </div>
           {selectedVisible.length > 0 && <button className="danger-button" disabled={scanning || applying} onClick={() => setConfirmationStage('choose')}>
-            {tab === 'oversized' ? 'Remove & search again' : 'Handle selected'} · {selectedVisible.length}
+            Handle selected · {selectedVisible.length}
           </button>}
         </div>
 
@@ -1040,7 +1136,7 @@ export default function App() {
                 <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search title, quality or path" aria-label="Search scan results" />
                 <label>Minimum {tab === 'oversized' ? 'overage' : 'size'}<span><input inputMode="decimal" value={minimumGib} onChange={(event) => setMinimumGib(event.target.value)} /> GiB</span></label>
                 <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="largest">Largest first</option>{tab === 'oversized' && <option value="overage">Most over limit</option>}<option value="title">Title</option>{tab === 'orphans' && <option value="oldest">Oldest first</option>}</select></label>
-                <div className="batch-tools"><button type="button" onClick={() => selectFirst(25)} disabled={!visible.length}>Select first 25</button><button type="button" onClick={() => selectFirst(100)} disabled={!visible.length}>Select first 100</button><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button></div>
+                <div className="batch-tools"><button type="button" onClick={() => selectFirst(25)} disabled={!visible.length}>Select first 25</button><button type="button" onClick={() => selectFirst(100)} disabled={!visible.length}>Select first 100</button><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button>{tab === 'oversized' && <button type="button" onClick={() => { void checkReplacements(); }} disabled={!selectedVisible.length || applying || checkingReplacements.length > 0} title="Ask Radarr/Sonarr whether a release exists that fits your size limit. Nothing is deleted.">{checkingReplacements.length ? 'Checking indexers…' : 'Check replacements'}</button>}</div>
               </div>
             </>}
 
@@ -1055,7 +1151,7 @@ export default function App() {
             ) : visible.length === 0 ? (
               <div className="empty-state"><div aria-hidden="true">⌕</div><h4>No matching files</h4><p>{source.length} file(s) are hidden by the current filters.</p><button type="button" className="ghost-button" onClick={clearFilters}>Clear filters</button></div>
             ) : tab === 'oversized' ? (
-              <OversizedTable items={visible as OversizedItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} />
+              <OversizedTable items={visible as OversizedItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} replacements={replacements} checking={checkingReplacements} />
             ) : (
               <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} />
             )}
@@ -1071,8 +1167,9 @@ export default function App() {
         tab={tab}
         count={selectedVisible.length}
         busy={applying}
+        replacementSummary={replacementSummary}
+        requireReplacement={Boolean(config?.oversizeRequireReplacement)}
         onCancel={() => setConfirmationStage('closed')}
-        onConfirmTracked={() => { void applySelection(); }}
         onQuarantine={() => { void applySelection('quarantine'); }}
         onChoosePermanent={() => setConfirmationStage('permanent')}
         onConfirmPermanent={() => { void applySelection('permanent'); }}
@@ -1089,8 +1186,9 @@ function SelectAll({ items, selected, onToggleAll }: { items: Array<{ id: string
   return <input type="checkbox" checked={checked} onChange={onToggleAll} aria-label="Select all visible files" />;
 }
 
-function OversizedTable({ items, selected, onToggle, onToggleAll }: { items: OversizedItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void }) {
-  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td><span className="excess-chip">+{formatBytes(item.overageBytes)}</span></td></tr>)}</tbody></table></div>;
+function OversizedTable({ items, selected, onToggle, onToggleAll, replacements, checking }: { items: OversizedItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; replacements: Record<string, ReplacementVerdict>; checking: string[] }) {
+  const checkingIds = new Set(checking);
+  return <div className="table-wrap"><table><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th><th>Replacement</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td><AppBadge app={item.app} /></td><td className="numeric">{formatBytes(item.sizeBytes)}</td><td><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td><span className="excess-chip">+{formatBytes(item.overageBytes)}</span></td><td><ReplacementChip verdict={replacements[item.id]} checking={checkingIds.has(item.id)} /></td></tr>)}</tbody></table></div>;
 }
 
 function OrphanTable({ items, selected, onToggle, onToggleAll }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void }) {

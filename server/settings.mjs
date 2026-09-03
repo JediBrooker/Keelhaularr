@@ -16,7 +16,8 @@ const SETTINGS_KEYS = new Set([
   'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON',
   'ORPHAN_ACTION', 'ORPHAN_TRASH_DIR', 'ALLOW_PERMANENT_ORPHAN_DELETE',
   'ORPHAN_IGNORE_DIRECTORIES', 'ORPHAN_MAX_FILES', 'MEDIA_EXTENSIONS', 'HARDLINK_MIN_AGE_HOURS',
-  'QUARANTINE_RETENTION_DAYS', 'SCHEDULE_ENABLED', 'SCHEDULE_INTERVAL_HOURS',
+  'QUARANTINE_RETENTION_DAYS', 'OVERSIZE_REQUIRE_REPLACEMENT',
+  'SCHEDULE_ENABLED', 'SCHEDULE_INTERVAL_HOURS',
   'NOTIFICATION_TYPE', 'NOTIFICATION_WEBHOOK_URL', 'NOTIFICATION_WHEN_CLEAR',
 ]);
 
@@ -321,6 +322,7 @@ export function settingsView(config) {
       mediaExtensions: config.mediaExtensions,
       hardlinkMinAgeHours: config.hardlinkMinAgeHours,
       retentionDays: config.quarantineRetentionDays,
+      requireReplacement: config.oversizeRequireReplacement,
     },
     schedule: {
       enabled: config.schedule.enabled,
@@ -417,6 +419,10 @@ export function buildSettingsOverrides(input, currentOverrides) {
     'Quarantine retention',
     { min: 0, max: 3650, integer: true },
   ).toString();
+  output.OVERSIZE_REQUIRE_REPLACEMENT = String(booleanValue(
+    orphan.requireReplacement ?? configuredBoolean('OVERSIZE_REQUIRE_REPLACEMENT', output, false),
+    'Require a compliant replacement',
+  ));
 
   output.SCHEDULE_ENABLED = String(booleanValue(schedule.enabled, 'Scheduled scans'));
   output.SCHEDULE_INTERVAL_HOURS = numberValue(schedule.intervalHours, 'Scheduled scan interval', { min: 1, max: 8760, integer: true }).toString();

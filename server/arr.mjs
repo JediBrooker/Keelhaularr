@@ -42,10 +42,29 @@ export function mapArrPath(input, pathMaps) {
   return path.resolve(input);
 }
 
+// Resolves which configured media root contains a mapped library file, so an
+// oversized file can be quarantined relative to its own root. Returns null when the
+// path is outside every configured root, which makes quarantine fail closed.
+export function resolveMediaRoot(localPath, mediaRoots = []) {
+  if (!localPath) return null;
+  const resolved = path.resolve(localPath);
+  let match = null;
+  for (const mediaRoot of mediaRoots) {
+    const root = path.resolve(mediaRoot);
+    const relative = path.relative(root, resolved);
+    if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) continue;
+    if (!match || root.length > match.length) match = root;
+  }
+  return match;
+}
+
+export const DEFAULT_ARR_TIMEOUT_MS = 30000;
+
 export async function arrRequest(connection, endpoint, init = {}) {
+  const { timeoutMs = DEFAULT_ARR_TIMEOUT_MS, ...requestInit } = init;
   const response = await fetch(`${connection.url}/api/v3/${endpoint.replace(/^\//, '')}`, {
-    ...init,
-    signal: AbortSignal.timeout(30000),
+    ...requestInit,
+    signal: AbortSignal.timeout(timeoutMs),
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
@@ -151,6 +170,8 @@ export async function scanRadarr(connection) {
         title: movie.title ?? 'Unknown movie',
         subtitle: [movie.year, qualityName(mediaFile)].filter(Boolean).join(' · '),
         path: arrPath,
+        localPath,
+        root: resolveMediaRoot(localPath, connection.mediaRoots),
         sizeBytes,
         configuredLimitBytes,
         toleranceBytes,
@@ -255,6 +276,8 @@ export async function scanSonarr(connection) {
           title: `${series.title ?? 'Unknown series'} · ${code}`,
           subtitle: [firstTitle, qualityName(mediaFile)].filter(Boolean).join(' · '),
           path: arrPath,
+          localPath,
+          root: resolveMediaRoot(localPath, connection.mediaRoots),
           sizeBytes,
           configuredLimitBytes,
           toleranceBytes,

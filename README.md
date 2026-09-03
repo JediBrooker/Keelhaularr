@@ -7,6 +7,9 @@ find orphaned media.
 
 Scan findings are never acted on automatically. File actions are selected in
 the interface, confirmed, and revalidated on the server before they run.
+Oversized files can be checked against live indexers for a compliant replacement
+before anything is removed, and can be moved to the recoverable Brig instead of
+being deleted outright.
 Optional Brig retention can purge already-quarantined files, and the separate
 qBittorrent recovery policy can remove eligible partial torrents through Arr.
 Both destructive automations are opt-in and disabled by default.
@@ -17,6 +20,9 @@ Both destructive automations are opt-in and disabled by default.
 - Oversized movie and episode scanning
 - Multi-episode Sonarr runtime calculations
 - Fresh Radarr/Sonarr searches after tracked files are removed
+- Replacement availability checks against Radarr/Sonarr interactive search before removal
+- Optional policy that refuses to remove an oversized file with no compliant replacement
+- Recoverable Brig quarantine for oversized files as well as untracked files
 - Filesystem orphan scanning against the files actually tracked by each app
 - Inode-based hardlink integrity checks for completed torrent/download folders
 - Optional qBittorrent guard that withholds every incomplete torrent from orphan actions
@@ -165,7 +171,7 @@ Later, open **Settings** in the top bar. The interface manages login
 credentials and sessions, shared and per-app size rules, Radarr/Sonarr URLs and
 API keys, the qBittorrent safety and recovery connection, unmonitored-media
 behavior, media roots, completed-download roots, hardlink minimum age, path
-mappings, quarantine, ignored directories,
+mappings, quarantine, the require-a-replacement policy, ignored directories,
 scan limits, and media extensions. Connection tests are available before
 saving and automatically fill empty library-folder fields. The qBittorrent test
 also discovers exact category names for recovery exclusions; saved connections
@@ -238,6 +244,61 @@ This does not create or modify custom formats, quality profiles, or definitions.
 When a selected tracked file is removed, Keelhaularr queues `MoviesSearch` in
 Radarr or `EpisodeSearch` in Sonarr. The replacement is evaluated using the
 quality profiles and definitions already configured in that application.
+
+## Checking for a replacement before removing anything
+
+Removing an oversized file and then searching is a gamble: the indexers may have
+nothing smaller, or may only offer the same bloated release again. **Check
+replacements** beside the batch controls asks each application's interactive
+search what it could actually get right now, and reports the verdict per row:
+
+- **Replacement found** with the size and quality of the best fitting release
+- **No compliant replacement** when nothing offered fits
+- **Replacement check failed** when the search errored or timed out
+
+A release only counts when it fits the same effective limit that flagged the file
+**and** is smaller than the file already on disk, and when the application has not
+already rejected it for its own profile or custom-format reasons. The largest
+release that still fits is preferred, because it is the best quality within the
+limit. The check is read-only: it never removes, moves, or downloads anything.
+
+Interactive search queries live indexers, so it is only ever run when you press
+the button, in batches of up to 50 selected files, and never automatically during
+a scan.
+
+To make the check binding rather than advisory, enable it in
+**Settings → Untracked files & quarantine**:
+
+```dotenv
+OVERSIZE_REQUIRE_REPLACEMENT=false
+```
+
+When enabled, every oversized file is re-checked immediately before it is removed,
+not when the job was approved. A file with no compliant replacement is preserved
+and its job item records why. A failed or ambiguous search also preserves the file:
+the check fails closed. This is off by default so upgrading does not change how
+existing installations behave.
+
+## Removing or quarantining an oversized file
+
+Confirming an oversized selection offers **Cancel**, **Quarantine**, and **Delete
+permanently**; permanent removal requires a second confirmation. Both paths request
+a replacement search afterwards.
+
+**Quarantine** moves the file into the Brig *before* the Radarr or Sonarr record is
+removed, so an interrupted job leaves the file recoverable rather than gone. The
+file is re-checked immediately before the move, and is preserved if its size no
+longer matches what the application reported, which means the record is stale and a
+fresh scan is needed.
+
+Quarantine needs the file to be reachable inside a configured media root. If an
+application reports a path Keelhaularr cannot resolve to a local file - a remote
+instance without a matching path mapping, for example - quarantine is refused for
+that file rather than guessing, and permanent removal remains available.
+
+Restoring an oversized file from the Brig puts the file back at its original path,
+but its Radarr or Sonarr database record was already removed. Rescan the folder in
+that application to pick the file back up.
 
 Sonarr specials are skipped because Sonarr itself does not apply its standard
 runtime-based size check to special releases. Files with unknown runtimes are
@@ -463,6 +524,10 @@ A positive number permanently purges recorded Brig files older than that many
 days. This policy runs independently of scheduled scans. Set it only when you
 want automatic deletion of expired quarantined files. Quarantine on the same
 filesystem does not reclaim disk space until files are purged.
+
+The Brig holds both untracked files and oversized files that were quarantined
+rather than deleted. Restoring an oversized file returns it to disk but not to its
+application's database; rescan that folder in Radarr or Sonarr afterwards.
 
 The Brig tracks files quarantined by version 1.1 and later. Files quarantined by
 older versions are left untouched in their existing folders and are not
