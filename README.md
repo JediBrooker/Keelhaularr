@@ -150,6 +150,23 @@ inside Keelhaularr.
 5. Open `http://your-server:8787` and sign in with `APP_USERNAME` and
    `APP_PASSWORD`.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main`, every pull request, and on
+demand. Two independent jobs:
+
+- **Typecheck, build and test** - `npm ci`, then `npm run build` (`tsc --noEmit &&
+  vite build`), then `npm test`. The suite needs no services and no secrets: it spawns
+  real servers on ephemeral ports and exercises file actions against temporary
+  directories.
+- **Docker image builds** - builds the `Dockerfile` exactly as a deployment would, so a
+  change that works locally but breaks the container build is caught here rather than
+  on your server.
+
+The runner is a non-root user, unlike the container, so the two permission tests in
+`server/directories.test.mjs` that skip themselves under uid 0 do run in CI. A local
+run as root reports 100 passing and 2 skipped; CI reports 102 passing.
+
 ## Run directly with Node
 
 Node.js 22.13 or later is required.

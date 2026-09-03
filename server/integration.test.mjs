@@ -26,15 +26,23 @@ async function freePort() {
   return port;
 }
 
-async function waitFor(url, attempts = 50) {
+async function waitFor(url, child = null, attempts = 200) {
+  let output = '';
+  child?.stdout?.on('data', (chunk) => { output += chunk; });
+  child?.stderr?.on('data', (chunk) => { output += chunk; });
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    // A child that has already exited will never answer, so fail now with its reason
+    // rather than burning the whole budget and reporting only a timeout.
+    if (child && child.exitCode !== null) {
+      throw new Error(`Server exited with code ${child.exitCode} before answering ${url}:\n${output}`);
+    }
     try {
       const response = await fetch(url);
       if (response.ok) return;
     } catch {}
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  throw new Error(`Timed out waiting for ${url}`);
+  throw new Error(`Timed out waiting for ${url}.${output ? ` Server output:\n${output}` : ''}`);
 }
 
 async function waitForJob(base, cookie, id, attempts = 100) {
@@ -219,7 +227,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   });
 
   const base = `http://127.0.0.1:${appPort}`;
-  await waitFor(`${base}/api/auth/status`);
+  await waitFor(`${base}/api/auth/status`, child);
   const login = await fetch(`${base}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -815,7 +823,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const restartedBase = `http://127.0.0.1:${restartedPort}`;
-  await waitFor(`${restartedBase}/api/auth/status`);
+  await waitFor(`${restartedBase}/api/auth/status`, restartedChild);
   const persistedLogin = await fetch(`${restartedBase}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -916,7 +924,7 @@ test('connection status probes Arr apps independently without exposing credentia
     });
     children.push(child);
     const base = `http://127.0.0.1:${port}`;
-    await waitFor(`${base}/api/auth/status`);
+    await waitFor(`${base}/api/auth/status`, child);
     const login = await fetch(`${base}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1051,7 +1059,7 @@ test('an interrupted deletion resumes safely and still queues its replacement se
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const base = `http://127.0.0.1:${port}`;
-    await waitFor(`${base}/api/auth/status`);
+    await waitFor(`${base}/api/auth/status`, processChild);
     const login = await fetch(`${base}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1181,7 +1189,7 @@ test('ignore summaries preserve legacy records and report unknown sizes safely',
   });
 
   const base = `http://127.0.0.1:${port}`;
-  await waitFor(`${base}/api/auth/status`);
+  await waitFor(`${base}/api/auth/status`, child);
   const unauthorizedRefresh = await fetch(`${base}/api/exclusions/refresh`, { method: 'POST' });
   assert.equal(unauthorizedRefresh.status, 401);
   const login = await fetch(`${base}/api/auth/login`, {
@@ -1345,7 +1353,7 @@ test('manual and scheduled scans refresh exact overages while non-authoritative 
   });
 
   const base = `http://127.0.0.1:${port}`;
-  await waitFor(`${base}/api/auth/status`);
+  await waitFor(`${base}/api/auth/status`, child);
   const login = await fetch(`${base}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
