@@ -6,3 +6,4 @@ config
 compose.yml
 compose.settings.yml
 npm-debug.log*
+.github

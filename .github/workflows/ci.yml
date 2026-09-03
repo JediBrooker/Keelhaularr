@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only: this workflow never needs to write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Typecheck, build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Matches the "engines" floor in package.json and the node:22 runtime image.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # `npm ci` rather than `npm install`, so a lockfile that has drifted out of
+      # step with package.json fails here instead of silently resolving something
+      # different from what the Docker image builds.
+      - name: Install dependencies
+        run: npm ci
+
+      # `npm run build` is `tsc --noEmit && vite build`, so this covers typechecking.
+      - name: Typecheck and build
+        run: npm run build
+
+      # The suite spawns real servers on ephemeral ports and exercises the file
+      # actions against temporary directories. It needs no services and no secrets.
+      #
+      # Note this runs as a non-root user, unlike a root container: the two
+      # permission tests in directories.test.mjs that skip themselves under uid 0
+      # do execute here.
+      - name: Test
+        run: npm test
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Dockerfile runs `npm ci` and `npm run build` inside the image, so this
+      # catches anything that works locally but breaks in the container build -
+      # a missing file in the build stage, or a dependency that is dev-only but
+      # needed at runtime. Not pushed anywhere; building is the whole test.
+      - name: Build image
+        run: docker build --tag keelhaularr:ci .
