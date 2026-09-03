@@ -27,6 +27,7 @@ import {
   startJobWorker,
   stopJobWorker,
 } from './jobs.mjs';
+import { historySummary } from './history.mjs';
 import { scanOrphans } from './orphans.mjs';
 import { findReplacementsForCandidates } from './replacements.mjs';
 import { listQuarantine, purgeQuarantine, reconcileQuarantine, restoreQuarantine } from './quarantine.mjs';
@@ -228,6 +229,7 @@ app.get('/api/status', (request, response) => {
     jobs: activeJobSummary(),
     schedule: scheduleStatus(config),
     ignoreSummary: exclusionSummary(),
+    reclaimed: historySummary(listQuarantine(), 0),
   });
 });
 
@@ -570,6 +572,10 @@ app.delete('/api/exclusions/:id', async (request, response, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+app.get('/api/history', (request, response) => {
+  response.json({ history: historySummary(listQuarantine(), 50) });
 });
 
 app.get('/api/quarantine', (request, response) => {

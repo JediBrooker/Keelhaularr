@@ -1,17 +1,38 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ModalDialog } from './ModalDialog';
 
-type OpsTab = 'jobs' | 'brig' | 'storage' | 'exclusions' | 'schedule';
+type OpsTab = 'jobs' | 'brig' | 'history' | 'storage' | 'exclusions' | 'schedule';
 
-const opsTabs: OpsTab[] = ['jobs', 'brig', 'storage', 'exclusions', 'schedule'];
+const opsTabs: OpsTab[] = ['jobs', 'brig', 'history', 'storage', 'exclusions', 'schedule'];
 const opsTabLabels: Record<OpsTab, string> = {
   jobs: 'Jobs',
   brig: 'Quarantine',
+  history: 'Reclaimed',
   storage: 'Storage health',
   exclusions: 'Ignore list',
   schedule: 'Maintenance',
 };
 const activeJobStatuses = new Set(['queued', 'running', 'cancelling']);
+
+interface HistoryRun {
+  id: string;
+  jobId: string | null;
+  type: string;
+  action: string | null;
+  title: string | null;
+  completedAt: string;
+  fileCount: number;
+  reclaimedBytes: number;
+  quarantinedBytes: number;
+}
+
+interface HistoryState {
+  totalReclaimedBytes: number;
+  pendingPurgeBytes: number;
+  pendingPurgeCount: number;
+  runCount: number;
+  runs: HistoryRun[];
+}
 const jobStatusLabels: Record<string, string> = {
   queued: 'Queued',
   running: 'Running',
@@ -211,6 +232,7 @@ export function OperationsDialog({ initialTab = 'jobs', onClose, onChanged, onJo
   const [exclusions, setExclusions] = useState<Exclusion[]>([]);
   const [storage, setStorage] = useState<StorageResult | null>(null);
   const [schedule, setSchedule] = useState<ScheduleState | null>(null);
+  const [history, setHistory] = useState<HistoryState | null>(null);
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [loadErrors, setLoadErrors] = useState<Partial<Record<OpsTab, string>>>({});
@@ -281,6 +303,15 @@ export function OperationsDialog({ initialTab = 'jobs', onClose, onChanged, onJo
     }
   }, [setLoadError]);
 
+  const loadHistory = useCallback(async () => {
+    try {
+      setHistory((await api<{ history: HistoryState }>('/api/history')).history);
+      setLoadError('history', '');
+    } catch (loadError) {
+      setLoadError('history', loadError instanceof Error ? loadError.message : String(loadError));
+    }
+  }, [setLoadError]);
+
   const loadSchedule = useCallback(async () => {
     try {
       setSchedule(await api<ScheduleState>('/api/schedule'));
@@ -294,8 +325,9 @@ export function OperationsDialog({ initialTab = 'jobs', onClose, onChanged, onJo
     if (tab === 'brig') void loadQuarantine();
     if (tab === 'storage') void loadStorage();
     if (tab === 'exclusions') void loadExclusions();
+    if (tab === 'history') void loadHistory();
     if (tab === 'schedule') void loadSchedule();
-  }, [loadExclusions, loadQuarantine, loadSchedule, loadStorage, tab]);
+  }, [loadExclusions, loadHistory, loadQuarantine, loadSchedule, loadStorage, tab]);
 
   useEffect(() => {
     let stopped = false;
@@ -404,6 +436,32 @@ export function OperationsDialog({ initialTab = 'jobs', onClose, onChanged, onJo
             const health = root.error ? 'error' : root.readable && root.writable ? 'healthy' : 'warning';
             return <article className="health-row" key={root.id}><div><span className={`app-chip ${root.app}`}>{root.app}</span><strong>{fallbackLabel(root.kind)}</strong><p>{root.path}</p></div><div><Status value={health} label={statusLabel(health, { healthy: 'Healthy', warning: 'Needs attention', error: 'Error' })} /><small>{root.freeBytes === null ? root.error : `${formatBytes(root.freeBytes)} free`}</small></div></article>;
           })}{storage?.compatibility.map((item) => <div className={`hardlink-check ${item.hardlinksPossible ? 'success' : 'warning'}`} key={`${item.app}-${item.downloadRoot}`}><strong>{item.hardlinksPossible ? 'Hardlinks possible' : 'Filesystem mismatch'}</strong><span>{item.downloadRoot}</span><p>{item.detail}</p></div>)}</div>}
+
+          {tab === 'history' && <div className="ops-list">
+            <article className="schedule-report">
+              <h3>Space reclaimed</h3>
+              <div><strong>{formatBytes(history?.totalReclaimedBytes ?? 0)}</strong><span>actually freed</span></div>
+              <div><strong>{formatBytes(history?.pendingPurgeBytes ?? 0)}</strong><span>held in the Brig</span></div>
+              <p>
+                Files moved to the Brig still occupy the filesystem. They only become free
+                space when purged, either from Quarantine or by the retention policy.
+              </p>
+            </article>
+            {!history?.runs.length && <div className="ops-empty"><h3>Nothing removed yet</h3><p>Completed file actions are recorded here with how much space each one freed.</p></div>}
+            {history?.runs.map((run) => <article className="record-card" key={run.id}>
+              <div>
+                <h3>{run.title ?? run.type}</h3>
+                <p>{run.fileCount} file{run.fileCount === 1 ? '' : 's'} · {new Date(run.completedAt).toLocaleString()}</p>
+                <small>
+                  {run.reclaimedBytes > 0 ? `${formatBytes(run.reclaimedBytes)} freed` : null}
+                  {run.reclaimedBytes > 0 && run.quarantinedBytes > 0 ? ' · ' : null}
+                  {run.quarantinedBytes > 0 ? `${formatBytes(run.quarantinedBytes)} moved to the Brig` : null}
+                  {run.reclaimedBytes === 0 && run.quarantinedBytes === 0 ? 'No space change recorded' : null}
+                </small>
+              </div>
+              <div><Status value={run.quarantinedBytes > 0 && run.reclaimedBytes === 0 ? 'quarantined' : 'completed'} label={run.quarantinedBytes > 0 && run.reclaimedBytes === 0 ? 'Recoverable' : 'Freed'} /></div>
+            </article>)}
+          </div>}
 
           {tab === 'exclusions' && <div className="ops-list">
             {!exclusions.length && <div className="ops-empty"><h3>Ignore list is empty</h3><p>Ignore selected untracked or size-limit scan results to keep them out of future findings. Removed items return on the next scan if they still match.</p></div>}

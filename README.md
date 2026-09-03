@@ -41,6 +41,7 @@ Both destructive automations are opt-in and disabled by default.
 - Brig interface for restoring or purging quarantined files
 - Optional automatic quarantine retention
 - Scheduled scan reports with generic, Discord, or Gotify webhooks
+- Reclaimed-space history that separates freed bytes from bytes still held in quarantine
 - Storage access, free-space, and filesystem compatibility checks
 - Installer checks that block normal updates during active file jobs
 
@@ -574,6 +575,30 @@ Webhook types are `generic` (JSON event and report), `discord` (Discord webhook
 URL), and `gotify` (a Gotify message endpoint including its application token).
 Webhook URLs are stored server-side and never returned to the browser. Leave
 the field blank when saving to keep the current URL, or use its removal switch.
+
+## Space reclaimed
+
+The dashboard's **Space reclaimed** card and **Operations → Reclaimed** report what
+Keelhaularr has actually achieved, kept deliberately in two separate figures:
+
+- **Actually freed** counts only bytes the filesystem has genuinely given back:
+  permanent removals, Brig purges, and quarantine-retention purges.
+- **Held in the Brig** counts quarantined files. These still occupy the filesystem
+  and become free space only when purged.
+
+Conflating the two is how a cleanup tool ends up claiming it freed space that `df`
+cannot see, so a quarantine run reports moved bytes and zero reclaimed bytes until
+the file is purged. The pending figure is read from the live Brig on every request
+rather than accumulated, so restoring or purging a file is reflected immediately.
+
+Each completed run is listed with its file count and what it freed. The latest 200
+runs are retained, and the cumulative total is kept separately so trimming old runs
+never rewrites it. A run is recorded against its job id, so a restart that
+re-finishes a job cannot double count.
+
+The manifest also reports where the space is concentrated - for example *Biggest 10
+account for 412.00 GiB of 890.00 GiB over limit - 46% of the total* - so you can act
+on the few files that matter instead of reading every row.
 
 ## Storage health
 

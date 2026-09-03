@@ -102,6 +102,34 @@ interface OrphanItem {
 
 type ManifestItem = OversizedItem | OrphanItem;
 
+interface HistoryRun {
+  id: string;
+  jobId: string | null;
+  type: string;
+  action: string | null;
+  title: string | null;
+  completedAt: string;
+  fileCount: number;
+  reclaimedBytes: number;
+  quarantinedBytes: number;
+}
+
+interface ReclaimedSummary {
+  totalReclaimedBytes: number;
+  pendingPurgeBytes: number;
+  pendingPurgeCount: number;
+  runCount: number;
+  runs: HistoryRun[];
+}
+
+const emptyReclaimed = (): ReclaimedSummary => ({
+  totalReclaimedBytes: 0,
+  pendingPurgeBytes: 0,
+  pendingPurgeCount: 0,
+  runCount: 0,
+  runs: [],
+});
+
 interface QBittorrentPathDetail {
   name: string | null;
   hash: string | null;
@@ -487,6 +515,7 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [applying, setApplying] = useState(false);
   const [confirmationStage, setConfirmationStage] = useState<ConfirmationStage>('closed');
+  const [reclaimed, setReclaimed] = useState<ReclaimedSummary>(emptyReclaimed);
   const [replacements, setReplacements] = useState<Record<string, ReplacementVerdict>>({});
   const [checkingReplacements, setCheckingReplacements] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState(false);
@@ -522,9 +551,10 @@ export default function App() {
           setAuth('signed-out');
           return;
         }
-        const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary }>('/api/status');
+        const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary; reclaimed?: ReclaimedSummary }>('/api/status');
         setConfig(statusData.config);
         setIgnoreSummary(normalizeIgnoreSummary(statusData.ignoreSummary));
+        setReclaimed(statusData.reclaimed ?? emptyReclaimed());
         setArrConnections(pendingArrConnections(statusData.config));
         if (!statusData.config.radarr.configured && !statusData.config.sonarr.configured) setShowSettings(true);
         setAuth('signed-in');
@@ -719,6 +749,19 @@ export default function App() {
     });
   }, [filter, minimumGib, query, scan, sort, tab]);
   const selectedVisible = visible.filter((item) => selected.has(item.id));
+  // Where the space actually is: a handful of files usually dominate the total, and
+  // saying so is more actionable than a list of every finding.
+  const biggestWins = useMemo(() => {
+    const wasted = (item: ManifestItem) => (
+      tab === 'oversized' ? (item as OversizedItem).overageBytes : item.sizeBytes
+    );
+    const total = visible.reduce((sum, item) => sum + wasted(item), 0);
+    if (visible.length < 4 || total <= 0) return null;
+    const count = Math.min(10, visible.length);
+    const top = [...visible].sort((left, right) => wasted(right) - wasted(left)).slice(0, count);
+    const topTotal = top.reduce((sum, item) => sum + wasted(item), 0);
+    return { count, topTotal, total, share: Math.round((topTotal / total) * 100) };
+  }, [tab, visible]);
   const scanHasConnectionError = Boolean(scan && (
     scan.connections.radarr.status === 'error' || scan.connections.sonarr.status === 'error'
   ));
@@ -757,9 +800,10 @@ export default function App() {
   ].filter(Boolean).join(' ');
 
   async function signedIn() {
-    const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary }>('/api/status');
+    const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary; reclaimed?: ReclaimedSummary }>('/api/status');
     setConfig(statusData.config);
     setIgnoreSummary(normalizeIgnoreSummary(statusData.ignoreSummary));
+    setReclaimed(statusData.reclaimed ?? emptyReclaimed());
     setArrConnections(pendingArrConnections(statusData.config));
     if (!statusData.config.radarr.configured && !statusData.config.sonarr.configured) setShowSettings(true);
     setAuth('signed-in');
@@ -788,9 +832,10 @@ export default function App() {
     ignoreOverageRefreshSession.current += 1;
     setIgnoreOverageRefreshState('idle');
     setScanning(false);
-    const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary }>('/api/status');
+    const statusData = await api<{ config: PublicConfig; ignoreSummary?: IgnoreSummary; reclaimed?: ReclaimedSummary }>('/api/status');
     setConfig(statusData.config);
     setIgnoreSummary(normalizeIgnoreSummary(statusData.ignoreSummary));
+    setReclaimed(statusData.reclaimed ?? emptyReclaimed());
     setArrConnections(pendingArrConnections(statusData.config));
     setArrConnectionProbeRevision((current) => current + 1);
     setScan(null);
@@ -956,8 +1001,9 @@ export default function App() {
   }
 
   async function operationsChanged() {
-    const statusData = await api<{ ignoreSummary?: IgnoreSummary }>('/api/status');
+    const statusData = await api<{ ignoreSummary?: IgnoreSummary; reclaimed?: ReclaimedSummary }>('/api/status');
     setIgnoreSummary(normalizeIgnoreSummary(statusData.ignoreSummary));
+    setReclaimed(statusData.reclaimed ?? emptyReclaimed());
     if (scan) await runScan();
   }
 
@@ -1117,6 +1163,9 @@ export default function App() {
       <section className="stat-grid" aria-label="Scan summary">
         <article className="stat-card accent"><p>Files over size limits</p><strong>{scan?.oversized.length ?? '—'}</strong><span>{scan ? formatBytes(totalOversized) : 'Scan to inspect'}</span></article>
         <article className="stat-card"><p>Untracked files</p><strong>{scan?.orphans.length ?? '—'}</strong><span>{scan ? formatBytes(totalOrphans) : 'Not tracked by either app'}</span></article>
+        <article className="stat-card"><p>Space reclaimed</p><strong>{formatBytes(reclaimed.totalReclaimedBytes)}</strong><span>{reclaimed.pendingPurgeCount > 0
+          ? `${formatBytes(reclaimed.pendingPurgeBytes)} still held in the Brig`
+          : reclaimed.runCount > 0 ? `across ${reclaimed.runCount} completed run${reclaimed.runCount === 1 ? '' : 's'}` : 'No files removed yet'}</span></article>
         <article className="stat-card"><p>Size rules</p><div className="dual-orders"><strong>{config?.radarr.maxMbPerMinute ?? '—'} <small>Radarr</small></strong><strong>{config?.sonarr.maxMbPerMinute ?? '—'} <small>Sonarr</small></strong></div><span>MB/min before per-app tolerance</span></article>
       </section>
 
@@ -1183,7 +1232,8 @@ export default function App() {
                 <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search title, quality or path" aria-label="Search scan results" />
                 <label>Minimum {tab === 'oversized' ? 'overage' : 'size'}<span><input inputMode="decimal" value={minimumGib} onChange={(event) => setMinimumGib(event.target.value)} /> GiB</span></label>
                 <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="largest">Largest first</option>{tab === 'oversized' && <option value="overage">Most over limit</option>}<option value="title">Title</option>{tab === 'orphans' && <option value="oldest">Oldest first</option>}</select></label>
-                <div className="batch-tools"><label className="quick-select"><span className="sr-only">Quick select</span><select aria-label="Quick select" value="" disabled={!visible.length} onChange={(event) => { applyQuickSelect(event.target.value); event.currentTarget.value = ''; }}><option value="">Quick select…</option><option value="shown">Everything shown ({visible.length})</option>{tab === 'oversized' && <option value="x2">At least 2× its limit</option>}{tab === 'oversized' && <option value="x3">At least 3× its limit</option>}<option value="top10">Top 10 by wasted space</option><option value="top25">Top 25 by wasted space</option><option value="first25">First 25 in this order</option><option value="first100">First 100 in this order</option></select></label><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button>{tab === 'oversized' && <button type="button" onClick={() => { void checkReplacements(); }} disabled={!selectedVisible.length || applying || checkingReplacements.length > 0} title="Ask Radarr/Sonarr whether a release exists that fits your size limit. Nothing is deleted.">{checkingReplacements.length ? 'Checking indexers…' : 'Check replacements'}</button>}</div>
+                {biggestWins && <p className="biggest-wins">Biggest {biggestWins.count} account for {formatBytes(biggestWins.topTotal)} of {formatBytes(biggestWins.total)} {tab === 'oversized' ? 'over limit' : 'untracked'} — {biggestWins.share}% of the total.</p>}
+              <div className="batch-tools"><label className="quick-select"><span className="sr-only">Quick select</span><select aria-label="Quick select" value="" disabled={!visible.length} onChange={(event) => { applyQuickSelect(event.target.value); event.currentTarget.value = ''; }}><option value="">Quick select…</option><option value="shown">Everything shown ({visible.length})</option>{tab === 'oversized' && <option value="x2">At least 2× its limit</option>}{tab === 'oversized' && <option value="x3">At least 3× its limit</option>}<option value="top10">Top 10 by wasted space</option><option value="top25">Top 25 by wasted space</option><option value="first25">First 25 in this order</option><option value="first100">First 100 in this order</option></select></label><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button>{tab === 'oversized' && <button type="button" onClick={() => { void checkReplacements(); }} disabled={!selectedVisible.length || applying || checkingReplacements.length > 0} title="Ask Radarr/Sonarr whether a release exists that fits your size limit. Nothing is deleted.">{checkingReplacements.length ? 'Checking indexers…' : 'Check replacements'}</button>}</div>
               </div>
             </>}
 
