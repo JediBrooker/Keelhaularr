@@ -171,8 +171,62 @@ export function matchSizeRule(rules, { tags = [], root = null, quality = null } 
   }) ?? null;
 }
 
-function connection(kind, defaults, overrides) {
-  const prefix = kind.toUpperCase();
+const INSTANCE_KINDS = ['radarr', 'sonarr'];
+const MAX_INSTANCES = 12;
+// Ids become properties on the config object, so they must not shadow anything real.
+const RESERVED_INSTANCE_IDS = new Set([
+  'instances', 'port', 'username', 'password', 'sessionSecret', 'sessionDays',
+  'cookieSecure', 'defaults', 'qbittorrent', 'mediaServer', 'schedule', 'protected',
+  'orphanAction', 'orphanTrashDir', 'allowPermanentOrphanDelete', 'mediaExtensions',
+  'extensions', 'customIgnoreDirectories', 'ignoreDirectories', 'maxFiles',
+  'hardlinkMinAgeHours', 'quarantineRetentionDays', 'oversizeRequireReplacement',
+  'storageRoots',
+]);
+
+function defaultInstanceLabel(id, kind) {
+  if (id === 'radarr') return 'Radarr';
+  if (id === 'sonarr') return 'Sonarr';
+  return `${kind === 'sonarr' ? 'Sonarr' : 'Radarr'} (${id})`;
+}
+
+/**
+ * ARR_INSTANCES is a comma-separated list of `id:kind`, defaulting to the historical
+ * pair. Each instance reads its own `${ID}_*` environment, so the default list reads
+ * exactly the RADARR_* and SONARR_* variables it always did.
+ */
+function readInstances(defaults, overrides) {
+  const raw = (envValue('ARR_INSTANCES', overrides) ?? '').trim();
+  const entries = raw
+    ? raw.split(',').map((entry) => entry.trim()).filter(Boolean)
+    : ['radarr:radarr', 'sonarr:sonarr'];
+  if (entries.length > MAX_INSTANCES) {
+    throw new Error(`ARR_INSTANCES may list at most ${MAX_INSTANCES} instances`);
+  }
+
+  const seen = new Set();
+  const instances = entries.map((entry) => {
+    const [id, kind = id] = entry.split(':').map((part) => part.trim().toLowerCase());
+    if (!/^[a-z][a-z0-9]{0,31}$/.test(id)) {
+      throw new Error(`ARR_INSTANCES id "${id}" must be 1-32 letters and digits starting with a letter`);
+    }
+    if (!INSTANCE_KINDS.includes(kind)) {
+      throw new Error(`ARR_INSTANCES entry "${entry}" must declare kind radarr or sonarr`);
+    }
+    if (RESERVED_INSTANCE_IDS.has(id)) throw new Error(`ARR_INSTANCES id "${id}" is reserved`);
+    if (seen.has(id)) throw new Error(`ARR_INSTANCES id "${id}" is duplicated`);
+    seen.add(id);
+    return connection(id, kind, defaults, overrides);
+  });
+
+  if (!instances.some((instance) => instance.kind === 'radarr')
+    && !instances.some((instance) => instance.kind === 'sonarr')) {
+    throw new Error('ARR_INSTANCES must include at least one Radarr or Sonarr instance');
+  }
+  return instances;
+}
+
+function connection(id, kind, defaults, overrides) {
+  const prefix = id.toUpperCase();
   const url = (envValue(`${prefix}_URL`, overrides) ?? '').replace(/\/+$/, '');
   const apiKey = envValue(`${prefix}_API_KEY`, overrides) ?? '';
   const maxMbPerMinuteOverride = readOptionalNumber(`${prefix}_MAX_MB_PER_MIN`, overrides);
@@ -188,7 +242,9 @@ function connection(kind, defaults, overrides) {
   }
 
   return {
+    id,
     kind,
+    label: envValue(`${prefix}_LABEL`, overrides) || defaultInstanceLabel(id, kind),
     url,
     apiKey,
     configured: Boolean(url && apiKey),
@@ -301,17 +357,27 @@ export function getConfig(overrides = {}) {
     throw new Error('NOTIFICATION_TYPE must be generic, discord, or gotify');
   }
 
-  const radarr = connection('radarr', defaults, overrides);
-  const sonarr = connection('sonarr', defaults, overrides);
+  const instances = readInstances(defaults, overrides);
+  // The first instance of each kind keeps the ids `radarr` and `sonarr`, which is what
+  // makes this change safe: candidate ids, exclusion keys, quarantine records and job
+  // connection identities all embed the instance id, and every existing one of those
+  // was written with those exact literals.
+  const radarr = instances.find((instance) => instance.kind === 'radarr') ?? connection('radarr', 'radarr', defaults, {});
+  const sonarr = instances.find((instance) => instance.kind === 'sonarr') ?? connection('sonarr', 'sonarr', defaults, {});
   const qbittorrent = qbittorrentConnection(overrides);
   if (qbittorrent.recovery.enabled && !qbittorrent.configured) {
     throw new Error('qBittorrent automatic recovery requires a configured qBittorrent connection');
   }
-  if (qbittorrent.recovery.enabled && !radarr.configured && !sonarr.configured) {
+  if (qbittorrent.recovery.enabled && !instances.some((instance) => instance.configured)) {
     throw new Error('qBittorrent automatic recovery requires at least one configured Arr connection');
   }
 
   return {
+    instances,
+    // Every instance is also exposed under its own id, so the long-standing
+    // `config[candidate.app]` lookup keeps resolving the right connection without a
+    // single call site changing.
+    ...Object.fromEntries(instances.map((instance) => [instance.id, instance])),
     port: readNumber('PORT', 8787, overrides),
     username: envValue('APP_USERNAME', overrides) ?? 'captain',
     password: envValue('APP_PASSWORD', overrides) ?? '',
@@ -362,6 +428,12 @@ export function publicConfig(config) {
   return {
     radarr: expose(config.radarr),
     sonarr: expose(config.sonarr),
+    instances: (config.instances ?? []).map((instance) => ({
+      id: instance.id,
+      kind: instance.kind,
+      label: instance.label,
+      ...expose(instance),
+    })),
     qbittorrent: {
       configured: config.qbittorrent.configured,
       recovery: { ...config.qbittorrent.recovery },

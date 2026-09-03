@@ -33,8 +33,8 @@ async function directoryInfo(directory) {
 function configuredRoots(config) {
   return [...new Set([
     ...(config.storageRoots ?? []),
-    ...(config.radarr?.mediaRoots ?? []), ...(config.radarr?.downloadRoots ?? []),
-    ...(config.sonarr?.mediaRoots ?? []), ...(config.sonarr?.downloadRoots ?? []),
+    ...(config.instances ?? [config.radarr, config.sonarr].filter(Boolean))
+      .flatMap((instance) => [...(instance?.mediaRoots ?? []), ...(instance?.downloadRoots ?? [])]),
     ...(config.orphanTrashDir ? [config.orphanTrashDir] : []),
     ...COMMON_ROOTS,
   ].map((root) => path.resolve(root)))];

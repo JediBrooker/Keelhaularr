@@ -146,9 +146,13 @@ async function mapLimit(values, limit, work) {
   return results;
 }
 
-function baseResult(kind, configured) {
+function baseResult(app, configured) {
   return {
-    kind,
+    // `app` is the instance id and is what every candidate, exclusion key and job
+    // record is keyed on. `kind` is retained as an alias so existing consumers and
+    // stored records keep working.
+    app,
+    kind: app,
     status: configured ? 'connecting' : 'not-configured',
     version: null,
     candidates: [],
@@ -160,7 +164,7 @@ function baseResult(kind, configured) {
 }
 
 export async function scanRadarr(connection) {
-  const result = baseResult('radarr', connection.configured);
+  const result = baseResult(connection.id ?? 'radarr', connection.configured);
   if (!connection.configured) return result;
 
   try {
@@ -204,15 +208,15 @@ export async function scanRadarr(connection) {
       const limitBytes = configuredLimitBytes + toleranceBytes;
       const sizeBytes = safeSizeBytes(mediaFile.size);
       if (sizeBytes === null) continue;
-      const exclusionKeys = [`radarr:movie:${movie.id}`];
+      const exclusionKeys = [`${result.app}:movie:${movie.id}`];
       const overageBytes = recordOverageObservation(
-        result, 'radarr', exclusionKeys, sizeBytes, limitBytes,
+        result, result.app, exclusionKeys, sizeBytes, limitBytes,
       );
       if (overageBytes === 0) continue;
 
       result.candidates.push({
-        id: stableId('radarr', mediaFile.id, arrPath),
-        app: 'radarr',
+        id: stableId(result.app, mediaFile.id, arrPath),
+        app: result.app,
         fileId: Number(mediaFile.id),
         searchIds: [Number(movie.id)],
         exclusionKeys,
@@ -248,7 +252,7 @@ function episodeCode(episodes) {
 }
 
 export async function scanSonarr(connection) {
-  const result = baseResult('sonarr', connection.configured);
+  const result = baseResult(connection.id ?? 'sonarr', connection.configured);
   if (!connection.configured) return result;
 
   try {
@@ -320,17 +324,17 @@ export async function scanSonarr(connection) {
         const limitBytes = configuredLimitBytes + toleranceBytes;
         const sizeBytes = safeSizeBytes(mediaFile.size);
         if (sizeBytes === null) continue;
-        const exclusionKeys = fileEpisodes.map((episode) => `sonarr:episode:${episode.id}`);
+        const exclusionKeys = fileEpisodes.map((episode) => `${result.app}:episode:${episode.id}`);
         const overageBytes = recordOverageObservation(
-          result, 'sonarr', exclusionKeys, sizeBytes, limitBytes,
+          result, result.app, exclusionKeys, sizeBytes, limitBytes,
         );
         if (overageBytes === 0) continue;
 
         const code = episodeCode(fileEpisodes);
         const firstTitle = fileEpisodes.length === 1 ? fileEpisodes[0].title : `${fileEpisodes.length} episodes`;
         result.candidates.push({
-          id: stableId('sonarr', mediaFile.id, arrPath),
-          app: 'sonarr',
+          id: stableId(result.app, mediaFile.id, arrPath),
+          app: result.app,
           fileId: Number(mediaFile.id),
           searchIds: fileEpisodes.map((episode) => Number(episode.id)),
           exclusionKeys,
@@ -361,12 +365,54 @@ export async function scanSonarr(connection) {
   return result;
 }
 
+/**
+ * Scans every configured instance and returns the results keyed by instance id. The
+ * historical `radarr` and `sonarr` keys are always present, because the first instance
+ * of each kind keeps those exact ids.
+ */
 export async function scanArr(config) {
-  const [radarr, sonarr] = await Promise.all([
-    scanRadarr(config.radarr),
-    scanSonarr(config.sonarr),
-  ]);
-  return { radarr, sonarr };
+  const instances = arrInstances(config);
+  const results = await Promise.all(instances.map((instance) => (
+    instance.kind === 'sonarr' ? scanSonarr(instance) : scanRadarr(instance)
+  )));
+  const byId = Object.fromEntries(results.map((result) => [result.app, result]));
+  return {
+    radarr: byId.radarr ?? baseResult('radarr', false),
+    sonarr: byId.sonarr ?? baseResult('sonarr', false),
+    ...byId,
+  };
+}
+
+// Every scan result, in instance order, without the aliases appearing twice.
+export function arrScanResults(scan) {
+  const seen = new Set();
+  return Object.values(scan ?? {}).filter((result) => {
+    if (!result || typeof result !== 'object' || !result.app || seen.has(result.app)) return false;
+    seen.add(result.app);
+    return true;
+  });
+}
+
+/**
+ * The instance list, falling back to the historical pair so a hand-built config - in a
+ * test, or any caller that predates the registry - still resolves correctly.
+ */
+export function arrInstances(config) {
+  if (Array.isArray(config?.instances) && config.instances.length) return config.instances;
+  return [config?.radarr, config?.sonarr]
+    .filter(Boolean)
+    .map((connection, index) => ({ ...connection, id: connection.id ?? (index === 0 ? 'radarr' : 'sonarr') }));
+}
+
+// Durable jobs record the URL of every instance so a connection change can be detected
+// on resume. Keyed by instance id, which keeps jobs written before multi-instance
+// existed readable: they simply carry fewer keys.
+export function arrInstanceUrls(config) {
+  return Object.fromEntries(arrInstances(config).map((instance) => [instance.id, instance.url]));
+}
+
+export function allArrCandidates(scan) {
+  return arrScanResults(scan).flatMap((result) => result.candidates);
 }
 
 export async function deleteCandidate(connection, candidate) {
@@ -468,7 +514,7 @@ export async function resolveQbittorrentRecoveryOwnership(config, torrent) {
   const hash = normalizedHash(torrent?.hash);
   if (!hash) throw new Error('The qBittorrent torrent hash is missing or malformed.');
 
-  const configuredApps = ['radarr', 'sonarr'].filter((app) => config[app]?.configured);
+  const configuredApps = arrInstances(config).filter((instance) => instance.configured).map((instance) => instance.id);
   if (!configuredApps.length) throw new Error('Neither Radarr nor Sonarr is configured.');
   const inventories = await Promise.all(configuredApps.map(async (app) => ({
     app,
@@ -621,17 +667,19 @@ export async function replacementProgress(connection, candidate, commandId) {
 
 export async function applyOversized(config, requestedIds) {
   const current = await scanArr(config);
-  const candidates = [...current.radarr.candidates, ...current.sonarr.candidates];
+  const candidates = allArrCandidates(current);
   const requested = new Set(requestedIds);
   const selected = candidates.filter((candidate) => requested.has(candidate.id));
   const results = [];
-  const searchIds = { radarr: new Set(), sonarr: new Set() };
+  const searchIds = new Map();
 
   for (const candidate of selected) {
     const connection = config[candidate.app];
     try {
       await deleteCandidate(connection, candidate);
-      candidate.searchIds.forEach((id) => searchIds[candidate.app].add(id));
+      if (!searchIds.has(candidate.app)) searchIds.set(candidate.app, new Set());
+      const pending = searchIds.get(candidate.app);
+      candidate.searchIds.forEach((id) => pending.add(id));
       results.push({ id: candidate.id, title: candidate.title, app: candidate.app, status: 'deleted' });
     } catch (error) {
       results.push({
@@ -645,12 +693,12 @@ export async function applyOversized(config, requestedIds) {
   }
 
   const searchCommands = [];
-  for (const kind of ['radarr', 'sonarr']) {
-    const ids = [...searchIds[kind]];
+  for (const [app, pending] of searchIds) {
+    const ids = [...pending];
     if (!ids.length) continue;
     try {
-      const command = await queueSearch(config[kind], kind, ids);
-      searchCommands.push({ app: kind, status: 'queued', commandId: command?.id ?? null, count: ids.length });
+      const command = await queueSearch(config[app], config[app]?.kind ?? app, ids);
+      searchCommands.push({ app, status: 'queued', commandId: command?.id ?? null, count: ids.length });
     } catch (error) {
       searchCommands.push({
         app: kind,
