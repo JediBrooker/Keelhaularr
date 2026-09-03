@@ -13,6 +13,7 @@ import {
   scanArr,
 } from './arr.mjs';
 import { filterExcluded } from './exclusions.mjs';
+import { recordRun, summarizeJobOutcome } from './history.mjs';
 import {
   applyOrphanCandidate,
   assertCandidateUnchanged,
@@ -560,6 +561,7 @@ async function processOrphanItem(job, item, config) {
   await updateItem(job.id, item.id, (value) => {
     value.status = 'complete';
     value.phase = result.status;
+    value.removal = result.status === 'quarantined' ? 'quarantined' : 'deleted';
     value.outcome = result.status === 'quarantined' ? 'Moved to the Brig.' : 'Permanently deleted.';
     value.destination = result.destination;
   });
@@ -857,13 +859,23 @@ async function processJob(job) {
       });
     }
   }
-  await updateJob(job.id, (value) => {
+  const settled = await updateJob(job.id, (value) => {
     const failed = value.items.some((item) => item.status === 'failed');
     const cancelled = value.items.some((item) => item.status === 'cancelled');
     value.status = failed ? 'completed_with_errors' : cancelled ? 'cancelled' : 'completed';
     value.completedAt = new Date().toISOString();
     value.updatedAt = value.completedAt;
   });
+  if (settled) {
+    await recordRun({
+      jobId: settled.id,
+      type: settled.type,
+      action: settled.action ?? null,
+      title: settled.title,
+      completedAt: settled.completedAt,
+      ...summarizeJobOutcome(settled),
+    }).catch((error) => console.error('Could not record job history:', error));
+  }
 }
 
 async function runWorker() {

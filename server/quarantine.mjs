@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, copyFile, link, mkdir, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
+import { recordPurge } from './history.mjs';
 import { createJsonStore } from './state.mjs';
 
 const store = createJsonStore('quarantine.json', { version: 1, records: [] });
@@ -89,11 +90,11 @@ async function restoreRecord(id) {
   return { ...record, restoredAt: new Date().toISOString() };
 }
 
-export function purgeQuarantine(id) {
-  return serializeFileOperation(() => purgeRecord(id));
+export function purgeQuarantine(id, options) {
+  return serializeFileOperation(() => purgeRecord(id, options));
 }
 
-async function purgeRecord(id) {
+async function purgeRecord(id, { source = 'brig' } = {}) {
   const record = store.read().records.find((item) => item.id === id);
   if (!record) return null;
   await unlink(record.quarantinePath).catch((error) => {
@@ -102,6 +103,9 @@ async function purgeRecord(id) {
   await store.update((document) => {
     document.records = document.records.filter((item) => item.id !== id);
   });
+  // This is the point at which quarantined bytes actually become free space.
+  await recordPurge({ fileCount: 1, bytes: record.sizeBytes, source })
+    .catch((error) => console.error('Could not record purge history:', error));
   return { ...record, purgedAt: new Date().toISOString() };
 }
 
@@ -111,7 +115,7 @@ export async function cleanupExpiredQuarantine(retentionDays) {
   const expired = store.read().records.filter((record) => new Date(record.quarantinedAt).getTime() <= cutoff);
   const purged = [];
   for (const record of expired) {
-    const result = await purgeQuarantine(record.id);
+    const result = await purgeQuarantine(record.id, { source: 'retention' });
     if (result) purged.push(result);
   }
   return purged;
