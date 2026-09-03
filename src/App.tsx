@@ -4,7 +4,15 @@ import { ModalDialog } from './ModalDialog';
 import { OperationsDialog } from './OperationsDialog';
 import { SettingsDialog } from './SettingsDialog';
 
-type AppKind = 'radarr' | 'sonarr';
+// An instance id. 'radarr' and 'sonarr' are always present; further instances add
+// their own ids, so this can no longer be a two-value union.
+type AppKind = string;
+
+interface InstanceConfig extends PublicConnectionConfig {
+  id: string;
+  kind: 'radarr' | 'sonarr';
+  label: string;
+}
 type Tab = 'oversized' | 'orphans';
 type OrphanAction = 'quarantine' | 'permanent';
 type ConfirmationStage = 'closed' | 'choose' | 'preview' | 'permanent';
@@ -92,6 +100,7 @@ interface PublicConnectionConfig {
 interface PublicConfig {
   radarr: PublicConnectionConfig;
   sonarr: PublicConnectionConfig;
+  instances?: InstanceConfig[];
   qbittorrent: { configured: boolean };
   hardlinkMinAgeHours: number;
   oversizeRequireReplacement: boolean;
@@ -300,8 +309,19 @@ function formatGib(bytes: number) {
   return `${gib > 0 && gib < 0.01 ? '<0.01' : gib.toFixed(2)} GiB`;
 }
 
-function AppBadge({ app }: { app: AppKind }) {
-  return <span className={`app-chip ${app}`}>{app === 'radarr' ? 'Radarr' : 'Sonarr'}</span>;
+function instanceLabel(instances: InstanceConfig[] | undefined, app: AppKind) {
+  const match = instances?.find((instance) => instance.id === app);
+  if (match) return match.label;
+  if (app === 'radarr') return 'Radarr';
+  if (app === 'sonarr') return 'Sonarr';
+  return app;
+}
+
+function AppBadge({ app, instances }: { app: AppKind; instances?: InstanceConfig[] }) {
+  // The class keeps the kind so an extra Radarr is coloured like a Radarr.
+  const kind = instances?.find((instance) => instance.id === app)?.kind
+    ?? (app === 'sonarr' ? 'sonarr' : 'radarr');
+  return <span className={`app-chip ${kind}`}>{instanceLabel(instances, app)}</span>;
 }
 
 function Login({ setupRequired, onLogin }: { setupRequired: boolean; onLogin: () => void }) {
@@ -833,6 +853,24 @@ export default function App() {
       return right.sizeBytes - left.sizeBytes;
     });
   }, [filter, minimumGib, query, scan, sort, tab]);
+  const arrInstances = useMemo<InstanceConfig[]>(() => {
+    if (config?.instances?.length) return config.instances;
+    if (!config) return [];
+    return [
+      { ...config.radarr, id: 'radarr', kind: 'radarr', label: 'Radarr' },
+      { ...config.sonarr, id: 'sonarr', kind: 'sonarr', label: 'Sonarr' },
+    ];
+  }, [config]);
+
+  const filterOptions = useMemo(() => {
+    const configured = arrInstances.filter((instance) => instance.configured);
+    const shown = configured.length ? configured : arrInstances;
+    return [
+      { value: 'all', label: shown.length > 2 ? 'All apps' : 'Both apps' },
+      ...shown.map((instance) => ({ value: instance.id, label: instance.label })),
+    ];
+  }, [arrInstances]);
+
   const selectedVisible = visible.filter((item) => selected.has(item.id));
   // Where the space actually is: a handful of files usually dominate the total, and
   // saying so is more actionable than a list of every finding.
@@ -1341,7 +1379,7 @@ export default function App() {
             {scan && <>
               <div className="result-tools">
                 <div className="filters" role="group" aria-label="Filter by application">
-                  {(['all', 'radarr', 'sonarr'] as const).map((filterValue) => <button type="button" key={filterValue} aria-pressed={filter === filterValue} className={filter === filterValue ? 'active' : ''} onClick={() => setFilter(filterValue)}>{filterValue === 'all' ? 'Both apps' : filterValue === 'radarr' ? 'Radarr' : 'Sonarr'}</button>)}
+                  {filterOptions.map((option) => <button type="button" key={option.value} aria-pressed={filter === option.value} className={filter === option.value ? 'active' : ''} onClick={() => setFilter(option.value)}>{option.label}</button>)}
                 </div>
               </div>
               <div className="manifest-filters">
@@ -1364,9 +1402,9 @@ export default function App() {
             ) : visible.length === 0 ? (
               <div className="empty-state"><div aria-hidden="true">⌕</div><h4>No matching files</h4><p>{source.length} file(s) are hidden by the current filters.</p><button type="button" className="ghost-button" onClick={clearFilters}>Clear filters</button></div>
             ) : tab === 'oversized' ? (
-              <OversizedTable items={visible as OversizedItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} replacements={replacements} checking={checkingReplacements} />
+              <OversizedTable items={visible as OversizedItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} replacements={replacements} checking={checkingReplacements} instances={arrInstances} />
             ) : (
-              <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} />
+              <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} instances={arrInstances} />
             )}
 
             <p className="safety-note"><span aria-hidden="true">⚓</span>{tab === 'oversized' ? 'Remove tracked files through Radarr or Sonarr and search again, or ignore them in future size-limit scans. Remove an item from Operations → Ignore list to include it again.' : 'Quarantine or permanently delete selected files, or ignore their paths in future untracked-file scans. Remove a path from Operations → Ignore list to include it again.'}</p>
@@ -1401,11 +1439,11 @@ function SelectAll({ items, selected, onToggleAll }: { items: Array<{ id: string
   return <input type="checkbox" checked={checked} onChange={onToggleAll} aria-label="Select all visible files" />;
 }
 
-function OversizedTable({ items, selected, onToggle, onToggleAll, replacements, checking }: { items: OversizedItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; replacements: Record<string, ReplacementVerdict>; checking: string[] }) {
+function OversizedTable({ items, selected, onToggle, onToggleAll, replacements, checking, instances }: { items: OversizedItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; replacements: Record<string, ReplacementVerdict>; checking: string[]; instances: InstanceConfig[] }) {
   const checkingIds = new Set(checking);
-  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th><th>Replacement</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Title"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} /></td><td className="numeric" data-label="Actual size">{formatBytes(item.sizeBytes)}</td><td data-label="Allowed" title={limitSourceExplanation(item)}><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td data-label="Over by"><span className="excess-chip">+{formatBytes(item.overageBytes)}</span><div className="diagnosis-line" title={limitSourceExplanation(item)}>{oversizeDiagnosis(item)}</div></td><td data-label="Replacement"><ReplacementChip verdict={replacements[item.id]} checking={checkingIds.has(item.id)} /></td></tr>)}</tbody></table></div>;
+  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th><th>Replacement</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Title"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} instances={instances} /></td><td className="numeric" data-label="Actual size">{formatBytes(item.sizeBytes)}</td><td data-label="Allowed" title={limitSourceExplanation(item)}><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td data-label="Over by"><span className="excess-chip">+{formatBytes(item.overageBytes)}</span><div className="diagnosis-line" title={limitSourceExplanation(item)}>{oversizeDiagnosis(item)}</div></td><td data-label="Replacement"><ReplacementChip verdict={replacements[item.id]} checking={checkingIds.has(item.id)} /></td></tr>)}</tbody></table></div>;
 }
 
-function OrphanTable({ items, selected, onToggle, onToggleAll }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void }) {
-  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Untracked file"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} /></td><td className="numeric" data-label="Size">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell" data-label="Modified">{new Date(item.modifiedAt).toLocaleDateString()}</td></tr>)}</tbody></table></div>;
+function OrphanTable({ items, selected, onToggle, onToggleAll, instances }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; instances: InstanceConfig[] }) {
+  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Untracked file"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} instances={instances} /></td><td className="numeric" data-label="Size">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell" data-label="Modified">{new Date(item.modifiedAt).toLocaleDateString()}</td></tr>)}</tbody></table></div>;
 }
