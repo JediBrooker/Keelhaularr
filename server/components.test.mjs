@@ -82,7 +82,7 @@ test('successful connection tests re-probe the saved header connection state', (
   assert.notEqual(arrTestEnd, -1);
   const arrTest = settingsSource.slice(arrTestStart, arrTestEnd);
   const connectionTested = sourceSection(
-    "function connectionTested(app: AppKind | 'qbittorrent')",
+    "function connectionTested(app: AppKind | 'qbittorrent' | 'mediaServer')",
     'async function runScan()',
   );
 
@@ -340,7 +340,7 @@ test('dashboard ignore-list summary reports exact GiB totals and stays fresh', (
   );
   const signInAndSettingsRefresh = sourceSection(
     'async function signedIn()',
-    "function connectionTested(app: AppKind | 'qbittorrent')",
+    "function connectionTested(app: AppKind | 'qbittorrent' | 'mediaServer')",
   );
   const scanRefresh = sourceSection(
     'async function runScan()',

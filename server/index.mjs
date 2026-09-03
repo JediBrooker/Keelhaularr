@@ -28,6 +28,7 @@ import {
   stopJobWorker,
 } from './jobs.mjs';
 import { historySummary } from './history.mjs';
+import { inspectMediaServer } from './mediaserver.mjs';
 import { previewOrphans, previewOversized, summarizePreview } from './preview.mjs';
 import { scanOrphans } from './orphans.mjs';
 import { findReplacementsForCandidates } from './replacements.mjs';
@@ -302,6 +303,29 @@ app.get('/api/qbittorrent/status', async (request, response, next) => {
       incompleteTorrentCount: snapshot.incompleteTorrentCount,
       metadataPendingCount: snapshot.metadataPendingCount,
       unresolvedIncompleteCount: snapshot.unmappedIncompleteCount,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/mediaserver/status', async (request, response, next) => {
+  try {
+    const connection = currentConfig().mediaServer;
+    if (!connection.configured) {
+      const error = new Error('No media server is configured.');
+      error.statusCode = 400;
+      throw error;
+    }
+    const snapshot = await inspectMediaServer(connection);
+    response.json({
+      status: snapshot.status,
+      kind: connection.kind,
+      watchedWithinDays: connection.watchedWithinDays,
+      protectedCount: snapshot.protectedCount,
+      unmappedCount: snapshot.unmappedCount,
+      inProgressCount: snapshot.inProgressCount,
+      samples: snapshot.samples,
     });
   } catch (error) {
     next(error);

@@ -41,6 +41,7 @@ Both destructive automations are opt-in and disabled by default.
 - Brig interface for restoring or purging quarantined files
 - Optional automatic quarantine retention
 - Scheduled scan reports with generic, Discord, or Gotify webhooks
+- Optional Plex/Jellyfin/Emby watch guard that withholds recently played or in-progress media
 - Dry run that evaluates every safety gate per file and changes nothing
 - Reclaimed-space history that separates freed bytes from bytes still held in quarantine
 - Storage access, free-space, and filesystem compatibility checks
@@ -576,6 +577,41 @@ Webhook types are `generic` (JSON event and report), `discord` (Discord webhook
 URL), and `gotify` (a Gotify message endpoint including its application token).
 Webhook URLs are stored server-side and never returned to the browser. Leave
 the field blank when saving to keep the current URL, or use its removal switch.
+
+## Watch guard
+
+Nothing should delete a film someone is halfway through. Connect a media server in
+**Settings → Connections → Media server** and any file played within a configurable
+window, plus anything playing at that moment, is withheld from every file action:
+
+```dotenv
+MEDIA_SERVER_TYPE=jellyfin
+MEDIA_SERVER_URL=http://jellyfin:8096
+MEDIA_SERVER_TOKEN=your-api-key
+MEDIA_SERVER_WATCHED_WITHIN_DAYS=30
+MEDIA_SERVER_PATH_MAPS=/media/movies=>/movies;/media/tv=>/tv
+```
+
+Jellyfin, Emby, and Plex are supported. Jellyfin and Emby use an API key; Plex uses
+an `X-Plex-Token`. Both a URL and a token are required, because querying watch
+history without credentials would return nothing and look exactly like "nothing was
+watched". Leave the URL blank to disable the guard entirely.
+
+Like the qBittorrent guard, this **fails closed**. A configured media server that
+cannot be reached or authenticated preserves the file rather than removing it, and so
+does a watched path that cannot be mapped to a local path - because a path that
+cannot be resolved cannot be proven different from the file about to be removed. Add
+`MEDIA_SERVER_PATH_MAPS` when the media server sees different paths than
+Keelhaularr; mapping translates paths and does not mount storage.
+
+The guard is re-queried immediately before each file is changed, not merely when the
+job was approved, and it appears as its own gate in the dry run. An unconfigured
+media server is reported there as a warning rather than a pass, since recent viewing
+genuinely cannot be ruled out without one.
+
+The token is write-only. The browser only ever learns whether one exists, and
+changing the server URL requires re-entering it so a token is never replayed at a
+different server than the one it was entered for.
 
 ## Dry run
 

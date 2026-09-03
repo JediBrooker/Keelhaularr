@@ -926,7 +926,9 @@ export default function App() {
     setError('');
   }
 
-  function connectionTested(app: AppKind | 'qbittorrent') {
+  function connectionTested(app: AppKind | 'qbittorrent' | 'mediaServer') {
+    // The media server has no header pill to refresh; its test reports inline.
+    if (app === 'mediaServer') return;
     if (app === 'qbittorrent') {
       setQbittorrentProbeRevision((current) => current + 1);
       return;
