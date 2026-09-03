@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { localOversizeCandidate } from './jobs.mjs';
+import { assertNotRecentlyWatched } from './mediaserver.mjs';
 import { assertCandidateUnchanged, assertQbittorrentSafe, quarantineDestination } from './orphans.mjs';
 import { REPLACEMENT_AVAILABLE, findReplacements } from './replacements.mjs';
 
@@ -86,6 +87,14 @@ export async function previewOversized(config, candidates, {
         'Will be checked against your indexers immediately before removal. No compliant replacement means the file is preserved.'));
     }
 
+
+    gates.push(config.mediaServer?.configured
+      ? await runGate('Not recently watched', async () => {
+        await assertNotRecentlyWatched(config, candidate);
+        return `No play recorded in the last ${config.mediaServer.watchedWithinDays} day(s).`;
+      })
+      : gate('Not recently watched', 'warn', 'No media server is configured, so recent viewing cannot be ruled out.'));
+
     // 'warn' is advisory; only an outright failure makes a file ineligible.
     const blocking = gates.filter((entry) => entry.status === 'fail'
       && entry.name !== 'Recoverable afterwards');
@@ -130,6 +139,14 @@ export async function previewOrphans(config, candidates, { action = 'quarantine'
         candidate.source === 'download'
           ? 'qBittorrent is not configured, so incomplete torrents cannot be ruled out.'
           : 'Library file, not a completed download.'));
+
+
+    gates.push(config.mediaServer?.configured
+      ? await runGate('Not recently watched', async () => {
+        await assertNotRecentlyWatched(config, candidate);
+        return `No play recorded in the last ${config.mediaServer.watchedWithinDays} day(s).`;
+      })
+      : gate('Not recently watched', 'warn', 'No media server is configured, so recent viewing cannot be ruled out.'));
 
     if (action === 'quarantine') {
       destination = quarantineDestination(config, candidate, RUN_PLACEHOLDER);

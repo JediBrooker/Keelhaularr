@@ -123,6 +123,27 @@ function connection(kind, defaults, overrides) {
   };
 }
 
+const MEDIA_SERVER_KINDS = ['plex', 'jellyfin', 'emby'];
+
+function mediaServerConnection(overrides) {
+  const url = (envValue('MEDIA_SERVER_URL', overrides) ?? '').replace(/\/+$/, '');
+  const rawKind = (envValue('MEDIA_SERVER_TYPE', overrides) ?? 'jellyfin').toLowerCase();
+  if (url && !MEDIA_SERVER_KINDS.includes(rawKind)) {
+    throw new Error(`MEDIA_SERVER_TYPE must be one of ${MEDIA_SERVER_KINDS.join(', ')}`);
+  }
+  const token = envValue('MEDIA_SERVER_TOKEN', overrides) ?? '';
+  return {
+    kind: MEDIA_SERVER_KINDS.includes(rawKind) ? rawKind : 'jellyfin',
+    url,
+    token,
+    // Both a URL and a token are required: querying watch history without credentials
+    // would silently return nothing, which would look like "nothing was watched".
+    configured: Boolean(url && token),
+    pathMaps: readPathMaps('MEDIA_SERVER_PATH_MAPS', overrides),
+    watchedWithinDays: readBoundedInteger('MEDIA_SERVER_WATCHED_WITHIN_DAYS', 30, 1, 3650, overrides),
+  };
+}
+
 function qbittorrentConnection(overrides) {
   const url = (envValue('QBITTORRENT_URL', overrides) ?? '').replace(/\/+$/, '');
   return {
@@ -161,6 +182,7 @@ export function getConfig(overrides = {}) {
   const allowPermanentOrphanDelete = readBoolean('ALLOW_PERMANENT_ORPHAN_DELETE', false, overrides);
   // Opt-in so existing installations keep their current behaviour on upgrade.
   const oversizeRequireReplacement = readBoolean('OVERSIZE_REQUIRE_REPLACEMENT', false, overrides);
+  const mediaServer = mediaServerConnection(overrides);
   if (orphanAction === 'permanent' && !allowPermanentOrphanDelete) {
     throw new Error(
       'Set ALLOW_PERMANENT_ORPHAN_DELETE=true before using ORPHAN_ACTION=permanent',
@@ -224,6 +246,7 @@ export function getConfig(overrides = {}) {
       : null,
     allowPermanentOrphanDelete,
     oversizeRequireReplacement,
+    mediaServer,
     mediaExtensions,
     extensions: new Set(mediaExtensions),
     customIgnoreDirectories,
@@ -263,6 +286,11 @@ export function publicConfig(config) {
     hardlinkMinAgeHours: config.hardlinkMinAgeHours,
     quarantineRetentionDays: config.quarantineRetentionDays,
     oversizeRequireReplacement: config.oversizeRequireReplacement,
+    mediaServer: {
+      configured: config.mediaServer?.configured === true,
+      kind: config.mediaServer?.kind ?? 'jellyfin',
+      watchedWithinDays: config.mediaServer?.watchedWithinDays ?? 30,
+    },
     schedule: {
       enabled: config.schedule.enabled,
       intervalHours: config.schedule.intervalHours,

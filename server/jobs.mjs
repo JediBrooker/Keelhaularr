@@ -14,6 +14,7 @@ import {
 } from './arr.mjs';
 import { filterExcluded } from './exclusions.mjs';
 import { recordRun, summarizeJobOutcome } from './history.mjs';
+import { assertNotRecentlyWatched } from './mediaserver.mjs';
 import {
   applyOrphanCandidate,
   assertCandidateUnchanged,
@@ -443,6 +444,10 @@ async function processOversizeItem(job, item, config) {
     }
   }
 
+  // Withhold anything someone is watching, or has watched inside the window. Fails
+  // closed: a configured-but-unreachable media server preserves the file.
+  if (!alreadyRemoved) await assertNotRecentlyWatched(config, item.candidate);
+
   if (!alreadyRemoved) {
     const quarantining = job.action === 'quarantine';
     await updateItem(job.id, item.id, (value) => {
@@ -527,6 +532,7 @@ async function pathHasSize(filePath, expectedSize) {
 
 async function processOrphanItem(job, item, config) {
   const jobConfig = { ...config, orphanAction: job.action, orphanTrashDir: job.trashDir };
+  await assertNotRecentlyWatched(config, item.candidate);
   let destination = item.plannedDestination ?? null;
   if (job.action === 'quarantine' && !destination) {
     destination = quarantineDestination(jobConfig, item.candidate, `job-${job.id}-${item.id}`);

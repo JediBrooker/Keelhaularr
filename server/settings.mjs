@@ -11,6 +11,8 @@ const SETTINGS_KEYS = new Set([
   'SONARR_URL', 'SONARR_API_KEY', 'SONARR_MAX_MB_PER_MIN', 'SONARR_OVERSIZE_TOLERANCE_GIB',
   'SONARR_USE_ARR_QUALITY_DEFINITIONS', 'SONARR_INCLUDE_UNMONITORED', 'SONARR_MEDIA_ROOTS', 'SONARR_DOWNLOAD_ROOTS', 'SONARR_PATH_MAPS',
   'QBITTORRENT_URL', 'QBITTORRENT_USERNAME', 'QBITTORRENT_PASSWORD', 'QBITTORRENT_PATH_MAPS',
+  'MEDIA_SERVER_TYPE', 'MEDIA_SERVER_URL', 'MEDIA_SERVER_TOKEN', 'MEDIA_SERVER_PATH_MAPS',
+  'MEDIA_SERVER_WATCHED_WITHIN_DAYS',
   'QBITTORRENT_RECOVERY_ENABLED', 'QBITTORRENT_RECOVERY_SLOW_KIB_PER_SECOND',
   'QBITTORRENT_RECOVERY_SLOW_MINUTES', 'QBITTORRENT_RECOVERY_STALLED_MINUTES',
   'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON',
@@ -213,6 +215,38 @@ function connectionOverrides(kind, input, output) {
   return { mediaRoots: roots, downloadRoots };
 }
 
+function mediaServerOverrides(input, output) {
+  if (input === undefined) return;
+  const settings = requiredObject(input, 'Media server');
+  const kind = stringValue(settings.kind ?? 'jellyfin', 'Media server type', { max: 32 }).toLowerCase();
+  if (!['plex', 'jellyfin', 'emby'].includes(kind)) {
+    inputError('Media server type must be Plex, Jellyfin, or Emby.');
+  }
+  const token = secretValue(settings.token ?? '', 'Media server token', { allowEmpty: true, max: 1024 });
+  const clearToken = booleanValue(settings.clearToken ?? false, 'Media server clear token');
+  if (token && clearToken) inputError('The media-server token cannot be replaced and cleared at the same time.');
+  const nextUrl = urlValue(settings.url, 'Media server URL');
+  const currentUrl = configuredString('MEDIA_SERVER_URL', output).replace(/\/+$/, '');
+  const currentToken = configuredString('MEDIA_SERVER_TOKEN', output);
+  // Re-authenticate when the target changes, so a token is never replayed at a
+  // different server than the one it was entered for.
+  if (nextUrl !== currentUrl && currentToken && !token && !clearToken) {
+    inputError('Enter the media-server token again when changing its URL.');
+  }
+
+  output.MEDIA_SERVER_TYPE = kind;
+  output.MEDIA_SERVER_URL = nextUrl;
+  output.MEDIA_SERVER_PATH_MAPS = pathMappings(settings.pathMaps, 'Media server path maps')
+    .map(({ from, to }) => `${from}=>${to}`).join(';');
+  output.MEDIA_SERVER_WATCHED_WITHIN_DAYS = numberValue(
+    settings.watchedWithinDays ?? 30,
+    'Recently-watched window',
+    { min: 1, max: 3650, integer: true },
+  ).toString();
+  if (token) output.MEDIA_SERVER_TOKEN = token;
+  if (clearToken) output.MEDIA_SERVER_TOKEN = '';
+}
+
 function qbittorrentOverrides(input, output) {
   if (input === undefined) return;
   const settings = requiredObject(input, 'qBittorrent');
@@ -315,6 +349,13 @@ export function settingsView(config) {
       pathMaps: config.qbittorrent.pathMaps,
       recovery: { ...config.qbittorrent.recovery },
     },
+    mediaServer: {
+      kind: config.mediaServer?.kind ?? 'jellyfin',
+      url: config.mediaServer?.url ?? '',
+      tokenConfigured: Boolean(config.mediaServer?.token),
+      pathMaps: config.mediaServer?.pathMaps ?? [],
+      watchedWithinDays: config.mediaServer?.watchedWithinDays ?? 30,
+    },
     orphan: {
       trashDir: config.orphanTrashDir ?? '',
       ignoreDirectories: config.customIgnoreDirectories,
@@ -368,6 +409,7 @@ export function buildSettingsOverrides(input, currentOverrides) {
   const radarrPaths = connectionOverrides('radarr', root.radarr, output);
   const sonarrPaths = connectionOverrides('sonarr', root.sonarr, output);
   qbittorrentOverrides(root.qbittorrent, output);
+  mediaServerOverrides(root.mediaServer, output);
   if (configuredBoolean('QBITTORRENT_RECOVERY_ENABLED', output)) {
     if (!configuredString('QBITTORRENT_URL', output).trim()) {
       inputError('qBittorrent automatic recovery requires a configured qBittorrent connection.');

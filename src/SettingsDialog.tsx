@@ -3,7 +3,7 @@ import { DirectoryInput } from './DirectoryInput';
 import { ModalDialog } from './ModalDialog';
 
 type AppKind = 'radarr' | 'sonarr';
-type TestKind = AppKind | 'qbittorrent';
+type TestKind = AppKind | 'qbittorrent' | 'mediaServer';
 type SettingsSectionKey = 'connections' | 'cleanup' | 'automation' | 'account' | 'system';
 
 const settingsSectionLabels: Record<SettingsSectionKey, string> = {
@@ -75,6 +75,7 @@ interface SettingsData {
   radarr: ConnectionSettings;
   sonarr: ConnectionSettings;
   qbittorrent: QBittorrentSettings;
+  mediaServer: MediaServerSettings;
   orphan: {
     trashDir: string;
     ignoreDirectories: string[];
@@ -144,6 +145,7 @@ interface SettingsForm {
   radarr: ConnectionForm;
   sonarr: ConnectionForm;
   qbittorrent: QBittorrentForm;
+  mediaServer: MediaServerForm;
   orphan: {
     trashDir: string;
     ignoreDirectoriesText: string;
@@ -191,6 +193,80 @@ function connectionForm(settings: ConnectionSettings): ConnectionForm {
   };
 }
 
+interface MediaServerSettings {
+  kind: 'plex' | 'jellyfin' | 'emby';
+  url: string;
+  tokenConfigured: boolean;
+  pathMaps: Array<{ from: string; to: string }>;
+  watchedWithinDays: number;
+}
+
+interface MediaServerForm {
+  kind: 'plex' | 'jellyfin' | 'emby';
+  url: string;
+  token: string;
+  tokenConfigured: boolean;
+  clearToken: boolean;
+  pathMapsText: string;
+  watchedWithinDays: string;
+}
+
+function mediaServerForm(settings: MediaServerSettings): MediaServerForm {
+  return {
+    kind: settings.kind,
+    url: settings.url,
+    token: '',
+    tokenConfigured: settings.tokenConfigured,
+    clearToken: false,
+    pathMapsText: settings.pathMaps.map(({ from, to }) => `${from}=>${to}`).join('\n'),
+    watchedWithinDays: settings.watchedWithinDays.toString(),
+  };
+}
+
+const mediaServerLabels: Record<MediaServerForm['kind'], string> = {
+  plex: 'Plex',
+  jellyfin: 'Jellyfin',
+  emby: 'Emby',
+};
+
+function MediaServerSection({ form, testing, testMessage, onChange, onTest }: {
+  form: MediaServerForm;
+  testing: boolean;
+  testMessage: string;
+  onChange: (next: MediaServerForm) => void;
+  onTest: () => void;
+}) {
+  const update = <K extends keyof MediaServerForm>(key: K, value: MediaServerForm[K]) => onChange({ ...form, [key]: value });
+  const label = mediaServerLabels[form.kind];
+  return (
+    <section className="settings-section">
+      <div className="settings-section-head">
+        <div><span className="app-chip qbittorrent">Watch guard</span><h3>Media server</h3></div>
+        <button type="button" className="ghost-button compact" onClick={onTest} disabled={testing || !form.url || form.clearToken}>
+          {testing ? 'Testing…' : 'Test connection'}
+        </button>
+      </div>
+      {testMessage && <p className={`connection-result ${testMessage.startsWith('Connected') ? 'success' : 'error'}`}>{testMessage}</p>}
+      <div className="settings-grid two">
+        <label className="field">Server type<select value={form.kind} onChange={(event) => update('kind', event.target.value as MediaServerForm['kind'])}>
+          <option value="jellyfin">Jellyfin</option>
+          <option value="emby">Emby</option>
+          <option value="plex">Plex</option>
+        </select></label>
+        <label className="field">Recently-watched window (days)<input type="number" min="1" max="3650" value={form.watchedWithinDays} onChange={(event) => update('watchedWithinDays', event.target.value)} /></label>
+        <label className="field wide-field">{label} URL<input type="url" value={form.url} onChange={(event) => update('url', event.target.value)} placeholder={form.kind === 'plex' ? 'http://plex:32400' : 'http://jellyfin:8096'} /></label>
+        <label className="field wide-field">{form.kind === 'plex' ? 'X-Plex-Token' : 'API key'}<input type="password" value={form.token} onChange={(event) => update('token', event.target.value)} autoComplete="new-password" placeholder={form.tokenConfigured ? 'Saved — leave blank to keep it' : 'Required to read watch history'} /></label>
+        {form.tokenConfigured && <label className="check-row wide-field"><input type="checkbox" checked={form.clearToken} onChange={(event) => update('clearToken', event.target.checked)} />Remove the saved {label} token and disable the watch guard</label>}
+        <p className="field-hint wide-field">Files played within the window, and anything playing right now, are withheld from every file action. Leave the URL blank to disable the guard. If a configured server cannot be reached, or reports a path that cannot be mapped, files are preserved rather than removed.</p>
+        <details className="advanced-settings wide-field" open={Boolean(form.pathMapsText.trim())}>
+          <summary>Path mapping <span>Required when {label} reports different paths</span></summary>
+          <div><p>Map the path {label} reports to the same folder inside Keelhaularr. For example, <code>/media/movies=&gt;/movies</code>. This translates paths; it does not mount storage.</p><label className="field">Mappings<textarea rows={2} value={form.pathMapsText} onChange={(event) => update('pathMapsText', event.target.value)} placeholder="/media/movies=>/movies" /></label></div>
+        </details>
+      </div>
+    </section>
+  );
+}
+
 function qbittorrentForm(settings: QBittorrentSettings): QBittorrentForm {
   return {
     url: settings.url,
@@ -226,6 +302,7 @@ function formFromSettings(settings: SettingsData): SettingsForm {
     radarr: connectionForm(settings.radarr),
     sonarr: connectionForm(settings.sonarr),
     qbittorrent: qbittorrentForm(settings.qbittorrent),
+    mediaServer: mediaServerForm(settings.mediaServer),
     orphan: {
       trashDir: settings.orphan.trashDir,
       ignoreDirectoriesText: settings.orphan.ignoreDirectories.join(', '),
@@ -473,13 +550,46 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
   const titleRef = useRef<HTMLHeadingElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [section, setSection] = useState<SettingsSectionKey>('connections');
+  const updateMediaServer = (next: MediaServerForm) => {
+    setForm((current) => current ? { ...current, mediaServer: next } : current);
+  };
+
+  // The status endpoint reads the saved connection, so an unsaved URL or token has to
+  // be saved first. Stated plainly rather than failing mysteriously.
+  async function testMediaServer() {
+    if (!form) return;
+    setTesting('mediaServer');
+    setTestMessages((current) => ({ ...current, mediaServer: '' }));
+    try {
+      const result = await api<{
+        kind: string; watchedWithinDays: number; protectedCount: number;
+        unmappedCount: number; inProgressCount: number;
+      }>('/api/mediaserver/status');
+      const unmapped = result.unmappedCount
+        ? ` · ${result.unmappedCount} path${result.unmappedCount === 1 ? '' : 's'} need mapping`
+        : '';
+      setTestMessages((current) => ({
+        ...current,
+        mediaServer: `Connected to ${result.kind}. ${result.protectedCount} file${result.protectedCount === 1 ? '' : 's'} protected from the last ${result.watchedWithinDays} day(s), ${result.inProgressCount} playing now${unmapped}.`,
+      }));
+      onConnectionTested?.('mediaServer');
+    } catch (testError) {
+      setTestMessages((current) => ({
+        ...current,
+        mediaServer: testError instanceof Error ? testError.message : String(testError),
+      }));
+    } finally {
+      setTesting(null);
+    }
+  }
+
   const [form, setForm] = useState<SettingsForm | null>(null);
   const [loadingError, setLoadingError] = useState('');
   const [saveError, setSaveError] = useState('');
   const [saved, setSaved] = useState('');
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState<TestKind | null>(null);
-  const [testMessages, setTestMessages] = useState<Record<TestKind, string>>({ radarr: '', sonarr: '', qbittorrent: '' });
+  const [testMessages, setTestMessages] = useState<Record<TestKind, string>>({ radarr: '', sonarr: '', qbittorrent: '', mediaServer: '' });
   const [savedQbittorrentConfigured, setSavedQbittorrentConfigured] = useState(false);
   const [categoryDiscovery, setCategoryDiscovery] = useState<QBittorrentCategoryDiscovery>({
     categories: [], loading: false, loaded: false, error: '',
@@ -644,6 +754,14 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
               excludedCategories: [...form.qbittorrent.recovery.excludedCategories],
             },
           },
+          mediaServer: {
+            kind: form.mediaServer.kind,
+            url: form.mediaServer.url,
+            token: form.mediaServer.token,
+            clearToken: form.mediaServer.clearToken,
+            pathMaps: pathMapsFromText(form.mediaServer.pathMapsText, 'Media server'),
+            watchedWithinDays: numeric(form.mediaServer.watchedWithinDays, 'Recently-watched window'),
+          },
           orphan: {
             trashDir: form.orphan.trashDir,
             ignoreDirectories: listFromText(form.orphan.ignoreDirectoriesText, /[,\n]/),
@@ -712,6 +830,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
                 {section === 'connections' && <>
                   <ArrConnectionSection app="radarr" form={form.radarr} testing={testing === 'radarr'} testMessage={testMessages.radarr} onChange={(next) => updateConnection('radarr', next)} onTest={() => testConnection('radarr')} />
                   <ArrConnectionSection app="sonarr" form={form.sonarr} testing={testing === 'sonarr'} testMessage={testMessages.sonarr} onChange={(next) => updateConnection('sonarr', next)} onTest={() => testConnection('sonarr')} />
+                  <MediaServerSection form={form.mediaServer} testing={testing === 'mediaServer'} testMessage={testMessages.mediaServer} onChange={updateMediaServer} onTest={testMediaServer} />
                   <QBittorrentConnectionSection form={form.qbittorrent} testing={testing === 'qbittorrent'} testMessage={testMessages.qbittorrent} onChange={updateQbittorrent} onTest={testQbittorrent} />
                 </>}
 
