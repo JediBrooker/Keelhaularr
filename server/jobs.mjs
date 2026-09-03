@@ -365,7 +365,7 @@ function summarizeReplacementVerdict(verdict) {
 // revalidation the orphan path uses. Refuses when the file cannot be located inside a
 // configured media root, or when what is on disk no longer matches what Arr reported -
 // a size mismatch means the Arr record is stale and the file may already be compliant.
-async function localOversizeCandidate(candidate) {
+export async function localOversizeCandidate(candidate) {
   const localPath = candidate.localPath ? path.resolve(candidate.localPath) : null;
   const root = candidate.root ? path.resolve(candidate.root) : null;
   if (!localPath || !root) {
