@@ -55,6 +55,7 @@ test('reclaimed-space accounting separates freed bytes from bytes still held in 
   await once(mock, 'listening');
   const mockPort = mock.address().port;
 
+  let child = null;
   const sock = net.createServer();
   sock.listen(0, '127.0.0.1');
   await once(sock, 'listening');
@@ -62,8 +63,14 @@ test('reclaimed-space accounting separates freed bytes from bytes still held in 
   sock.close();
   await once(sock, 'close');
 
-  const child = spawn(process.execPath, ['server/index.mjs'], {
-  cwd: '/home/user/Keelhaularr',
+  context.after(async () => {
+    child?.kill('SIGTERM');
+    mock.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  child = spawn(process.execPath, ['server/index.mjs'], {
+  cwd: path.resolve('.'),
   env: {
     ...process.env,
     CONFIG_DIR: path.join(root, 'config'), PORT: String(appPort),
@@ -82,10 +89,16 @@ test('reclaimed-space accounting separates freed bytes from bytes still held in 
   child.stderr.on('data', (c) => { log += c; });
 
   const base = `http://127.0.0.1:${appPort}`;
-  for (let i = 0; i < 200; i += 1) {
-  try { if ((await fetch(`${base}/api/auth/status`)).ok) break; } catch {}
-  await new Promise((r) => setTimeout(r, 50));
+  let booted = false;
+  for (let i = 0; i < 200 && !booted; i += 1) {
+    if (child.exitCode !== null) {
+      throw new Error(`Server exited with code ${child.exitCode} before answering:\n${log}`);
+    }
+    try { booted = (await fetch(`${base}/api/auth/status`)).ok; } catch {}
+    if (!booted) await new Promise((r) => setTimeout(r, 50));
   }
+  if (!booted) throw new Error(`Server never answered ${base}.${log ? ` Output:\n${log}` : ''}`);
+
   const login = await fetch(`${base}/api/auth/login`, {
   method: 'POST', headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ username: 'captain', password: 'pw' }),
@@ -145,10 +158,4 @@ test('reclaimed-space accounting separates freed bytes from bytes still held in 
   assert.equal(h3.runCount, 3);
 
 
-
-  context.after(async () => {
-    child.kill('SIGTERM');
-    mock.close();
-    await rm(root, { recursive: true, force: true });
-  });
 });
