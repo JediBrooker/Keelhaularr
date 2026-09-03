@@ -90,6 +90,87 @@ function readPathMaps(name, overrides) {
   }).sort((a, b) => b.from.length - a.from.length);
 }
 
+const MAX_SIZE_RULES = 50;
+
+/**
+ * Ordered size rules. Each rule narrows by tag, media root and/or quality, and carries
+ * its own MB/min and tolerance. The first rule that matches a file wins; a file that
+ * matches nothing falls through to the connection's own limit, so adding rules can
+ * never change how an unmatched file is judged.
+ *
+ * Validated exactly as strictly as the connection defaults: a rule that would produce a
+ * zero, negative or non-finite limit is rejected at load rather than silently flagging
+ * an entire library.
+ */
+function readSizeRules(name, overrides) {
+  const raw = envValue(name, overrides);
+  if (raw === undefined || raw.trim() === '') return [];
+  let values;
+  try {
+    values = JSON.parse(raw);
+  } catch {
+    throw new Error(`${name} must be a JSON array of size rules`);
+  }
+  if (!Array.isArray(values)) throw new Error(`${name} must be a JSON array of size rules`);
+  if (values.length > MAX_SIZE_RULES) {
+    throw new Error(`${name} must contain at most ${MAX_SIZE_RULES} rules`);
+  }
+
+  return values.map((value, index) => {
+    const position = `${name}[${index}]`;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`${position} must be an object`);
+    }
+    const text = (field) => {
+      const candidate = value[field];
+      if (candidate === undefined || candidate === null || candidate === '') return null;
+      if (typeof candidate !== 'string' || candidate.length > 256) {
+        throw new Error(`${position}.${field} must be a string of at most 256 characters`);
+      }
+      return candidate.trim().toLowerCase() || null;
+    };
+    const tag = text('tag');
+    const root = value.root === undefined || value.root === null || value.root === ''
+      ? null
+      : path.resolve(String(value.root));
+    const quality = text('quality');
+    if (!tag && !root && !quality) {
+      throw new Error(`${position} must match on at least one of tag, root or quality`);
+    }
+
+    const maxMbPerMinute = Number(value.maxMbPerMinute);
+    if (!Number.isFinite(maxMbPerMinute) || maxMbPerMinute <= 0) {
+      throw new Error(`${position}.maxMbPerMinute must be a number greater than zero`);
+    }
+    const toleranceGib = value.toleranceGib === undefined ? 0 : Number(value.toleranceGib);
+    if (!Number.isFinite(toleranceGib) || toleranceGib < 0) {
+      throw new Error(`${position}.toleranceGib cannot be negative`);
+    }
+    const label = typeof value.label === 'string' && value.label.trim()
+      ? value.label.trim().slice(0, 120)
+      : [tag && `tag ${tag}`, root && `root ${root}`, quality && `quality ${quality}`]
+        .filter(Boolean).join(' + ');
+
+    return { label, tag, root, quality, maxMbPerMinute, toleranceGib };
+  });
+}
+
+/**
+ * First match wins. A rule matches only when EVERY criterion it specifies matches, so a
+ * narrower rule placed first can carve an exception out of a broader one below it.
+ */
+export function matchSizeRule(rules, { tags = [], root = null, quality = null } = {}) {
+  const tagSet = new Set(tags.filter(Boolean).map((tag) => String(tag).toLowerCase()));
+  const resolvedRoot = root ? path.resolve(root) : null;
+  const qualityName = quality ? String(quality).toLowerCase() : null;
+  return rules.find((rule) => {
+    if (rule.tag && !tagSet.has(rule.tag)) return false;
+    if (rule.root && rule.root !== resolvedRoot) return false;
+    if (rule.quality && rule.quality !== qualityName) return false;
+    return true;
+  }) ?? null;
+}
+
 function connection(kind, defaults, overrides) {
   const prefix = kind.toUpperCase();
   const url = (envValue(`${prefix}_URL`, overrides) ?? '').replace(/\/+$/, '');
@@ -120,6 +201,7 @@ function connection(kind, defaults, overrides) {
     mediaRoots: readRoots(`${prefix}_MEDIA_ROOTS`, overrides),
     downloadRoots: readRoots(`${prefix}_DOWNLOAD_ROOTS`, overrides),
     pathMaps: readPathMaps(`${prefix}_PATH_MAPS`, overrides),
+    sizeRules: readSizeRules(`${prefix}_SIZE_RULES_JSON`, overrides),
   };
 }
 
@@ -274,6 +356,7 @@ export function publicConfig(config) {
     includeUnmonitored: connectionConfig.includeUnmonitored,
     mediaRoots: connectionConfig.mediaRoots,
     downloadRoots: connectionConfig.downloadRoots,
+    sizeRules: connectionConfig.sizeRules ?? [],
   });
 
   return {

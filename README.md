@@ -34,6 +34,7 @@ Both destructive automations are opt-in and disabled by default.
 - Server-side folder autocomplete for library, completed-download, and quarantine paths
 - Durable background jobs, restart recovery, cancellation, retries, and item history
 - Replacement search/download status tracking
+- Per-tag, per-folder and per-quality size rules with their own limits
 - Optional per-quality size limits read directly from Radarr and Sonarr
 - Search, sorting, minimum-overage filters, predicate batch selection, and a persistent ignore list
 - Per-file explanation of why a file exceeds its limit, and where that limit came from
@@ -232,6 +233,35 @@ RADARR_OVERSIZE_TOLERANCE_GIB=1
 SONARR_MAX_MB_PER_MIN=85
 SONARR_OVERSIZE_TOLERANCE_GIB=1
 ```
+
+### Different limits for different media
+
+One MB/min rarely fits a whole library. Under each application's connection,
+**Size rules** lets you give tagged, foldered, or specific-quality media its own
+limit:
+
+```dotenv
+RADARR_SIZE_RULES_JSON=[{"label":"4K exempt","tag":"4k","maxMbPerMinute":900},{"label":"Anime","tag":"anime","maxMbPerMinute":40,"toleranceGib":0.5}]
+```
+
+Each rule matches on any combination of a Radarr/Sonarr **tag**, a **library
+folder**, and a **quality** name, and carries its own MB/min and tolerance. A rule
+applies only when *every* field it fills in matches, so a narrow rule placed above a
+broad one carves out an exception. Rules are checked in order and the first match
+wins.
+
+A file that matches no rule is judged exactly as it was before rules existed - the
+application's own limit, unchanged - so adding rules can never alter how untouched
+media is treated. A matching rule outranks the quality definition below; where no
+rule matches, quality definitions still apply as usual.
+
+Tag and quality names are matched exactly but ignore capitalisation. Tags are only
+fetched from the application when a rule actually matches on one, and if that request
+fails the scan still completes, warns, and falls back to the application's limit
+rather than misapplying a rule. A rule that would produce a zero or negative limit is
+rejected when settings are saved, not silently applied to a whole library.
+
+Each result row names the rule that set its limit, so it is obvious which one fired.
 
 Each application also has a **Use quality-definition limits** toggle in Settings:
 

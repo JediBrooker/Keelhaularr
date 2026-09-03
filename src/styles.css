@@ -224,3 +224,6 @@ body:has(.modal-dialog[open]){overflow:hidden}
 .preview-gates>li.fail>span:first-child{color:#9c3326}
 .preview-gates>li.warn>span:first-child,.preview-gates>li.unknown>span:first-child{color:#8a6516}
 .preview-gates em{color:var(--muted);font-style:normal}
+
+.size-rule-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));align-items:end;gap:8px;margin-bottom:10px;padding:10px;border:1px solid var(--line);border-radius:10px;background:rgba(255,255,255,.4)}
+.size-rule-row button{align-self:end}

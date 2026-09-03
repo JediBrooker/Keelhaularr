@@ -13,6 +13,7 @@ const SETTINGS_KEYS = new Set([
   'QBITTORRENT_URL', 'QBITTORRENT_USERNAME', 'QBITTORRENT_PASSWORD', 'QBITTORRENT_PATH_MAPS',
   'MEDIA_SERVER_TYPE', 'MEDIA_SERVER_URL', 'MEDIA_SERVER_TOKEN', 'MEDIA_SERVER_PATH_MAPS',
   'MEDIA_SERVER_WATCHED_WITHIN_DAYS',
+  'RADARR_SIZE_RULES_JSON', 'SONARR_SIZE_RULES_JSON',
   'QBITTORRENT_RECOVERY_ENABLED', 'QBITTORRENT_RECOVERY_SLOW_KIB_PER_SECOND',
   'QBITTORRENT_RECOVERY_SLOW_MINUTES', 'QBITTORRENT_RECOVERY_STALLED_MINUTES',
   'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON',
@@ -210,6 +211,7 @@ function connectionOverrides(kind, input, output) {
   output[`${prefix}_MEDIA_ROOTS`] = roots.join(',');
   output[`${prefix}_DOWNLOAD_ROOTS`] = downloadRoots.join(',');
   output[`${prefix}_PATH_MAPS`] = mappings.map(({ from, to }) => `${from}=>${to}`).join(';');
+  output[`${prefix}_SIZE_RULES_JSON`] = sizeRulesValue(settings.sizeRules, label);
   if (apiKey) output[`${prefix}_API_KEY`] = apiKey;
   if (clearApiKey) output[`${prefix}_API_KEY`] = '';
   return { mediaRoots: roots, downloadRoots };
@@ -320,6 +322,42 @@ export function buildQbittorrentTestConnection(input, currentConfig) {
   return { url, username, password, configured: true, pathMaps: mappings };
 }
 
+const MAX_SIZE_RULES = 50;
+
+function sizeRulesValue(value, label) {
+  if (value === undefined || value === null || value === '') return '';
+  if (!Array.isArray(value)) inputError(`${label} size rules must be a list.`);
+  if (!value.length) return '';
+  if (value.length > MAX_SIZE_RULES) inputError(`${label} allows at most ${MAX_SIZE_RULES} size rules.`);
+
+  const rules = value.map((entry, index) => {
+    const position = `${label} size rule ${index + 1}`;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) inputError(`${position} must be an object.`);
+    const optionalText = (field, name) => {
+      const candidate = entry[field];
+      if (candidate === undefined || candidate === null || candidate === '') return undefined;
+      return stringValue(candidate, `${position} ${name}`, { max: 256 });
+    };
+    const tag = optionalText('tag', 'tag');
+    const root = optionalText('root', 'root');
+    const quality = optionalText('quality', 'quality');
+    if (!tag && !root && !quality) {
+      inputError(`${position} must match on at least one of tag, folder or quality.`);
+    }
+    if (root && !path.isAbsolute(root)) inputError(`${position} folder must be an absolute container path.`);
+    const rule = {
+      maxMbPerMinute: numberValue(entry.maxMbPerMinute, `${position} MB/min`, { min: 0.01, max: 10000 }),
+      toleranceGib: numberValue(entry.toleranceGib ?? 0, `${position} tolerance`, { min: 0, max: 1000 }),
+    };
+    if (entry.label) rule.label = stringValue(entry.label, `${position} name`, { max: 120 });
+    if (tag) rule.tag = tag;
+    if (root) rule.root = root;
+    if (quality) rule.quality = quality;
+    return rule;
+  });
+  return JSON.stringify(rules);
+}
+
 export function settingsView(config) {
   const connection = (value) => ({
     url: value.url,
@@ -331,6 +369,14 @@ export function settingsView(config) {
     mediaRoots: value.mediaRoots,
     downloadRoots: value.downloadRoots,
     pathMaps: value.pathMaps,
+    sizeRules: (value.sizeRules ?? []).map((rule) => ({
+      label: rule.label,
+      tag: rule.tag,
+      root: rule.root,
+      quality: rule.quality,
+      maxMbPerMinute: rule.maxMbPerMinute,
+      toleranceGib: rule.toleranceGib,
+    })),
   });
   return {
     account: {
