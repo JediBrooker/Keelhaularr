@@ -21,7 +21,7 @@ const SETTINGS_KEYS = new Set([
   'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON',
   'ORPHAN_ACTION', 'ORPHAN_TRASH_DIR', 'ALLOW_PERMANENT_ORPHAN_DELETE',
   'ORPHAN_IGNORE_DIRECTORIES', 'ORPHAN_MAX_FILES', 'MEDIA_EXTENSIONS', 'HARDLINK_MIN_AGE_HOURS',
-  'QUARANTINE_RETENTION_DAYS', 'OVERSIZE_REQUIRE_REPLACEMENT',
+  'QUARANTINE_RETENTION_DAYS', 'OVERSIZE_REQUIRE_REPLACEMENT', 'ORPHAN_AUTO_IDENTIFY',
   'SCHEDULE_ENABLED', 'SCHEDULE_INTERVAL_HOURS',
   'NOTIFICATION_TYPE', 'NOTIFICATION_WEBHOOK_URL', 'NOTIFICATION_WHEN_CLEAR',
 ]);
@@ -412,6 +412,7 @@ export function settingsView(config) {
       hardlinkMinAgeHours: config.hardlinkMinAgeHours,
       retentionDays: config.quarantineRetentionDays,
       requireReplacement: config.oversizeRequireReplacement,
+      autoIdentify: config.orphanAutoIdentify,
     },
     schedule: {
       enabled: config.schedule.enabled,
@@ -525,6 +526,10 @@ export function buildSettingsOverrides(input, currentOverrides) {
   output.OVERSIZE_REQUIRE_REPLACEMENT = String(booleanValue(
     orphan.requireReplacement ?? configuredBoolean('OVERSIZE_REQUIRE_REPLACEMENT', output, false),
     'Require a compliant replacement',
+  ));
+  output.ORPHAN_AUTO_IDENTIFY = String(booleanValue(
+    orphan.autoIdentify ?? configuredBoolean('ORPHAN_AUTO_IDENTIFY', output, true),
+    'Identify untracked files automatically',
   ));
 
   output.SCHEDULE_ENABLED = String(booleanValue(schedule.enabled, 'Scheduled scans'));
