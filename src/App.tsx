@@ -14,7 +14,7 @@ interface InstanceConfig extends PublicConnectionConfig {
   label: string;
 }
 type Tab = 'oversized' | 'orphans';
-type OrphanAction = 'quarantine' | 'permanent';
+type OrphanAction = 'quarantine' | 'permanent' | 'import';
 type ConfirmationStage = 'closed' | 'choose' | 'preview' | 'permanent';
 type GateStatus = 'pass' | 'fail' | 'warn' | 'unknown';
 
@@ -51,6 +51,19 @@ interface PreviewState {
   summary: PreviewSummary | null;
 }
 type ReplacementStatus = 'available' | 'none' | 'unsupported' | 'error';
+// What an untracked file turns out to be. 'occupied' means the movie or episode it
+// belongs to already has a tracked file, so this copy is spare; 'importable' means the
+// library is missing it, so deleting it would lose the only copy.
+type IdentityStatus = 'importable' | 'occupied' | 'unidentified' | 'blocked' | 'unsupported' | 'error';
+
+interface IdentityVerdict {
+  id: string;
+  status: IdentityStatus;
+  reason: string | null;
+  title: string | null;
+  quality: string | null;
+  existing: { path: string | null; sizeBytes: number | null; quality: string | null } | null;
+}
 
 interface ReplacementRelease {
   title: string;
@@ -473,6 +486,33 @@ function ReplacementChip({ verdict, checking }: { verdict?: ReplacementVerdict; 
   );
 }
 
+function IdentityChip({ verdict, checking }: { verdict?: IdentityVerdict; checking: boolean }) {
+  if (checking) return <span className="replacement-chip pending">Identifying…</span>;
+  if (!verdict) return <span className="replacement-chip unknown">Not identified</span>;
+  if (verdict.status === 'occupied') {
+    // Green because this is the reassuring answer: the library already has this, so the
+    // copy on disk is spare and removing it loses nothing.
+    return (
+      <span className="replacement-chip available" title={verdict.reason ?? undefined}>
+        Spare copy{verdict.existing?.sizeBytes ? ` · library has ${formatBytes(verdict.existing.sizeBytes)}` : ''}
+      </span>
+    );
+  }
+  if (verdict.status === 'importable') {
+    // Red because deleting this would lose the only copy of something the library wants.
+    return (
+      <span className="replacement-chip none" title={verdict.reason ?? undefined}>
+        Missing from library{verdict.title ? ` · ${verdict.title}` : ''}
+      </span>
+    );
+  }
+  return (
+    <span className="replacement-chip error" title={verdict.reason ?? undefined}>
+      {verdict.status === 'blocked' ? 'Refused by the app' : verdict.status === 'unidentified' ? 'Not recognised' : 'Identification failed'}
+    </span>
+  );
+}
+
 function PreviewPanel({ state }: { state: PreviewState }) {
   if (state.loading) return <p className="confirm-note ok">Running every safety gate against your current library…</p>;
   if (state.error) return <p className="confirm-note warn">The dry run failed: {state.error}</p>;
@@ -511,17 +551,19 @@ function PreviewPanel({ state }: { state: PreviewState }) {
   );
 }
 
-function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireReplacement, preview, onDryRun, onCancel, onQuarantine, onChoosePermanent, onConfirmPermanent }: {
+function ConfirmDialog({ stage, tab, count, busy, replacementSummary, identitySummary, requireReplacement, preview, onDryRun, onCancel, onQuarantine, onImport, onChoosePermanent, onConfirmPermanent }: {
   stage: ConfirmationStage;
   tab: Tab;
   count: number;
   busy: boolean;
   onCancel: () => void;
   replacementSummary: { checked: number; available: number } | null;
+  identitySummary: { checked: number; importable: number; occupied: number } | null;
   requireReplacement: boolean;
   preview: PreviewState | null;
   onDryRun: () => void;
   onQuarantine: () => void;
+  onImport: () => void;
   onChoosePermanent: () => void;
   onConfirmPermanent: () => void;
 }) {
@@ -582,6 +624,13 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireRep
               : `All ${replacementSummary.checked} checked file(s) have a compliant replacement available.`}
           </p>
         )}
+        {!oversized && identitySummary && (
+          <p className={`confirm-note ${identitySummary.importable > 0 ? 'warn' : 'ok'}`}>
+            {identitySummary.importable > 0
+              ? `${identitySummary.importable} of ${identitySummary.checked} identified file(s) are missing from the library. Deleting those loses the only copy; importing hands them back to Radarr/Sonarr instead.`
+              : `All ${identitySummary.checked} identified file(s) are spare: the library already has a tracked copy of each.`}
+          </p>
+        )}
         {oversized && requireReplacement && (
           <p className="confirm-note ok">
             Each file is re-checked for a compliant replacement immediately before it is removed. Any file without one is preserved.
@@ -595,6 +644,11 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, requireRep
             </button>
           ) : <>
             {!previewing && <button type="button" className="ghost-button" onClick={onDryRun} disabled={busy || Boolean(preview?.loading)}>{preview?.loading ? 'DRY RUN…' : 'DRY RUN'}</button>}
+            {!oversized && (
+              <button type="button" className="ghost-button" onClick={onImport} disabled={busy} title="Hand these files back to Radarr/Sonarr, which will hardlink or move them into the library according to their own settings. Files whose movie or episode already has a tracked copy are refused.">
+                {busy ? 'IMPORTING…' : 'IMPORT INTO LIBRARY'}
+              </button>
+            )}
             <button type="button" className="primary-button" onClick={onQuarantine} disabled={busy}>
               {busy ? 'QUARANTINING…' : 'QUARANTINE'}
             </button>
@@ -623,6 +677,8 @@ export default function App() {
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [replacements, setReplacements] = useState<Record<string, ReplacementVerdict>>({});
   const [checkingReplacements, setCheckingReplacements] = useState<string[]>([]);
+  const [identities, setIdentities] = useState<Record<string, IdentityVerdict>>({});
+  const [identifying, setIdentifying] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [showOperations, setShowOperations] = useState(false);
   const [operationsTab, setOperationsTab] = useState<'jobs' | 'brig' | 'storage' | 'exclusions' | 'schedule'>('jobs');
@@ -1161,6 +1217,46 @@ export default function App() {
     }
   }
 
+  // Identifying makes Radarr or Sonarr read each folder off disk, so like the
+  // replacement check it is an explicit action rather than something a scan does.
+  const IDENTIFY_LIMIT = 200;
+
+  async function identifySelection() {
+    const batch = selectedVisible.slice(0, IDENTIFY_LIMIT).map((item) => item.id);
+    if (!batch.length) return;
+    setError('');
+    setIdentifying(batch);
+    try {
+      const result = await api<{ identifications: IdentityVerdict[] }>('/api/orphans/identify', {
+        method: 'POST',
+        body: JSON.stringify({ ids: batch }),
+      });
+      setIdentities((current) => {
+        const next = { ...current };
+        for (const verdict of result.identifications) next[verdict.id] = verdict;
+        return next;
+      });
+      if (selectedVisible.length > IDENTIFY_LIMIT) {
+        setMessage(`Identified the first ${IDENTIFY_LIMIT} of ${selectedVisible.length} selected files.`);
+      }
+    } catch (identifyError) {
+      setError(identifyError instanceof Error ? identifyError.message : String(identifyError));
+    } finally {
+      setIdentifying([]);
+    }
+  }
+
+  const identitySummary = useMemo(() => {
+    if (tab !== 'orphans') return null;
+    const identified = selectedVisible.filter((item) => identities[item.id]);
+    if (!identified.length) return null;
+    return {
+      checked: identified.length,
+      importable: identified.filter((item) => identities[item.id].status === 'importable').length,
+      occupied: identified.filter((item) => identities[item.id].status === 'occupied').length,
+    };
+  }, [identities, selectedVisible, tab]);
+
   const replacementSummary = useMemo(() => {
     if (tab !== 'oversized') return null;
     const checked = selectedVisible.filter((item) => replacements[item.id]);
@@ -1242,6 +1338,7 @@ export default function App() {
       setConfirmationStage('closed');
       setSelected(new Set());
       setReplacements({});
+      setIdentities({});
       setPreview(null);
       setOperationsTab('jobs');
       setShowOperations(true);
@@ -1387,7 +1484,7 @@ export default function App() {
                 <label>Minimum {tab === 'oversized' ? 'overage' : 'size'}<span><input inputMode="decimal" value={minimumGib} onChange={(event) => setMinimumGib(event.target.value)} /> GiB</span></label>
                 <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="largest">Largest first</option>{tab === 'oversized' && <option value="overage">Most over limit</option>}<option value="title">Title</option>{tab === 'orphans' && <option value="oldest">Oldest first</option>}</select></label>
                 {biggestWins && <p className="biggest-wins">Biggest {biggestWins.count} account for {formatBytes(biggestWins.topTotal)} of {formatBytes(biggestWins.total)} {tab === 'oversized' ? 'over limit' : 'untracked'} — {biggestWins.share}% of the total.</p>}
-              <div className="batch-tools"><label className="quick-select"><span className="sr-only">Quick select</span><select aria-label="Quick select" value="" disabled={!visible.length} onChange={(event) => { applyQuickSelect(event.target.value); event.currentTarget.value = ''; }}><option value="">Quick select…</option><option value="shown">Everything shown ({visible.length})</option>{tab === 'oversized' && <option value="x2">At least 2× its limit</option>}{tab === 'oversized' && <option value="x3">At least 3× its limit</option>}<option value="top10">Top 10 by wasted space</option><option value="top25">Top 25 by wasted space</option><option value="first25">First 25 in this order</option><option value="first100">First 100 in this order</option></select></label><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button>{tab === 'oversized' && <button type="button" onClick={() => { void checkReplacements(); }} disabled={!selectedVisible.length || applying || checkingReplacements.length > 0} title="Ask Radarr/Sonarr whether a release exists that fits your size limit. Nothing is deleted.">{checkingReplacements.length ? 'Checking indexers…' : 'Check replacements'}</button>}</div>
+              <div className="batch-tools"><label className="quick-select"><span className="sr-only">Quick select</span><select aria-label="Quick select" value="" disabled={!visible.length} onChange={(event) => { applyQuickSelect(event.target.value); event.currentTarget.value = ''; }}><option value="">Quick select…</option><option value="shown">Everything shown ({visible.length})</option>{tab === 'oversized' && <option value="x2">At least 2× its limit</option>}{tab === 'oversized' && <option value="x3">At least 3× its limit</option>}<option value="top10">Top 10 by wasted space</option><option value="top25">Top 25 by wasted space</option><option value="first25">First 25 in this order</option><option value="first100">First 100 in this order</option></select></label><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button>{tab === 'oversized' && <button type="button" onClick={() => { void checkReplacements(); }} disabled={!selectedVisible.length || applying || checkingReplacements.length > 0} title="Ask Radarr/Sonarr whether a release exists that fits your size limit. Nothing is deleted.">{checkingReplacements.length ? 'Checking indexers…' : 'Check replacements'}</button>}{tab === 'orphans' && <button type="button" onClick={() => { void identifySelection(); }} disabled={!selectedVisible.length || applying || identifying.length > 0} title="Ask Radarr/Sonarr what each file is, and whether the movie or episode it belongs to already has a tracked file. Nothing is moved or deleted.">{identifying.length ? 'Identifying…' : 'Identify'}</button>}</div>
               </div>
             </>}
 
@@ -1404,7 +1501,7 @@ export default function App() {
             ) : tab === 'oversized' ? (
               <OversizedTable items={visible as OversizedItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} replacements={replacements} checking={checkingReplacements} instances={arrInstances} />
             ) : (
-              <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} instances={arrInstances} />
+              <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} instances={arrInstances} identities={identities} identifyingIds={new Set(identifying)} />
             )}
 
             <p className="safety-note"><span aria-hidden="true">⚓</span>{tab === 'oversized' ? 'Remove tracked files through Radarr or Sonarr and search again, or ignore them in future size-limit scans. Remove an item from Operations → Ignore list to include it again.' : 'Quarantine or permanently delete selected files, or ignore their paths in future untracked-file scans. Remove a path from Operations → Ignore list to include it again.'}</p>
@@ -1421,9 +1518,11 @@ export default function App() {
         preview={preview}
         onDryRun={() => { void runDryRun(); }}
         replacementSummary={replacementSummary}
+        identitySummary={identitySummary}
         requireReplacement={Boolean(config?.oversizeRequireReplacement)}
         onCancel={() => { setConfirmationStage('closed'); setPreview(null); }}
         onQuarantine={() => { void applySelection('quarantine'); }}
+        onImport={() => { void applySelection('import'); }}
         onChoosePermanent={() => setConfirmationStage('permanent')}
         onConfirmPermanent={() => { void applySelection('permanent'); }}
       />
@@ -1444,6 +1543,6 @@ function OversizedTable({ items, selected, onToggle, onToggleAll, replacements, 
   return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th><th>Replacement</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Title"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} instances={instances} /></td><td className="numeric" data-label="Actual size">{formatBytes(item.sizeBytes)}</td><td data-label="Allowed" title={limitSourceExplanation(item)}><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td data-label="Over by"><span className="excess-chip">+{formatBytes(item.overageBytes)}</span><div className="diagnosis-line" title={limitSourceExplanation(item)}>{oversizeDiagnosis(item)}</div></td><td data-label="Replacement"><ReplacementChip verdict={replacements[item.id]} checking={checkingIds.has(item.id)} /></td></tr>)}</tbody></table></div>;
 }
 
-function OrphanTable({ items, selected, onToggle, onToggleAll, instances }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; instances: InstanceConfig[] }) {
-  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Untracked file"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} instances={instances} /></td><td className="numeric" data-label="Size">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell" data-label="Modified">{new Date(item.modifiedAt).toLocaleDateString()}</td></tr>)}</tbody></table></div>;
+function OrphanTable({ items, selected, onToggle, onToggleAll, instances, identities, identifyingIds }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; instances: InstanceConfig[]; identities: Record<string, IdentityVerdict>; identifyingIds: Set<string> }) {
+  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th><th>In the library?</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Untracked file"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} instances={instances} /></td><td className="numeric" data-label="Size">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell" data-label="Modified">{new Date(item.modifiedAt).toLocaleDateString()}</td><td data-label="In the library?"><IdentityChip verdict={identities[item.id]} checking={identifyingIds.has(item.id)} /></td></tr>)}</tbody></table></div>;
 }
