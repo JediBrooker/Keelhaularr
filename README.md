@@ -617,6 +617,13 @@ or permanently purge it. Restore refuses to overwrite an existing file. The
 original root must still be available to Keelhaularr. Metadata is retained when
 you change the quarantine folder, so existing recorded files remain manageable.
 
+The quarantine folder must sit outside every library and completed-download
+root, and Settings refuses one that does not. Nothing tracks a quarantined
+file, so a Brig inside a scanned root would be walked by the next scan and
+every file in it offered again as a fresh orphan. Scans skip a Brig they find
+inside a root anyway and say so, in case one was configured before this rule
+existed or set directly through `ORPHAN_TRASH_DIR`.
+
 Quarantine keeps all files indefinitely unless you set a retention period:
 
 ```dotenv

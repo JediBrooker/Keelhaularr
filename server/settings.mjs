@@ -491,6 +491,16 @@ export function buildSettingsOverrides(input, currentOverrides) {
 
   const trashDir = stringValue(orphan.trashDir, 'Quarantine directory', { allowEmpty: true });
   if (trashDir && !path.isAbsolute(trashDir)) inputError('Quarantine directory must be an absolute container path.');
+  // The folder browser will happily offer a folder inside the library, and a Brig there
+  // means every quarantined file is found again by the next scan and offered as a fresh
+  // orphan - because nothing tracks it any more. Scans skip it defensively, but the
+  // configuration itself is wrong and is refused here, the same way two scan roots
+  // cannot contain one another.
+  for (const scanRoot of trashDir ? scanRoots : []) {
+    if (pathsOverlap(trashDir, scanRoot.value)) {
+      inputError(`Quarantine directory and ${scanRoot.label.toLowerCase()} must be separate and cannot contain one another.`);
+    }
+  }
   const ignoreDirectories = stringArray(orphan.ignoreDirectories, 'Ignored directories');
   for (const directory of ignoreDirectories) {
     if (directory.includes('/') || directory.includes('\\') || directory.includes(',')) {
