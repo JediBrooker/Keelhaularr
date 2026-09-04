@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import { mapArrPath } from './arr.mjs';
-import { scanOrphans } from './orphans.mjs';
+import { quarantineFile, scanOrphans } from './orphans.mjs';
 
 const isRoot = process.getuid?.() === 0;
 
@@ -182,4 +182,50 @@ test('an incomplete download-root walk withholds that root', { skip: isRoot }, a
 
   assert.deepEqual(scan.candidates.filter((candidate) => candidate.source === 'download'), []);
   assert.match(scan.warnings.join(' '), /could not read 1 folder\(s\)/);
+});
+
+test('a quarantine folder inside a library is skipped, not rescanned as fresh orphans', async (context) => {
+  const root = await fixture(context);
+  const movies = path.join(root, 'movies');
+  // The folder browser in Settings will happily offer a folder inside the library.
+  const brig = path.join(movies, 'Brig');
+  await mkdir(path.join(movies, 'Film'), { recursive: true });
+  await mkdir(brig, { recursive: true });
+  const stray = path.join(movies, 'Film', 'stray.mkv');
+  const tracked = path.join(movies, 'Film', 'tracked.mkv');
+  await writeFile(stray, 'a');
+  await writeFile(tracked, 'b');
+
+  const config = baseConfig({
+    orphanTrashDir: brig,
+    instances: [{ id: 'radarr', kind: 'radarr', mediaRoots: [movies], downloadRoots: [] }],
+  });
+  const first = await scanOrphans(config, connectedArr([tracked]));
+  assert.deepEqual(first.candidates.map((candidate) => candidate.path), [stray]);
+
+  await quarantineFile(config, first.candidates[0]);
+
+  // Nothing tracks a quarantined file any more, so before the walk learned to skip the
+  // Brig the next scan found it and offered it again as a fresh orphan. Quarantining it
+  // nested it one level deeper each time, and with permanent deletion enabled the scan
+  // offered to destroy a file that was sitting safely in the Brig.
+  const second = await scanOrphans(config, connectedArr([tracked]));
+  assert.deepEqual(second.candidates, []);
+  assert.match(second.warnings.join(' '), /Brig at .* is inside a scanned root/);
+});
+
+test('a quarantine folder that swallows a library root is called out', async (context) => {
+  const root = await fixture(context);
+  const movies = path.join(root, 'store', 'movies');
+  await mkdir(movies, { recursive: true });
+  await writeFile(path.join(movies, 'Film.mkv'), 'a');
+
+  const config = baseConfig({
+    orphanTrashDir: path.join(root, 'store'),
+    instances: [{ id: 'radarr', kind: 'radarr', mediaRoots: [movies], downloadRoots: [] }],
+  });
+  const scan = await scanOrphans(config, connectedArr([path.join(movies, 'Film.mkv')]));
+
+  // Quarantining would move the file inside the library it was just taken from.
+  assert.match(scan.warnings.join(' '), /contains a scanned root/);
 });

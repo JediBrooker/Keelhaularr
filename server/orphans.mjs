@@ -66,6 +66,12 @@ export async function assertQbittorrentSafe(config, candidate) {
 async function walk(root, config, output) {
   const stack = [root];
   const unreadable = [];
+  // Never descend into the Brig. A quarantine folder placed inside a library root - the
+  // folder browser happily offers one - meant every quarantined file was found again by
+  // the next scan and offered as a fresh orphan, because nothing tracks it any more.
+  // Requarantining nested it one level deeper each time, and with permanent deletion
+  // enabled the scan offered to destroy files that were sitting safely in the Brig.
+  const quarantineRoot = config.orphanTrashDir ? path.resolve(config.orphanTrashDir) : null;
   while (stack.length) {
     const directory = stack.pop();
     let entries;
@@ -80,6 +86,7 @@ async function walk(root, config, output) {
       const fullPath = path.join(directory, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
+        if (quarantineRoot && path.resolve(fullPath) === quarantineRoot) continue;
         if (!config.ignoreDirectories.has(entry.name.toLowerCase())) stack.push(fullPath);
         continue;
       }
@@ -118,6 +125,20 @@ export async function scanOrphans(config, arrResults) {
     warning: null,
   };
 
+  const quarantineRoot = config.orphanTrashDir ? path.resolve(config.orphanTrashDir) : null;
+  if (quarantineRoot) {
+    const scanned = arrInstances(config)
+      .flatMap((instance) => [...(instance.mediaRoots ?? []), ...(instance.downloadRoots ?? [])])
+      .map((value) => path.resolve(value));
+    const inside = scanned.filter((value) => isWithin(value, quarantineRoot) || value === quarantineRoot);
+    const swallowing = scanned.filter((value) => isWithin(quarantineRoot, value));
+    if (inside.length) {
+      warnings.push(`The Brig at ${quarantineRoot} is inside a scanned root (${inside[0]}). It is skipped so quarantined files are not offered up a second time, but move it outside every library and completed-download root: while it sits there, restoring a file puts it back into a folder this scan also walks.`);
+    }
+    if (swallowing.length) {
+      warnings.push(`The Brig at ${quarantineRoot} contains a scanned root (${swallowing[0]}). Quarantining a file would move it inside the library it was taken from. Point the Brig somewhere outside every library and completed-download root.`);
+    }
+  }
   const configuredDownloadRoots = arrInstances(config)
     .flatMap((instance) => instance.downloadRoots ?? [])
     .map((root) => path.resolve(root));
