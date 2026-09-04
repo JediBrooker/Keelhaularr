@@ -24,13 +24,17 @@ Both destructive automations are opt-in and disabled by default.
 - Optional policy that refuses to remove an oversized file with no compliant replacement
 - Recoverable Brig quarantine for oversized files as well as untracked files
 - Filesystem orphan scanning against the files actually tracked by each app
-- Identification of untracked files: spare copy, or the only copy of something the library is missing
+- Every scan says whether each untracked file is a spare copy or the only copy of something the library is missing
 - One-press import that hands a missing file back to Radarr/Sonarr to hardlink or move per their own settings
 - Inode-based hardlink integrity checks for completed torrent/download folders
 - Optional qBittorrent guard that withholds every incomplete torrent from orphan actions
 - Opt-in automatic recovery for continuously slow or stalled qBittorrent downloads
 - Recoverable orphan quarantine or confirmed permanent deletion per selected batch
-- Built-in login, HttpOnly signed sessions, and login rate limiting
+- Built-in login with the password stored as a salted scrypt hash, never in the clear
+- HttpOnly, SameSite=Strict signed sessions, all of which end the moment the password changes
+- Failed logins slowed progressively rather than locked out, so nobody can lock you out of your own server
+- Content-Security-Policy, nosniff and referrer headers, plus HSTS once the deployment declares HTTPS
+- Optional TRUST_PROXY so a reverse-proxied deployment still sees real client addresses
 - API keys kept server-side
 - Authenticated GUI settings with immediate apply and durable, atomic storage
 - Server-side folder autocomplete for library, completed-download, and quarantine paths
@@ -95,6 +99,17 @@ guard for emergency recovery; unfinished durable jobs resume after restart.
 
 Older versions did not persist in-flight actions. Let any old-version deletion
 finish before installing this release for the first time.
+
+Two changes in this release are worth knowing about before you update:
+
+- **Everyone is signed out once.** Sessions are now tied to the stored password,
+  and a password still held in the clear is rehashed on first start. Both change
+  the signing key, so every existing session ends. Sign in again and it is done.
+- **A quarantine folder inside a library or completed-download root is now
+  refused.** Nothing tracks a quarantined file, so a Brig inside a scanned root
+  meant the next scan found everything in it and offered it again as a fresh
+  find. Scans skip such a folder and say so, and Settings will not save one -
+  move the Brig somewhere outside every scan root.
 
 For a Proxmox LXC, enable the required features on the Proxmox host before
 running the installer:
@@ -295,6 +310,7 @@ limit:
 
 ```dotenv
 RADARR_SIZE_RULES_JSON=[{"label":"4K exempt","tag":"4k","maxMbPerMinute":900},{"label":"Anime","tag":"anime","maxMbPerMinute":40,"toleranceGib":0.5}]
+SONARR_SIZE_RULES_JSON=[{"label":"Anime","tag":"anime","maxMbPerMinute":40}]
 ```
 
 Each rule matches on any combination of a Radarr/Sonarr **tag**, a **library
