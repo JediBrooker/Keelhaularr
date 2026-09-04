@@ -24,6 +24,8 @@ Both destructive automations are opt-in and disabled by default.
 - Optional policy that refuses to remove an oversized file with no compliant replacement
 - Recoverable Brig quarantine for oversized files as well as untracked files
 - Filesystem orphan scanning against the files actually tracked by each app
+- Identification of untracked files: spare copy, or the only copy of something the library is missing
+- One-press import that hands a missing file back to Radarr/Sonarr to hardlink or move per their own settings
 - Inode-based hardlink integrity checks for completed torrent/download folders
 - Optional qBittorrent guard that withholds every incomplete torrent from orphan actions
 - Opt-in automatic recovery for continuously slow or stalled qBittorrent downloads
@@ -558,6 +560,59 @@ ORPHAN_TRASH_DIR=/quarantine
 When acting on selected untracked files, the confirmation dialog offers
 **Cancel**, **Quarantine**, and **Delete permanently**. Permanent deletion
 requires a second confirmation.
+
+### Is it spare, or is it the only copy?
+
+An untracked file is one of two very different things, and a file listing cannot
+tell them apart: a spare copy of something the library already holds, or the
+only copy of something whose link into the library broke. Deleting the first
+costs nothing. Deleting the second loses the file.
+
+Select files and press **Identify**. Radarr and Sonarr are asked what each file
+actually is, using the same manual-import machinery their own interactive import
+screen uses, so release-name parsing is theirs rather than a second guess at it.
+Each file comes back as one of:
+
+- **Spare copy** — the movie or episode already has a tracked file, shown with
+  that file's size. Removing this copy loses nothing.
+- **Missing from library** — identified, but nothing tracks it. Deleting this
+  loses the only copy.
+- **Refused by the app** — Radarr or Sonarr will not import it, and says why
+  (a sample, an unsupported extension, and so on).
+- **Not recognised** — the application cannot tell what the file is.
+
+Identification reads folders from disk on the application's side, so it runs
+only when asked, never as part of a scan. Nothing is moved, changed or deleted
+by it.
+
+### Importing a file back into the library
+
+For anything reported as **Missing from library**, **IMPORT INTO LIBRARY** hands
+the file back to the application that should own it. Radarr or Sonarr performs
+the file operation itself, with `importMode: auto`, so it hardlinks or copies
+while a torrent is still seeding and moves otherwise, honouring its own **Use
+Hardlinks instead of Copy** setting. Keelhaularr does not override that choice:
+forcing a move would break seeding, and forcing a copy would waste a second copy
+where a hardlink was wanted.
+
+Three checks stand in front of every import, and each one leaves the file where
+it is:
+
+- an incomplete torrent is refused, because importing a partial file puts a
+  broken copy into the library under a name that says it is fine;
+- the file must still be exactly what the scan measured;
+- the target is identified again immediately before the command is sent, so a
+  movie that gained a file since the scan is refused rather than duplicated.
+
+Afterwards the result is proven rather than assumed. Radarr and Sonarr report a
+manual import as completed even when the file was rejected during the import, so
+the library is asked whether it actually gained the file; an import that did not
+happen is reported as a failure with the file untouched. The job then says which
+of the two happened — `Linked into …` means the file stayed put and any torrent
+keeps seeding, `Moved into the library as …` means it did not.
+
+Imports run as ordinary durable jobs under **Operations → Jobs**, with the same
+restart recovery and per-file outcomes as every other action.
 
 ## Automatic qBittorrent recovery
 
