@@ -59,6 +59,40 @@ export function mapArrPath(input, pathMaps) {
   return path.isAbsolute(normalizedInput) ? path.resolve(normalizedInput) : null;
 }
 
+/**
+ * Translates a path inside this container back into the path the application uses.
+ *
+ * The inverse of mapArrPath, needed whenever we ask an application to act on a file by
+ * path rather than by id - manual import, for one. Sending a container path to an
+ * application that mounts the same storage somewhere else means it simply finds nothing
+ * there, so callers should confirm the round trip before acting on the result.
+ *
+ * Separators follow the mapping's own `from`, because an application running on Windows
+ * wants `D:\Media\Film.mkv` and will not recognise the same path spelled with slashes.
+ */
+export function mapLocalPathToArr(input, pathMaps) {
+  if (typeof input !== 'string' || !input || !path.isAbsolute(input)) return null;
+  const resolved = path.resolve(input);
+  for (const mapping of pathMaps ?? []) {
+    const rawFrom = String(mapping.from ?? '');
+    const rawTo = String(mapping.to ?? '').trim();
+    const from = rawFrom.replaceAll('\\', '/').replace(/\/+$/, '');
+    // An empty `to` would resolve to the working directory and swallow everything
+    // beneath it, so a half-written mapping matches nothing instead of matching all.
+    if (!from || !rawTo) continue;
+    const destination = path.resolve(rawTo);
+    const relative = path.relative(destination, resolved);
+    if (relative !== '' && (relative.startsWith('..') || path.isAbsolute(relative))) continue;
+    const separator = rawFrom.includes('\\') ? '\\' : '/';
+    const base = from.replaceAll('/', separator);
+    const suffix = relative.split(path.sep).filter(Boolean).join(separator);
+    return suffix ? `${base}${separator}${suffix}` : base;
+  }
+  // No mapping covers this path, which is the ordinary setup where the application and
+  // this container mount the storage at the same place.
+  return resolved;
+}
+
 // Resolves which configured media root contains a mapped library file, so an
 // oversized file can be quarantined relative to its own root. Returns null when the
 // path is outside every configured root, which makes quarantine fail closed.
