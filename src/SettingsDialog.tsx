@@ -85,6 +85,7 @@ interface SettingsData {
     hardlinkMinAgeHours: number;
     retentionDays: number;
     requireReplacement: boolean;
+    autoIdentify: boolean;
   };
   schedule: {
     enabled: boolean;
@@ -156,6 +157,7 @@ interface SettingsForm {
     hardlinkMinAgeHours: string;
     retentionDays: string;
     requireReplacement: boolean;
+    autoIdentify: boolean;
   };
   schedule: {
     enabled: boolean;
@@ -384,6 +386,7 @@ function formFromSettings(settings: SettingsData): SettingsForm {
       hardlinkMinAgeHours: settings.orphan.hardlinkMinAgeHours.toString(),
       retentionDays: settings.orphan.retentionDays.toString(),
       requireReplacement: settings.orphan.requireReplacement,
+      autoIdentify: settings.orphan.autoIdentify,
     },
     schedule: {
       enabled: settings.schedule.enabled,
@@ -854,6 +857,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
             mediaExtensions: listFromText(form.orphan.mediaExtensionsText, /[,\n]/),
             retentionDays: numeric(form.orphan.retentionDays, 'Quarantine retention'),
             requireReplacement: form.orphan.requireReplacement,
+            autoIdentify: form.orphan.autoIdentify,
           },
           schedule: {
             enabled: form.schedule.enabled,
@@ -937,6 +941,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
                       <label className="field">Minimum unlinked age (hours) <span>allows completed imports to finish</span><input type="number" min="0" max="8760" step="0.5" value={form.orphan.hardlinkMinAgeHours} onChange={(event) => updateSection('orphan', { ...form.orphan, hardlinkMinAgeHours: event.target.value })} /></label>
                       <label className="field">Media extensions <span>comma separated</span><input value={form.orphan.mediaExtensionsText} onChange={(event) => updateSection('orphan', { ...form.orphan, mediaExtensionsText: event.target.value })} /></label>
                       <label className="check-row wide-field feature-toggle"><input type="checkbox" checked={form.orphan.requireReplacement} onChange={(event) => updateSection('orphan', { ...form.orphan, requireReplacement: event.target.checked })} /><span><strong>Require a compliant replacement before removing an oversized file</strong><small>Before each oversized file is removed, ask Radarr/Sonarr whether a release exists that fits your size limit and is smaller than the current file. Files without one are preserved. Interactive search queries your indexers, so jobs take longer.</small></span></label>
+                      <label className="check-row wide-field feature-toggle"><input type="checkbox" checked={form.orphan.autoIdentify} onChange={(event) => updateSection('orphan', { ...form.orphan, autoIdentify: event.target.checked })} /><span><strong>Identify untracked files during every scan</strong><small>Ask Radarr/Sonarr which movie or episode each untracked file is, so the manifest can say whether the library already has a copy. This is a name lookup, not a folder read, and repeated names are cached, so it adds roughly one request per newly seen name. Turn it off if you would rather identify files only on demand.</small></span></label>
                       <label className="field">Quarantine retention (days) <span>0 keeps files; a positive value permanently deletes expired quarantined files during maintenance</span><input type="number" min="0" max="3650" value={form.orphan.retentionDays} onChange={(event) => updateSection('orphan', { ...form.orphan, retentionDays: event.target.value })} /></label>
                     </div>
                   </section>

@@ -180,6 +180,7 @@ const RESERVED_INSTANCE_IDS = new Set([
   'orphanAction', 'orphanTrashDir', 'allowPermanentOrphanDelete', 'mediaExtensions',
   'extensions', 'customIgnoreDirectories', 'ignoreDirectories', 'maxFiles',
   'hardlinkMinAgeHours', 'quarantineRetentionDays', 'oversizeRequireReplacement',
+  'orphanAutoIdentify', 'orphanAutoIdentifyLimit',
   'storageRoots',
 ]);
 
@@ -320,6 +321,12 @@ export function getConfig(overrides = {}) {
   const allowPermanentOrphanDelete = readBoolean('ALLOW_PERMANENT_ORPHAN_DELETE', false, overrides);
   // Opt-in so existing installations keep their current behaviour on upgrade.
   const oversizeRequireReplacement = readBoolean('OVERSIZE_REQUIRE_REPLACEMENT', false, overrides);
+  // On by default: it costs one string-parse request per newly seen name, cached
+  // afterwards, and answers the question the untracked list otherwise leaves open.
+  const orphanAutoIdentify = readBoolean('ORPHAN_AUTO_IDENTIFY', true, overrides);
+  // A ceiling so a misconfigured root that finds thousands of untracked files cannot
+  // turn every scheduled scan into thousands of requests at the applications.
+  const orphanAutoIdentifyLimit = readNumber('ORPHAN_AUTO_IDENTIFY_LIMIT', 300, overrides);
   const mediaServer = mediaServerConnection(overrides);
   if (orphanAction === 'permanent' && !allowPermanentOrphanDelete) {
     throw new Error(
@@ -394,6 +401,8 @@ export function getConfig(overrides = {}) {
       : null,
     allowPermanentOrphanDelete,
     oversizeRequireReplacement,
+    orphanAutoIdentify,
+    orphanAutoIdentifyLimit,
     mediaServer,
     mediaExtensions,
     extensions: new Set(mediaExtensions),
@@ -441,6 +450,7 @@ export function publicConfig(config) {
     hardlinkMinAgeHours: config.hardlinkMinAgeHours,
     quarantineRetentionDays: config.quarantineRetentionDays,
     oversizeRequireReplacement: config.oversizeRequireReplacement,
+    orphanAutoIdentify: config.orphanAutoIdentify,
     mediaServer: {
       configured: config.mediaServer?.configured === true,
       kind: config.mediaServer?.kind ?? 'jellyfin',

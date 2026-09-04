@@ -28,7 +28,7 @@ import {
   stopJobWorker,
 } from './jobs.mjs';
 import { historySummary } from './history.mjs';
-import { identifyOrphansForCandidates } from './imports.mjs';
+import { identifyOrphansForCandidates, identifyScanCandidates } from './imports.mjs';
 import { createLoginThrottle } from './login-throttle.mjs';
 import { inspectMediaServer } from './mediaserver.mjs';
 import { previewOrphans, previewOversized, summarizePreview } from './preview.mjs';
@@ -512,6 +512,13 @@ app.post('/api/scan', async (request, response, next) => {
     const orphans = await scanOrphans(config, arr);
     const oversized = filterExcluded(allArrCandidates(arr));
     const orphanCandidates = filterExcluded(orphans.candidates);
+    // Identification runs as part of every scan, because "nothing tracks this" is only
+    // half an answer and the other half decides whether deleting the file is safe. It
+    // is a string match against the library rather than a folder read, and repeated
+    // names are cached, so a scan costs one request per newly seen name.
+    const identifications = config.orphanAutoIdentify
+      ? await identifyScanCandidates(config, arr, orphanCandidates, config.orphanAutoIdentifyLimit)
+      : [];
     response.json({
       scannedAt: new Date().toISOString(),
       config: publicConfig(config),
@@ -521,6 +528,7 @@ app.post('/api/scan', async (request, response, next) => {
       },
       oversized: oversized.sort((a, b) => b.overageBytes - a.overageBytes),
       orphans: orphanCandidates.sort((a, b) => b.sizeBytes - a.sizeBytes),
+      identifications,
       roots: orphans.roots,
       qbittorrentSafety: orphans.qbittorrentSafety,
       warnings: [...arr.radarr.warnings, ...arr.sonarr.warnings, ...orphans.warnings],

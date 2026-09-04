@@ -986,9 +986,15 @@ test('the untracked manifest offers identification and import, and colours them 
   assert.match(chip, /Spare copy/);
   assert.match(chip, /Missing from library/);
 
-  // Identification is an explicit action: it makes Radarr/Sonarr read folders off disk.
+  // Identification arrives with the scan, so the chips are populated without anyone
+  // pressing anything. Replaced wholesale rather than merged: a stale verdict about a
+  // file the library has since gained or lost is what must not linger on screen.
+  assert.match(appSource, /setIdentities\(Object\.fromEntries\(\(data\.identifications \?\? \[\]\)/);
+
+  // The manual control remains as the deeper on-disk check.
   assert.match(appSource, /void identifySelection\(\)/);
   assert.match(appSource, /'\/api\/orphans\/identify'/);
+  assert.match(appSource, /Re-check on disk/);
 
   // The import action exists, and only on the untracked tab.
   assert.match(appSource, /IMPORT INTO LIBRARY/);

@@ -568,10 +568,11 @@ tell them apart: a spare copy of something the library already holds, or the
 only copy of something whose link into the library broke. Deleting the first
 costs nothing. Deleting the second loses the file.
 
-Select files and press **Identify**. Radarr and Sonarr are asked what each file
-actually is, using the same manual-import machinery their own interactive import
-screen uses, so release-name parsing is theirs rather than a second guess at it.
-Each file comes back as one of:
+Every scan answers this without being asked. Radarr and Sonarr are given each
+untracked file's release name and reply with the movie or episode it belongs to;
+whether that movie or episode already has a tracked file is something the scan
+has just read anyway, so it costs nothing further. Each file is shown as one
+of:
 
 - **Spare copy** — the movie or episode already has a tracked file, shown with
   that file's size. Removing this copy loses nothing.
@@ -581,9 +582,27 @@ Each file comes back as one of:
   (a sample, an unsupported extension, and so on).
 - **Not recognised** — the application cannot tell what the file is.
 
-Identification reads folders from disk on the application's side, so it runs
-only when asked, never as part of a scan. Nothing is moved, changed or deleted
-by it.
+This is a name lookup, not a folder read: the applications answer from their own
+database without touching disk. A release name always parses to the same thing,
+so names already seen are remembered and later scans re-ask nothing. Whether the
+target has a file is *not* remembered - it is re-read on every scan - so a
+verdict can never go stale in the direction that matters.
+
+Two settings bound it, in **Settings → Cleanup rules**:
+
+```dotenv
+# Identify untracked files during every scan. On by default.
+ORPHAN_AUTO_IDENTIFY=true
+# Ceiling per scan, so a misconfigured root that finds thousands of untracked
+# files cannot turn every scheduled scan into thousands of requests.
+ORPHAN_AUTO_IDENTIFY_LIMIT=300
+```
+
+**Re-check on disk** does the deeper version on selected files: the application
+reads the folder itself, which additionally reports anything it would refuse to
+import and confirms the exact details an import would use. That one costs real
+work on the application's side, so it stays a manual action. Neither moves,
+changes nor deletes anything.
 
 ### Importing a file back into the library
 

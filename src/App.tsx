@@ -256,6 +256,7 @@ interface ScanData {
   connections: Record<AppKind, { status: 'connected' | 'error' | 'not-configured'; version: string | null; error: string | null }>;
   oversized: OversizedItem[];
   orphans: OrphanItem[];
+  identifications?: IdentityVerdict[];
   roots: Array<{ app: AppKind; kind: 'library' | 'download'; path: string; filesScanned: number }>;
   qbittorrentSafety: QBittorrentSafety;
   ignoreSummary?: IgnoreSummary;
@@ -1051,6 +1052,11 @@ export default function App() {
         sonarr: { state: data.connections.sonarr.status, error: data.connections.sonarr.error },
       });
       setSelected(new Set());
+      // Every scan brings its own identifications, so the chips are populated without
+      // anyone pressing anything. Results replace the previous set rather than merging
+      // into it: a stale verdict about a file the library has since gained or lost is
+      // exactly what must not linger on screen.
+      setIdentities(Object.fromEntries((data.identifications ?? []).map((verdict) => [verdict.id, verdict])));
       setMessage(`Manifest refreshed at ${new Date(data.scannedAt).toLocaleTimeString()}.`);
       return true;
     } catch (scanError) {
@@ -1484,7 +1490,7 @@ export default function App() {
                 <label>Minimum {tab === 'oversized' ? 'overage' : 'size'}<span><input inputMode="decimal" value={minimumGib} onChange={(event) => setMinimumGib(event.target.value)} /> GiB</span></label>
                 <label>Sort<select value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="largest">Largest first</option>{tab === 'oversized' && <option value="overage">Most over limit</option>}<option value="title">Title</option>{tab === 'orphans' && <option value="oldest">Oldest first</option>}</select></label>
                 {biggestWins && <p className="biggest-wins">Biggest {biggestWins.count} account for {formatBytes(biggestWins.topTotal)} of {formatBytes(biggestWins.total)} {tab === 'oversized' ? 'over limit' : 'untracked'} — {biggestWins.share}% of the total.</p>}
-              <div className="batch-tools"><label className="quick-select"><span className="sr-only">Quick select</span><select aria-label="Quick select" value="" disabled={!visible.length} onChange={(event) => { applyQuickSelect(event.target.value); event.currentTarget.value = ''; }}><option value="">Quick select…</option><option value="shown">Everything shown ({visible.length})</option>{tab === 'oversized' && <option value="x2">At least 2× its limit</option>}{tab === 'oversized' && <option value="x3">At least 3× its limit</option>}<option value="top10">Top 10 by wasted space</option><option value="top25">Top 25 by wasted space</option><option value="first25">First 25 in this order</option><option value="first100">First 100 in this order</option></select></label><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button>{tab === 'oversized' && <button type="button" onClick={() => { void checkReplacements(); }} disabled={!selectedVisible.length || applying || checkingReplacements.length > 0} title="Ask Radarr/Sonarr whether a release exists that fits your size limit. Nothing is deleted.">{checkingReplacements.length ? 'Checking indexers…' : 'Check replacements'}</button>}{tab === 'orphans' && <button type="button" onClick={() => { void identifySelection(); }} disabled={!selectedVisible.length || applying || identifying.length > 0} title="Ask Radarr/Sonarr what each file is, and whether the movie or episode it belongs to already has a tracked file. Nothing is moved or deleted.">{identifying.length ? 'Identifying…' : 'Identify'}</button>}</div>
+              <div className="batch-tools"><label className="quick-select"><span className="sr-only">Quick select</span><select aria-label="Quick select" value="" disabled={!visible.length} onChange={(event) => { applyQuickSelect(event.target.value); event.currentTarget.value = ''; }}><option value="">Quick select…</option><option value="shown">Everything shown ({visible.length})</option>{tab === 'oversized' && <option value="x2">At least 2× its limit</option>}{tab === 'oversized' && <option value="x3">At least 3× its limit</option>}<option value="top10">Top 10 by wasted space</option><option value="top25">Top 25 by wasted space</option><option value="first25">First 25 in this order</option><option value="first100">First 100 in this order</option></select></label><button type="button" onClick={ignoreSelection} disabled={!selectedVisible.length || applying}>{applying ? 'Working…' : 'Ignore selected'}</button>{tab === 'oversized' && <button type="button" onClick={() => { void checkReplacements(); }} disabled={!selectedVisible.length || applying || checkingReplacements.length > 0} title="Ask Radarr/Sonarr whether a release exists that fits your size limit. Nothing is deleted.">{checkingReplacements.length ? 'Checking indexers…' : 'Check replacements'}</button>}{tab === 'orphans' && <button type="button" onClick={() => { void identifySelection(); }} disabled={!selectedVisible.length || applying || identifying.length > 0} title="Every scan already identifies these by name. This asks Radarr/Sonarr to read the folders themselves, which also reports anything they would refuse to import. Nothing is moved or deleted.">{identifying.length ? 'Identifying…' : 'Re-check on disk'}</button>}</div>
               </div>
             </>}
 

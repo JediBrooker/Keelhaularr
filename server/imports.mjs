@@ -385,3 +385,138 @@ export async function targetHasFile(connection, app, target) {
   const movie = await arrRequest(connection, `movie/${target.movieId}`, { timeoutMs: IDENTIFY_TIMEOUT_MS });
   return Boolean(movie && (movie.hasFile === true || positiveId(movie.movieFileId)));
 }
+
+// The cheap identification used on every scan.
+//
+// `manualimport` is thorough but makes the application read a folder off disk and run
+// full import decisions over it, which is far too much to do on a schedule. `parse` is
+// a pure string match against the library - no disk access at all - so it can answer
+// "which movie or episode is this?" for every untracked file on every scan.
+//
+// The two are not interchangeable. `parse` cannot report rejections or produce the
+// payload an import needs, so the manual check and the import itself still use
+// `manualimport`. What `parse` gives is the one thing worth knowing at a glance:
+// whether the library already has this.
+export const PARSE_TIMEOUT_MS = 15000;
+const PARSE_CACHE_LIMIT = 5000;
+
+// A release name always parses to the same thing, so this is cacheable for the life of
+// the process. Crucially it caches only the name-to-id match and never whether that
+// target has a file: occupancy is recomputed from each fresh scan, so a cached parse
+// can never produce a stale "already in the library" verdict.
+const parseCache = new Map();
+
+function cacheParse(key, value) {
+  if (parseCache.size >= PARSE_CACHE_LIMIT) {
+    parseCache.delete(parseCache.keys().next().value);
+  }
+  parseCache.set(key, value);
+  return value;
+}
+
+async function parseTitle(connection, title) {
+  const key = `${connection.id ?? connection.kind} ${title}`;
+  if (parseCache.has(key)) return parseCache.get(key);
+  let parsed;
+  try {
+    parsed = await arrRequest(connection, `parse?title=${encodeURIComponent(title)}`, {
+      timeoutMs: PARSE_TIMEOUT_MS,
+    });
+  } catch {
+    // Not cached: a connection failure says nothing about the name, and the next scan
+    // should try again rather than remember a failure forever.
+    return null;
+  }
+  if (connection.kind === 'sonarr') {
+    const seriesId = positiveId(parsed?.series?.id);
+    const episodes = (Array.isArray(parsed?.episodes) ? parsed.episodes : [])
+      .map((episode) => ({
+        id: positiveId(episode?.id),
+        seasonNumber: episode?.seasonNumber,
+        episodeNumber: episode?.episodeNumber,
+      }))
+      .filter((episode) => episode.id);
+    if (!seriesId || !episodes.length) return cacheParse(key, { matched: false });
+    return cacheParse(key, { matched: true, seriesId, episodes, title: parsed.series?.title });
+  }
+  const movieId = positiveId(parsed?.movie?.id);
+  if (!movieId) return cacheParse(key, { matched: false });
+  return cacheParse(key, { matched: true, movieId, title: parsed.movie?.title, year: parsed.movie?.year });
+}
+
+/**
+ * Identifies untracked files by name against what the scan already knows.
+ *
+ * `withFile` is the set of movie or episode ids the scan already found to have a
+ * tracked file, so no extra request is needed to answer the question that matters.
+ */
+export async function identifyByName(connection, candidates, withFile, limit) {
+  const results = new Map();
+  if (!connection?.configured) return results;
+
+  const queue = candidates.slice(0, limit);
+  const workers = Array.from({ length: Math.min(4, queue.length) }, async () => {
+    for (;;) {
+      const candidate = queue.shift();
+      if (!candidate) return;
+
+      // A release folder usually carries more than the file inside it does, so it is
+      // tried first, exactly as the applications' own import does.
+      const folder = path.basename(path.dirname(candidate.path));
+      const file = path.basename(candidate.path, path.extname(candidate.path));
+      let parsed = null;
+      for (const title of [folder, file]) {
+        if (!title || title === '.' || title === '/') continue;
+        parsed = await parseTitle(connection, title);
+        if (parsed?.matched) break;
+      }
+
+      if (!parsed) continue;
+      const appName = connection.kind === 'sonarr' ? 'Sonarr' : 'Radarr';
+      if (!parsed.matched) {
+        results.set(candidate.id, verdict('unidentified', `${appName} does not recognise this name.`));
+        continue;
+      }
+
+      if (connection.kind === 'sonarr') {
+        const label = episodeLabel({ title: parsed.title }, parsed.episodes);
+        const taken = parsed.episodes.filter((episode) => withFile.has(episode.id));
+        const which = taken.length === parsed.episodes.length
+          ? label
+          : `${taken.length} of the ${parsed.episodes.length} episodes in ${label}`;
+        results.set(candidate.id, taken.length
+          ? verdict(OCCUPIED, `${which} already has a tracked file, so this copy is spare.`, { title: label })
+          : verdict(IMPORTABLE, `${label} has no tracked file. Sonarr can import this copy.`, { title: label }));
+        continue;
+      }
+
+      const label = movieLabel({ title: parsed.title, year: parsed.year });
+      results.set(candidate.id, withFile.has(parsed.movieId)
+        ? verdict(OCCUPIED, `${label} already has a tracked file, so this copy is spare.`, { title: label })
+        : verdict(IMPORTABLE, `${label} has no tracked file. Radarr can import this copy.`, { title: label }));
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+export async function identifyScanCandidates(config, arrResults, candidates, limit) {
+  if (!limit || limit <= 0 || !candidates.length) return [];
+  const byApp = new Map();
+  for (const candidate of candidates) {
+    if (!byApp.has(candidate.app)) byApp.set(candidate.app, []);
+    byApp.get(candidate.app).push(candidate);
+  }
+  const merged = new Map();
+  // The budget is shared across applications so a large Radarr library cannot use it up
+  // and leave Sonarr's untracked files permanently unidentified.
+  const share = Math.max(1, Math.floor(limit / byApp.size));
+  for (const [app, group] of byApp) {
+    const withFile = arrResults?.[app]?.withFile ?? new Set();
+    const results = await identifyByName(config[app], group, withFile, share);
+    for (const [id, result] of results) merged.set(id, result);
+  }
+  return candidates
+    .filter((candidate) => merged.has(candidate.id))
+    .map((candidate) => ({ id: candidate.id, ...merged.get(candidate.id), source: 'scan' }));
+}

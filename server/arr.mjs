@@ -208,6 +208,10 @@ function baseResult(app, configured) {
     candidates: [],
     overageObservations: [],
     knownPaths: new Set(),
+    // Which movies, and which episodes, already have a tracked file. Gathered while the
+    // scan is already walking this data, so answering "does the library already have a
+    // copy of this?" costs nothing extra later.
+    withFile: new Set(),
     warnings: [],
     error: null,
   };
@@ -241,6 +245,7 @@ export async function scanRadarr(connection) {
 
     for (const movie of movies) {
       const mediaFile = movie.movieFile;
+      if (movie.hasFile === true || Number(movie.movieFileId) > 0) result.withFile.add(Number(movie.id));
       if (!movie.hasFile || !mediaFile) continue;
       const arrPath = mediaFile.path || joinArrPath(movie.path, mediaFile.relativePath);
       const localPath = mapArrPath(arrPath, connection.pathMaps);
@@ -339,6 +344,7 @@ export async function scanSonarr(connection) {
       const episodesByFile = new Map();
       for (const episode of episodes) {
         const fileId = Number(episode.episodeFileId) || 0;
+        if (episode.hasFile === true || fileId > 0) result.withFile.add(Number(episode.id));
         if (!fileId) continue;
         if (!episodesByFile.has(fileId)) episodesByFile.set(fileId, []);
         episodesByFile.get(fileId).push(episode);
