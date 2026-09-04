@@ -28,6 +28,7 @@ import {
   stopJobWorker,
 } from './jobs.mjs';
 import { historySummary } from './history.mjs';
+import { identifyOrphansForCandidates } from './imports.mjs';
 import { createLoginThrottle } from './login-throttle.mjs';
 import { inspectMediaServer } from './mediaserver.mjs';
 import { previewOrphans, previewOversized, summarizePreview } from './preview.mjs';
@@ -631,6 +632,30 @@ app.post('/api/oversized/replacements', async (request, response, next) => {
   }
 });
 
+// Read-only: asks each application what an untracked file actually is, and whether the
+// movie or episode it belongs to already has a tracked file. Never mutates anything.
+app.post('/api/orphans/identify', async (request, response, next) => {
+  try {
+    const ids = Array.isArray(request.body?.ids) ? request.body.ids.filter((id) => typeof id === 'string') : [];
+    if (!ids.length || ids.length > 200) {
+      response.status(400).json({ error: 'Identify between 1 and 200 files at a time. Each folder is read from disk by Radarr or Sonarr.' });
+      return;
+    }
+    const config = currentConfig();
+    const arr = await scanArr(config);
+    const scan = await scanOrphans(config, arr);
+    const requested = new Set(ids);
+    const candidates = filterExcluded(scan.candidates).filter((candidate) => requested.has(candidate.id));
+    if (!candidates.length) {
+      response.status(409).json({ error: 'None of the selected files are still untracked.' });
+      return;
+    }
+    response.json({ identifications: await identifyOrphansForCandidates(config, candidates) });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post('/api/orphans/apply', async (request, response, next) => {
   try {
     const ids = Array.isArray(request.body?.ids) ? request.body.ids.filter((id) => typeof id === 'string') : [];
@@ -639,8 +664,8 @@ app.post('/api/orphans/apply', async (request, response, next) => {
       return;
     }
     const action = request.body?.action;
-    if (action !== 'quarantine' && action !== 'permanent') {
-      response.status(400).json({ error: 'Choose either quarantine or permanent for the selected orphan files.' });
+    if (!['quarantine', 'permanent', 'import'].includes(action)) {
+      response.status(400).json({ error: 'Choose quarantine, permanent or import for the selected files.' });
       return;
     }
     if (action === 'permanent' && request.body?.confirmPermanent !== true) {

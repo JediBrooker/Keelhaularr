@@ -751,7 +751,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const missingAction = await request('/api/orphans/apply', { ids: orphanIds });
   assert.equal(missingAction.status, 400);
   assert.deepEqual(await missingAction.json(), {
-    error: 'Choose either quarantine or permanent for the selected orphan files.',
+    error: 'Choose quarantine, permanent or import for the selected files.',
   });
   const invalidAction = await request('/api/orphans/apply', { ids: orphanIds, action: 'Permanent' });
   assert.equal(invalidAction.status, 400);
@@ -767,7 +767,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(orphans.status, 202);
   const orphanResult = await orphans.json();
   assert.equal(orphanResult.job.action, 'quarantine');
-  assert.match(orphanResult.job.title, /^Quarantine 3 orphan files$/);
+  assert.match(orphanResult.job.title, /^Quarantine 3 untracked files$/);
   const orphanJob = await waitForJob(base, cookie, orphanResult.job.id);
   assert.equal(orphanJob.status, 'completed');
   assert.equal(orphanJob.action, 'quarantine');
@@ -798,7 +798,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(permanentResponse.status, 202);
   const permanentResult = await permanentResponse.json();
   assert.equal(permanentResult.job.action, 'permanent');
-  assert.equal(permanentResult.job.title, 'Delete 1 orphan file');
+  assert.equal(permanentResult.job.title, 'Delete 1 untracked file');
   const permanentJob = await waitForJob(base, cookie, permanentResult.job.id);
   assert.equal(permanentJob.status, 'completed');
   assert.equal(permanentJob.action, 'permanent');

@@ -26,6 +26,13 @@ import {
   scanOrphans,
 } from './orphans.mjs';
 import { recordQuarantine } from './quarantine.mjs';
+import {
+  IMPORTABLE,
+  identifyOrphans,
+  importCommandStatus,
+  requestImport,
+  targetHasFile,
+} from './imports.mjs';
 import { REPLACEMENT_AVAILABLE, findReplacements } from './replacements.mjs';
 import {
   classifyQbittorrentRecoveryTorrent,
@@ -238,9 +245,11 @@ export async function createOversizeJob(config, requestedIds, action = 'permanen
   });
 }
 
+const ORPHAN_ACTION_TITLES = { permanent: 'Delete', quarantine: 'Quarantine', import: 'Import' };
+
 export async function createOrphanJob(config, requestedIds, action) {
-  if (action !== 'quarantine' && action !== 'permanent') {
-    inputError('Orphan jobs require either quarantine or permanent action.');
+  if (!Object.hasOwn(ORPHAN_ACTION_TITLES, action)) {
+    inputError('Orphan jobs require quarantine, permanent or import as the action.');
   }
   const arr = await scanArr(config);
   const current = await scanOrphans(config, arr);
@@ -251,7 +260,7 @@ export async function createOrphanJob(config, requestedIds, action) {
   return saveNewJob({
     id: randomUUID(),
     type: 'orphans',
-    title: `${action === 'permanent' ? 'Delete' : 'Quarantine'} ${candidates.length} orphan file${candidates.length === 1 ? '' : 's'}`,
+    title: `${ORPHAN_ACTION_TITLES[action]} ${candidates.length} untracked file${candidates.length === 1 ? '' : 's'}`,
     action,
     trashDir: config.orphanTrashDir,
     status: 'queued',
@@ -534,7 +543,88 @@ async function pathHasSize(filePath, expectedSize) {
   }
 }
 
+// How long to follow a ManualImport command before giving up on watching it. The
+// import itself continues inside the application regardless; this only bounds how long
+// the job waits for proof, and an unproven import is reported as unproven, never as
+// done.
+const IMPORT_POLL_TIMEOUT_MS = 120000;
+const IMPORT_POLL_INTERVAL_MS = 2000;
+
+/**
+ * Hands an untracked file back to the application that should own it.
+ *
+ * Nothing here deletes or moves anything itself: the application performs the file
+ * operation, hardlinking or moving according to its own settings, which is the point.
+ * The job's part is to prove the file is still what was scanned, prove the target still
+ * has no file, and then prove afterwards that the library actually gained one.
+ */
+async function processOrphanImportItem(job, item, config) {
+  const connection = config[item.candidate.app];
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'processing';
+    value.phase = 'identifying';
+    value.error = null;
+  });
+
+  // An incomplete torrent is a partial file; importing it would put a broken copy into
+  // the library under a name that says it is fine.
+  await assertQbittorrentSafe(config, item.candidate);
+  await assertCandidateUnchanged(item.candidate);
+
+  // Re-identified now rather than trusted from the scan: the target may have gained a
+  // file in the meantime, and importing over one is the outcome this must never cause.
+  const identified = (await identifyOrphans(connection, [item.candidate])).get(item.candidate.id);
+  if (identified?.status !== IMPORTABLE || !identified.target || !identified.arrPath) {
+    throw new Error(identified?.reason
+      ?? 'This file could not be identified immediately before importing, so it was left alone.');
+  }
+
+  await updateItem(job.id, item.id, (value) => {
+    value.phase = 'importing';
+    value.importTitle = identified.title;
+  });
+
+  const commandId = await requestImport(connection, item.candidate.app, identified.arrPath, identified.target);
+  await updateItem(job.id, item.id, (value) => {
+    value.importCommandId = commandId;
+  });
+
+  const deadline = Date.now() + IMPORT_POLL_TIMEOUT_MS;
+  let command = null;
+  while (Date.now() < deadline) {
+    command = await importCommandStatus(connection, commandId);
+    if (command.finished) break;
+    await new Promise((resolve) => setTimeout(resolve, IMPORT_POLL_INTERVAL_MS));
+  }
+  if (!command?.finished) {
+    throw new Error(`${item.candidate.app} is still importing this file. It will finish on its own; rescan to confirm.`);
+  }
+  if (!command.succeeded) {
+    throw new Error(`${item.candidate.app} reported the import as ${command.status}${command.message ? `: ${command.message}` : '.'}`);
+  }
+
+  // A completed command is not proof. Radarr and Sonarr report ManualImport as
+  // completed even when the file was rejected during the import itself, so the library
+  // is asked whether it actually gained the file.
+  if (!await targetHasFile(connection, item.candidate.app, identified.target)) {
+    throw new Error(`${item.candidate.app} finished the import but ${identified.title} still has no tracked file. The file was left where it is.`);
+  }
+
+  // Which of the two it did is the application's decision, and the source file is the
+  // evidence: gone means moved, still there means hardlinked or copied.
+  const sourceRemains = await pathExists(item.candidate.path);
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'complete';
+    value.phase = 'imported';
+    value.removal = null;
+    value.outcome = sourceRemains
+      ? `Linked into ${identified.title}. The file stays where it is, so any torrent keeps seeding.`
+      : `Moved into the library as ${identified.title}.`;
+  });
+}
+
 async function processOrphanItem(job, item, config) {
+  if (job.action === 'import') return processOrphanImportItem(job, item, config);
   const jobConfig = { ...config, orphanAction: job.action, orphanTrashDir: job.trashDir };
   await assertNotRecentlyWatched(config, item.candidate);
   let destination = item.plannedDestination ?? null;

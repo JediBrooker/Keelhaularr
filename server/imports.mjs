@@ -364,3 +364,24 @@ export async function importCommandStatus(connection, commandId) {
     message: safeText(command?.message, 200),
   };
 }
+
+/**
+ * Whether the movie or episodes an import targeted now have a tracked file.
+ *
+ * This is how an import is proven rather than assumed. A completed command is not
+ * evidence on its own: Radarr and Sonarr report ManualImport as completed even when the
+ * file was rejected during the import itself, so the only honest confirmation is that
+ * the library now holds what it did not hold before.
+ */
+export async function targetHasFile(connection, app, target) {
+  if (app === 'sonarr') {
+    const episodes = await arrRequest(connection, `episode?seriesId=${target.seriesId}`, { timeoutMs: IDENTIFY_TIMEOUT_MS });
+    const byId = new Map((Array.isArray(episodes) ? episodes : []).map((episode) => [episode?.id, episode]));
+    return target.episodeIds.every((id) => {
+      const episode = byId.get(id);
+      return Boolean(episode && (episode.hasFile === true || positiveId(episode.episodeFileId)));
+    });
+  }
+  const movie = await arrRequest(connection, `movie/${target.movieId}`, { timeoutMs: IDENTIFY_TIMEOUT_MS });
+  return Boolean(movie && (movie.hasFile === true || positiveId(movie.movieFileId)));
+}
