@@ -3,6 +3,8 @@ import { constants, accessSync, readFileSync, statSync } from 'node:fs';
 import { chmod, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
+import { hashPassword, isHashedPassword } from './passwords.mjs';
+
 const SETTINGS_KEYS = new Set([
   'APP_USERNAME', 'APP_PASSWORD', 'APP_SESSION_SECRET', 'APP_SESSION_DAYS', 'APP_COOKIE_SECURE',
   'MAX_MB_PER_MIN', 'OVERSIZE_TOLERANCE_GIB',
@@ -445,7 +447,10 @@ export function buildSettingsOverrides(input, currentOverrides) {
   output.APP_SESSION_DAYS = numberValue(account.sessionDays, 'Session lifetime', { min: 1, max: 365, integer: true }).toString();
   output.APP_COOKIE_SECURE = String(booleanValue(account.cookieSecure, 'Secure cookie'));
   const newPassword = secretValue(account.newPassword ?? '', 'New password', { allowEmpty: true, max: 1024 });
-  if (newPassword) output.APP_PASSWORD = newPassword;
+  // Persisted hashed, never in the clear. config/settings.json is 0600 in a 0700
+  // directory, but it also lands in every backup and bind mount of the config
+  // volume, and people reuse this password elsewhere.
+  if (newPassword) output.APP_PASSWORD = hashPassword(newPassword);
   if (booleanValue(account.rotateSessions ?? false, 'Rotate sessions')) {
     output.APP_SESSION_SECRET = randomBytes(32).toString('hex');
   }
@@ -524,6 +529,19 @@ export function buildSettingsOverrides(input, currentOverrides) {
   if (webhookUrl) output.NOTIFICATION_WEBHOOK_URL = webhookUrl;
   if (clearWebhook) output.NOTIFICATION_WEBHOOK_URL = '';
   return output;
+}
+
+/**
+ * Replaces a password an earlier version of this application persisted in the clear.
+ *
+ * Only the stored settings are touched: an APP_PASSWORD supplied through .env belongs
+ * to the operator, is not ours to rewrite, and is still accepted as-is at login.
+ */
+export async function migrateStoredPassword() {
+  const stored = settingsOverrides.APP_PASSWORD;
+  if (!stored || isHashedPassword(stored)) return false;
+  await saveSettingsOverrides({ ...settingsOverrides, APP_PASSWORD: hashPassword(stored) });
+  return true;
 }
 
 export function saveSettingsOverrides(nextOverrides) {

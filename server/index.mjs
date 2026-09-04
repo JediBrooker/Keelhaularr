@@ -31,6 +31,7 @@ import { historySummary } from './history.mjs';
 import { inspectMediaServer } from './mediaserver.mjs';
 import { previewOrphans, previewOversized, summarizePreview } from './preview.mjs';
 import { scanOrphans } from './orphans.mjs';
+import { verifyPassword } from './passwords.mjs';
 import { findReplacementsForCandidates } from './replacements.mjs';
 import { listQuarantine, purgeQuarantine, reconcileQuarantine, restoreQuarantine } from './quarantine.mjs';
 import {
@@ -44,6 +45,7 @@ import {
   buildSettingsOverrides,
   buildQbittorrentTestConnection,
   getSettingsOverrides,
+  migrateStoredPassword,
   saveSettingsOverrides,
   settingsView,
 } from './settings.mjs';
@@ -169,12 +171,22 @@ function parseCookies(request) {
   }).filter(([key]) => key));
 }
 
+/**
+ * The signing key is bound to the stored credential, so changing the password
+ * invalidates every session that was issued under the old one. Without this a stolen
+ * cookie kept working for the rest of its lifetime - up to a year - and changing the
+ * password, the one thing anyone does after suspecting a compromise, did nothing.
+ */
+function sessionKey(config) {
+  return createHmac('sha256', config.sessionSecret).update(String(config.password)).digest();
+}
+
 function signSession(config) {
   const payload = Buffer.from(JSON.stringify({
     username: config.username,
     expiresAt: Date.now() + config.sessionDays * 86400000,
   })).toString('base64url');
-  const signature = createHmac('sha256', config.sessionSecret).update(payload).digest('base64url');
+  const signature = createHmac('sha256', sessionKey(config)).update(payload).digest('base64url');
   return `${payload}.${signature}`;
 }
 
@@ -192,7 +204,7 @@ function checkSession(request, config) {
   if (!token) return false;
   const [payload, signature, ...rest] = token.split('.');
   if (!payload || !signature || rest.length) return false;
-  const expected = createHmac('sha256', config.sessionSecret).update(payload).digest('base64url');
+  const expected = createHmac('sha256', sessionKey(config)).update(payload).digest('base64url');
   if (!safeEqual(signature, expected)) return false;
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
@@ -221,7 +233,7 @@ app.get('/api/auth/status', (request, response) => {
   });
 });
 
-app.post('/api/auth/login', (request, response) => {
+app.post('/api/auth/login', async (request, response) => {
   const config = currentConfig();
   if (!config.password) {
     response.status(503).json({ error: 'Set APP_PASSWORD in .env before signing in.' });
@@ -236,7 +248,11 @@ app.post('/api/auth/login', (request, response) => {
   }
   const username = typeof request.body?.username === 'string' ? request.body.username : '';
   const password = typeof request.body?.password === 'string' ? request.body.password : '';
-  if (!safeEqual(username, config.username) || !safeEqual(password, config.password)) {
+  // Both halves are always evaluated so a wrong username costs the same as a wrong
+  // password, and the credential may be stored either hashed or - from .env - plain.
+  const usernameMatches = safeEqual(username, config.username);
+  const passwordMatches = await verifyPassword(password, config.password);
+  if (!usernameMatches || !passwordMatches) {
     recent.push(now);
     failedLogins.set(key, recent);
     response.status(401).json({ error: 'Incorrect username or password.' });
@@ -770,6 +786,12 @@ const server = app.listen(config.port, '0.0.0.0', () => {
   console.log(`Keelhaularr API listening on http://0.0.0.0:${config.port}`);
   if (!config.password) console.warn('Setup required: set APP_PASSWORD in .env before signing in.');
 });
+
+migrateStoredPassword()
+  .then((migrated) => {
+    if (migrated) console.log('Rehashed the stored login password; existing sessions were signed out.');
+  })
+  .catch((error) => console.error('Could not rehash the stored login password:', error));
 
 startJobWorker(currentConfig);
 startScheduler(currentConfig);

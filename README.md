@@ -758,6 +758,19 @@ Use long, unrelated values for `APP_PASSWORD` and `APP_SESSION_SECRET`. The
 login issues an HttpOnly, SameSite=Strict signed cookie. Failed logins are
 limited per client address.
 
+A password set in Settings is stored as a salted scrypt hash, never in the
+clear. A password that arrives through `.env` stays as you wrote it, because
+that file belongs to you; a plaintext password left in `config/settings.json`
+by an older release is rehashed automatically on the next start. Changing the
+password signs out every other session immediately, so the browser you changed
+it in stays signed in and every other one has to sign in again.
+
+Responses carry `Content-Security-Policy` (including `frame-ancestors 'none'`,
+so the interface cannot be framed by another page on the same host),
+`X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`.
+`Strict-Transport-Security` is added once `APP_COOKIE_SECURE=true` declares the
+deployment to be HTTPS.
+
 For access outside a trusted LAN, put Keelhaularr behind an HTTPS reverse proxy
 and set:
 
@@ -766,8 +779,9 @@ APP_COOKIE_SECURE=true
 ```
 
 Radarr and Sonarr API keys and the qBittorrent password entered in Settings are
-never returned to the browser. They are stored unencrypted in the private
-`config/settings.json` file (mode `0600`), so do not commit or casually copy
+never returned to the browser. Unlike the login password, they have to be
+replayed to those services, so they are stored unencrypted in the private
+`config/settings.json` file (mode `0600`). Do not commit or casually copy
 `.env` or `config/settings.json`.
 
 ## Uninstall

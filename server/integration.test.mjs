@@ -8,6 +8,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
 
+import { verifyPassword } from './passwords.mjs';
+
 async function sparseFile(filePath, size) {
   await mkdir(path.dirname(filePath), { recursive: true });
   const handle = await open(filePath, 'w');
@@ -234,7 +236,9 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     body: JSON.stringify({ username: 'captain', password: 'test-password' }),
   });
   assert.equal(login.status, 200);
-  const cookie = login.headers.get('set-cookie')?.split(';', 1)[0];
+  // Reassigned after the password change below, which deliberately invalidates every
+  // session signed under the old credential.
+  let cookie = login.headers.get('set-cookie')?.split(';', 1)[0];
   assert.ok(cookie?.startsWith('keelhaularr_session='));
 
   const request = (url, body = {}, method = 'POST') => fetch(`${base}${url}`, {
@@ -364,6 +368,16 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   };
   const saveSettingsResponse = await request('/api/settings', settingsUpdate, 'PUT');
   assert.equal(saveSettingsResponse.status, 200);
+
+  // Changing the password evicts every session issued under the old one, and hands the
+  // administrator who changed it a replacement so they are not signed out of their own
+  // browser.
+  const previousCookie = cookie;
+  cookie = saveSettingsResponse.headers.get('set-cookie')?.split(';', 1)[0];
+  assert.ok(cookie?.startsWith('keelhaularr_session='));
+  assert.notEqual(cookie, previousCookie);
+  assert.equal((await fetch(`${base}/api/status`, { headers: { Cookie: previousCookie } })).status, 401);
+
   const savedSettingsText = await saveSettingsResponse.text();
   assert.equal(savedSettingsText.includes('updated-radarr-key'), false);
   assert.equal(savedSettingsText.includes('qbit-secret'), false);
@@ -435,7 +449,12 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
 
   const persistedPath = path.join(tempRoot, 'config', 'settings.json');
   const persisted = JSON.parse(await readFile(persistedPath, 'utf8'));
-  assert.equal(persisted.values.APP_PASSWORD, 'yo');
+  // The login password is never written in the clear: config/settings.json travels
+  // wherever the config volume is backed up, and people reuse this password elsewhere.
+  assert.equal(persisted.values.APP_PASSWORD.includes('yo'), false);
+  assert.match(persisted.values.APP_PASSWORD, /^scrypt\$/);
+  assert.equal(await verifyPassword('yo', persisted.values.APP_PASSWORD), true);
+  assert.equal(await verifyPassword('not-yo', persisted.values.APP_PASSWORD), false);
   assert.equal(persisted.values.RADARR_API_KEY, 'updated-radarr-key');
   assert.equal(persisted.values.QBITTORRENT_PASSWORD, 'qbit-secret');
   assert.equal(persisted.values.QBITTORRENT_RECOVERY_ENABLED, 'true');
