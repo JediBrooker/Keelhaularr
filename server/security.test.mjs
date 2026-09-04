@@ -242,3 +242,47 @@ test('the saved password is stored hashed, and an older plaintext one is rehashe
   assert.equal(isHashedPassword(migrated.APP_PASSWORD), true, 'plaintext password should be rehashed at boot');
   assert.equal(await verifyPassword('legacy-plaintext', migrated.APP_PASSWORD), true);
 });
+
+test('ten wrong guesses no longer lock the account out', async (context) => {
+  const app = await startApp(context);
+
+  // The old limit refused everything after ten failures in fifteen minutes. Behind a
+  // reverse proxy every client shares the proxy's address, so anyone on the internet
+  // could keep the administrator out of their own server just by guessing wrong.
+  // The delay ladder is unit-tested in login-throttle.test.mjs; this proves the route
+  // is wired to it.
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    assert.equal((await app.login('wrong')).status, 401, `guess ${attempt + 1}`);
+  }
+
+  // The delay is charged to failures, not attempts, so the person who finally remembers
+  // their password is answered at once rather than serving the penalty their typos earned.
+  const started = Date.now();
+  assert.equal((await app.login('test-password')).status, 200);
+  assert.ok(Date.now() - started < 1000, 'a correct password should not be delayed');
+
+  // And a success clears the record, so the next mistake starts from zero again.
+  const afterSuccess = Date.now();
+  assert.equal((await app.login('wrong')).status, 401);
+  assert.ok(Date.now() - afterSuccess < 1000, 'the throttle should reset after a success');
+});
+
+test('a real client address is used when a trusted proxy is declared', async (context) => {
+  const app = await startApp(context, { TRUST_PROXY: '1' });
+
+  // Without TRUST_PROXY these all share the proxy's address and one bucket. With it,
+  // each forwarded client is throttled on its own, so one noisy client cannot slow
+  // down or refuse anybody else.
+  const guess = (forwarded) => fetch(`${app.base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': forwarded },
+    body: JSON.stringify({ username: 'captain', password: 'wrong' }),
+  });
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    assert.equal((await guess('203.0.113.9')).status, 401);
+  }
+
+  const started = Date.now();
+  assert.equal((await guess('198.51.100.4')).status, 401);
+  assert.ok(Date.now() - started < 200, 'a different client should not inherit the throttle');
+});

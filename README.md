@@ -755,8 +755,24 @@ The check does not modify storage or create test files.
 ## Security
 
 Use long, unrelated values for `APP_PASSWORD` and `APP_SESSION_SECRET`. The
-login issues an HttpOnly, SameSite=Strict signed cookie. Failed logins are
-limited per client address.
+login issues an HttpOnly, SameSite=Strict signed cookie.
+
+Failed logins are slowed down per client address rather than locked out: the
+first few cost nothing, then each further failure waits twice as long as the
+last, up to eight seconds. A lockout would be a way to attack you - behind a
+reverse proxy every request arrives from the proxy's address, so wrong guesses
+from anyone on the internet would count against everyone, and repeating them
+would keep you out of your own server.
+
+If Keelhaularr sits behind a reverse proxy, set `TRUST_PROXY` so it can see the
+real client address instead of the proxy's:
+
+```dotenv
+# 1 for a single proxy in front of Keelhaularr, or a subnet list such as
+# "loopback, 172.16.0.0/12". Leave it unset when nothing is in front, because
+# an unfiltered X-Forwarded-For lets any caller claim any address.
+TRUST_PROXY=1
+```
 
 A password set in Settings is stored as a salted scrypt hash, never in the
 clear. A password that arrives through `.env` stays as you wrote it, because
