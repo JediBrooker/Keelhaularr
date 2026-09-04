@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, copyFile, link, mkdir, stat, unlink } from 'node:fs/promises';
+import { access, copyFile, link, lstat, mkdir, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { recordPurge } from './history.mjs';
 import { createJsonStore } from './state.mjs';
@@ -97,16 +97,35 @@ export function purgeQuarantine(id, options) {
 async function purgeRecord(id, { source = 'brig' } = {}) {
   const record = store.read().records.find((item) => item.id === id);
   if (!record) return null;
-  await unlink(record.quarantinePath).catch((error) => {
+
+  // A purge is the one action here with nothing behind it, so what gets unlinked has to
+  // be the regular file that was quarantined - not a directory, and not a symlink whose
+  // target is still in the library. Records are written by this application but read
+  // back from a file on disk.
+  let removed = false;
+  try {
+    const value = await lstat(record.quarantinePath);
+    if (!value.isFile()) {
+      throw new Error(`Refusing to purge ${record.quarantinePath}: it is no longer a regular file.`);
+    }
+    await unlink(record.quarantinePath);
+    removed = true;
+  } catch (error) {
     if (error.code !== 'ENOENT') throw error;
-  });
+    // Already gone. The record is still cleared, but its bytes are not claimed below.
+  }
+
   await store.update((document) => {
     document.records = document.records.filter((item) => item.id !== id);
   });
-  // This is the point at which quarantined bytes actually become free space.
-  await recordPurge({ fileCount: 1, bytes: record.sizeBytes, source })
-    .catch((error) => console.error('Could not record purge history:', error));
-  return { ...record, purgedAt: new Date().toISOString() };
+  // This is the point at which quarantined bytes actually become free space - but only
+  // when this purge is what freed them. Crediting a file somebody had already removed
+  // from the Brig by hand inflated the reclaimed total with space nothing gave back.
+  if (removed) {
+    await recordPurge({ fileCount: 1, bytes: record.sizeBytes, source })
+      .catch((error) => console.error('Could not record purge history:', error));
+  }
+  return { ...record, purgedAt: new Date().toISOString(), removed };
 }
 
 export async function cleanupExpiredQuarantine(retentionDays) {
