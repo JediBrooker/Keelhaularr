@@ -9,7 +9,7 @@ import { applyOrphanCandidate, assertCandidateUnchanged, assertQbittorrentSafe, 
 const testRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-components-'));
 process.env.CONFIG_DIR = path.join(testRoot, 'config');
 const { createJsonStore } = await import('./state.mjs');
-const { cleanupExpiredQuarantine, listQuarantine, recordQuarantine, restoreQuarantine } = await import('./quarantine.mjs');
+const { cleanupExpiredQuarantine, listQuarantine, purgeQuarantine, recordQuarantine, restoreQuarantine } = await import('./quarantine.mjs');
 const appSource = await readFile(new URL('../src/App.tsx', import.meta.url), 'utf8');
 const operationsSource = await readFile(new URL('../src/OperationsDialog.tsx', import.meta.url), 'utf8');
 const settingsSource = await readFile(new URL('../src/SettingsDialog.tsx', import.meta.url), 'utf8');
@@ -930,4 +930,44 @@ test('Brig restore refuses collisions and retention remains opt-in', async (cont
   assert.equal(listQuarantine().length, 0);
   await assert.rejects(stat(quarantined), { code: 'ENOENT' });
   assert.equal(await readFile(original, 'utf8'), 'old media');
+});
+
+test('purging only claims the space it actually freed, and only unlinks a real file', async () => {
+  const { historySummary } = await import('./history.mjs');
+  const before = historySummary([], 0).totalReclaimedBytes;
+  const original = path.join(testRoot, 'purge-original', 'movie.mkv');
+  const quarantined = path.join(testRoot, 'purge-brig', 'movie.mkv');
+  await mkdir(path.dirname(original), { recursive: true });
+  await mkdir(path.dirname(quarantined), { recursive: true });
+  await writeFile(original, 'x');
+  await writeFile(quarantined, 'quarantined media');
+
+  const record = await recordQuarantine({
+    app: 'radarr', title: 'movie.mkv', sizeBytes: 1000, path: original, root: path.dirname(original),
+  }, quarantined);
+  const purged = await purgeQuarantine(record.id);
+  assert.equal(purged.removed, true);
+  await assert.rejects(stat(quarantined), { code: 'ENOENT' });
+  assert.equal(historySummary([], 0).totalReclaimedBytes, before + 1000);
+
+  // Somebody emptied the Brig folder by hand. The record is cleared, but the reclaimed
+  // total must not grow: nothing gave that space back just now, and the figure is the
+  // one thing on the deck claiming to measure real disk.
+  const ghost = await recordQuarantine({
+    app: 'radarr', title: 'movie.mkv', sizeBytes: 2000, path: original, root: path.dirname(original),
+  }, quarantined);
+  const ghostPurge = await purgeQuarantine(ghost.id);
+  assert.equal(ghostPurge.removed, false);
+  assert.equal(listQuarantine().length, 0);
+  assert.equal(historySummary([], 0).totalReclaimedBytes, before + 1000);
+
+  // A record whose path no longer names a regular file is refused rather than unlinked.
+  const directory = path.join(testRoot, 'purge-brig', 'a-directory');
+  await mkdir(directory, { recursive: true });
+  const corrupt = await recordQuarantine({
+    app: 'radarr', title: 'movie.mkv', sizeBytes: 3000, path: original, root: path.dirname(original),
+  }, directory);
+  await assert.rejects(purgeQuarantine(corrupt.id), /no longer a regular file/);
+  assert.equal(listQuarantine().length, 1);
+  assert.equal(historySummary([], 0).totalReclaimedBytes, before + 1000);
 });
