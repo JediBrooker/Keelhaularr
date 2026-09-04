@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import test from 'node:test';
+
+import { hashPassword, isHashedPassword, verifyPassword } from './passwords.mjs';
 
 async function freePort() {
   const server = net.createServer();
@@ -142,4 +144,101 @@ test('the connection test reports a status code without echoing the remote body'
   assert.equal(body.includes(secret), false, 'remote body must not be echoed back');
   assert.match(body, /returned HTTP 403/);
   assert.equal(response.status, 502);
+});
+
+test('a stored password is salted, hashed, and verifiable in both forms', async () => {
+  const hash = hashPassword('correct horse battery staple');
+  assert.equal(isHashedPassword(hash), true);
+  assert.equal(hash.includes('correct horse'), false);
+  assert.equal(await verifyPassword('correct horse battery staple', hash), true);
+  assert.equal(await verifyPassword('Correct horse battery staple', hash), false);
+  assert.equal(await verifyPassword('', hash), false);
+
+  // Salted, so the same password never produces the same stored value twice and a
+  // leaked file cannot be attacked with one precomputed table.
+  assert.notEqual(hashPassword('same'), hashPassword('same'));
+
+  // A plaintext credential is still honoured: APP_PASSWORD may come from a .env file
+  // this application does not own.
+  assert.equal(await verifyPassword('plain', 'plain'), true);
+  assert.equal(await verifyPassword('plain', 'other'), false);
+
+  // Nothing unparseable is ever treated as a match.
+  for (const broken of ['scrypt$', 'scrypt$0$8$1$AAAA$AAAA', 'scrypt$16384$8$1$$', 'scrypt$99999999$8$1$AAAA$AAAA']) {
+    assert.equal(await verifyPassword('anything', broken), false, broken);
+  }
+  assert.equal(await verifyPassword('anything', ''), false);
+});
+
+async function settingsBody(base, cookie, account) {
+  const view = await (await fetch(`${base}/api/settings`, { headers: { Cookie: cookie } })).json();
+  return {
+    ...view.settings,
+    account: { ...view.settings.account, rotateSessions: false, newPassword: '', ...account },
+  };
+}
+
+test('changing the password signs out every session issued under the old one', async (context) => {
+  const app = await startApp(context);
+  const cookie = (await app.login('test-password')).headers.get('set-cookie').split(';', 1)[0];
+  assert.equal((await fetch(`${app.base}/api/status`, { headers: { Cookie: cookie } })).status, 200);
+
+  const update = await fetch(`${app.base}/api/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify(await settingsBody(app.base, cookie, { newPassword: 'a-brand-new-password' })),
+  });
+  assert.equal(update.status, 200, await update.text());
+
+  // The cookie held before the change is now worthless. Previously it stayed valid for
+  // the rest of its lifetime - up to a year - so changing the password, the one thing
+  // anyone does after suspecting a compromise, evicted nobody.
+  assert.equal((await fetch(`${app.base}/api/status`, { headers: { Cookie: cookie } })).status, 401);
+
+  // The administrator making the change is handed a fresh cookie and stays signed in.
+  const reissued = update.headers.get('set-cookie').split(';', 1)[0];
+  assert.notEqual(reissued, cookie);
+  assert.equal((await fetch(`${app.base}/api/status`, { headers: { Cookie: reissued } })).status, 200);
+
+  assert.equal((await app.login('test-password')).status, 401);
+  assert.equal((await app.login('a-brand-new-password')).status, 200);
+});
+
+test('the saved password is stored hashed, and an older plaintext one is rehashed at boot', async (context) => {
+  const app = await startApp(context);
+  const cookie = (await app.login('test-password')).headers.get('set-cookie').split(';', 1)[0];
+  const update = await fetch(`${app.base}/api/settings`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify(await settingsBody(app.base, cookie, { newPassword: 'stored-secret' })),
+  });
+  assert.equal(update.status, 200, await update.text());
+
+  const settingsPath = path.join(app.root, 'config', 'settings.json');
+  const saved = JSON.parse(await readFile(settingsPath, 'utf8'));
+  assert.equal(saved.values.APP_PASSWORD.includes('stored-secret'), false);
+  assert.equal(isHashedPassword(saved.values.APP_PASSWORD), true);
+
+  // An install upgraded from a version that wrote the password in the clear rehashes it
+  // on the next start rather than leaving it there forever.
+  const legacyRoot = await mkdtemp(path.join(os.tmpdir(), 'kh-legacy-'));
+  context.after(() => rm(legacyRoot, { recursive: true, force: true }));
+  const legacyConfig = path.join(legacyRoot, 'config');
+  await mkdir(legacyConfig, { recursive: true });
+  const legacyPath = path.join(legacyConfig, 'settings.json');
+  await writeFile(legacyPath, JSON.stringify({
+    version: 1,
+    values: { APP_USERNAME: 'captain', APP_PASSWORD: 'legacy-plaintext' },
+  }));
+
+  const legacy = await startApp(context, { CONFIG_DIR: legacyConfig, APP_PASSWORD: '' });
+  assert.equal((await legacy.login('legacy-plaintext')).status, 200);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const values = JSON.parse(await readFile(legacyPath, 'utf8')).values;
+    if (isHashedPassword(values.APP_PASSWORD)) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const migrated = JSON.parse(await readFile(legacyPath, 'utf8')).values;
+  assert.equal(isHashedPassword(migrated.APP_PASSWORD), true, 'plaintext password should be rehashed at boot');
+  assert.equal(await verifyPassword('legacy-plaintext', migrated.APP_PASSWORD), true);
 });
