@@ -971,3 +971,31 @@ test('purging only claims the space it actually freed, and only unlinks a real f
   assert.equal(listQuarantine().length, 1);
   assert.equal(historySummary([], 0).totalReclaimedBytes, before + 1000);
 });
+
+test('the untracked manifest offers identification and import, and colours them by risk', () => {
+  // The column that answers the question the orphan list could never answer before.
+  assert.match(appSource, /<th>In the library\?<\/th>/);
+  assert.match(appSource, /<IdentityChip verdict=\{identities\[item\.id\]\}/);
+
+  const chip = sourceSection('function IdentityChip', 'function PreviewPanel');
+  // Colour carries the meaning here, so it is pinned: green is the reassuring answer
+  // (the library already has this, so removing the copy on disk loses nothing) and red
+  // is the dangerous one (deleting this loses the only copy of something).
+  assert.match(chip, /verdict\.status === 'occupied'[\s\S]*?replacement-chip available/);
+  assert.match(chip, /verdict\.status === 'importable'[\s\S]*?replacement-chip none/);
+  assert.match(chip, /Spare copy/);
+  assert.match(chip, /Missing from library/);
+
+  // Identification is an explicit action: it makes Radarr/Sonarr read folders off disk.
+  assert.match(appSource, /void identifySelection\(\)/);
+  assert.match(appSource, /'\/api\/orphans\/identify'/);
+
+  // The import action exists, and only on the untracked tab.
+  assert.match(appSource, /IMPORT INTO LIBRARY/);
+  assert.match(appSource, /onImport=\{\(\) => \{ void applySelection\('import'\); \}\}/);
+  const dialogActions = sourceSection('{!oversized && (', 'QUARANTINE');
+  assert.match(dialogActions, /onClick=\{onImport\}/);
+
+  // Importing must never claim a permanent-delete confirmation.
+  assert.match(appSource, /confirmPermanent: orphanAction === 'permanent'/);
+});
