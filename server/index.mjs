@@ -57,6 +57,24 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '256kb' }));
 app.use((request, response, next) => {
   response.setHeader('Cache-Control', 'no-store');
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('Referrer-Policy', 'no-referrer');
+  // frame-ancestors matters most here: SameSite=Strict does not stop a page served
+  // from another port on the same host from framing this one, cookie attached, and
+  // overlaying a decoy control on the permanent-delete confirmation.
+  response.setHeader('Content-Security-Policy', [
+    "default-src 'self'",
+    "img-src 'self' data:",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    'font-src https://fonts.gstatic.com',
+    "frame-ancestors 'none'",
+    "base-uri 'none'",
+    "object-src 'none'",
+    "form-action 'none'",
+  ].join('; '));
+  if (currentConfig().cookieSecure) {
+    response.setHeader('Strict-Transport-Security', 'max-age=31536000');
+  }
   next();
 });
 
@@ -137,7 +155,17 @@ function parseCookies(request) {
   return Object.fromEntries((request.headers.cookie ?? '').split(';').map((cookie) => {
     const index = cookie.indexOf('=');
     if (index < 0) return ['', ''];
-    return [cookie.slice(0, index).trim(), decodeURIComponent(cookie.slice(index + 1))];
+    const raw = cookie.slice(index + 1);
+    let value;
+    try {
+      value = decodeURIComponent(raw);
+    } catch {
+      // An invalid percent-escape in ANY cookie - including one set by an unrelated
+      // service on the same host - used to throw out of here and surface as a 500 on
+      // every single API route, leaving the interface unusable.
+      value = raw;
+    }
+    return [cookie.slice(0, index).trim(), value];
   }).filter(([key]) => key));
 }
 
@@ -151,6 +179,14 @@ function signSession(config) {
 }
 
 function validSession(request, config) {
+  try {
+    return checkSession(request, config);
+  } catch {
+    return false;
+  }
+}
+
+function checkSession(request, config) {
   if (!config.password || !config.sessionSecret) return false;
   const token = parseCookies(request).keelhaularr_session;
   if (!token) return false;
@@ -401,20 +437,25 @@ app.post('/api/settings/test', async (request, response, next) => {
       throw error;
     }
     const headers = { Accept: 'application/json', 'X-Api-Key': apiKey };
+    // redirect: 'error' so the API key is never replayed to a redirect target.
     const [arrResponse, rootResponse] = await Promise.all([
-      fetch(`${rawUrl}/api/v3/system/status`, { signal: AbortSignal.timeout(10000), headers }),
-      fetch(`${rawUrl}/api/v3/rootfolder`, { signal: AbortSignal.timeout(10000), headers }),
+      fetch(`${rawUrl}/api/v3/system/status`, { signal: AbortSignal.timeout(10000), redirect: 'error', headers }),
+      fetch(`${rawUrl}/api/v3/rootfolder`, { signal: AbortSignal.timeout(10000), redirect: 'error', headers }),
     ]);
     if (!arrResponse.ok || !rootResponse.ok) {
       const failed = !arrResponse.ok ? arrResponse : rootResponse;
-      const detail = (await failed.text()).slice(0, 300);
-      throw new Error(`${kind} returned HTTP ${failed.status}${detail ? `: ${detail}` : ''}`);
+      // The status code is enough to diagnose a connection problem. Returning the
+      // remote body made this endpoint read back 300 bytes of any HTTP service the
+      // container can reach, since the error message is sent to the caller verbatim.
+      const error = new Error(`${kind} returned HTTP ${failed.status}. Check the URL and API key.`);
+      error.statusCode = 502;
+      throw error;
     }
     const status = await arrResponse.json();
     const roots = await rootResponse.json();
     response.json({
       connected: true,
-      version: status?.version ?? null,
+      version: safeConnectionText(status?.version, 64, [apiKey]),
       rootFolders: Array.isArray(roots)
         ? roots.map((root) => root?.path).filter((root) => typeof root === 'string' && root)
         : [],
