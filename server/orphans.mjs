@@ -54,15 +54,26 @@ export async function assertQbittorrentSafe(config, candidate) {
   }
 }
 
+/**
+ * Returns the directories it could not read rather than throwing on the first one.
+ * A single unreadable subdirectory - `lost+found` is 0700 root:root on every directly
+ * mounted ext4 volume - used to abort the whole scan for every app and every root.
+ *
+ * An incomplete walk is still dangerous, though: files under a directory that could
+ * not be read are invisible, so the caller must treat the result as untrustworthy for
+ * deciding what is missing. Callers gate on `unreadable.length`.
+ */
 async function walk(root, config, output) {
   const stack = [root];
+  const unreadable = [];
   while (stack.length) {
     const directory = stack.pop();
     let entries;
     try {
       entries = await readdir(directory, { withFileTypes: true });
     } catch (error) {
-      throw new Error(`Cannot read ${directory}: ${error.message}`);
+      unreadable.push({ path: directory, reason: error.code ?? error.message });
+      continue;
     }
 
     for (const entry of entries) {
@@ -86,6 +97,7 @@ async function walk(root, config, output) {
       }
     }
   }
+  return unreadable;
 }
 
 export async function scanOrphans(config, arrResults) {
@@ -154,19 +166,50 @@ export async function scanOrphans(config, arrResults) {
 
     const known = new Set([...arrResult.knownPaths].map((knownPath) => path.resolve(knownPath)));
     const libraryIdentities = new Set();
+    // Whether this app's library was surveyed completely enough to be used as evidence
+    // that a completed download has no library hardlink. Any doubt withholds the
+    // download roots below, because "not found in the library" is only meaningful when
+    // the library was actually and fully readable.
+    let libraryTrustworthy = connection.mediaRoots.length > 0;
+    if (!connection.mediaRoots.length && connection.downloadRoots.length) {
+      warnings.push(`${app} has completed-download roots but no media roots, so no library exists to prove a download is unlinked. Completed-download results were withheld.`);
+    }
+
     for (const configuredRoot of connection.mediaRoots) {
       let root;
       try {
         await access(configuredRoot, constants.R_OK);
         root = path.resolve(configuredRoot);
       } catch {
-        warnings.push(`${app} media root is not readable: ${configuredRoot}`);
+        warnings.push(`${app} media root is not readable, so its library could not be surveyed: ${configuredRoot}`);
+        libraryTrustworthy = false;
         continue;
       }
 
       const files = [];
-      await walk(root, config, files);
+      const unreadable = await walk(root, config, files);
       roots.push({ app, kind: 'library', path: root, filesScanned: files.length });
+
+      if (unreadable.length) {
+        // Files under a directory we could not read are invisible to us, so neither
+        // this root's own results nor the hardlink evidence can be trusted.
+        warnings.push(`${app} could not read ${unreadable.length} folder(s) under ${root} (for example ${unreadable[0].path}: ${unreadable[0].reason}). Results for this root were withheld.`);
+        libraryTrustworthy = false;
+        continue;
+      }
+
+      // Sanity floor against a broken path mapping. If the application tracks files
+      // somewhere, and this root holds media, but not one tracked path lands inside
+      // it, the paths are almost certainly not being translated correctly - and
+      // treating that as "everything here is untracked" would offer the whole root
+      // for deletion. That is the difference between a bad mapping and a genuine
+      // library of strays, and it cannot be told apart from here, so withhold.
+      if (files.length && known.size && ![...known].some((knownPath) => isWithin(root, knownPath))) {
+        warnings.push(`${app} tracks ${known.size} file(s) but none of them resolve inside ${root}, although ${files.length} media file(s) were found there. This usually means a path mapping is wrong. Results for this root were withheld; fix the mapping or remove the root.`);
+        libraryTrustworthy = false;
+        continue;
+      }
+
       for (const file of files) {
         const relativePath = path.relative(root, file.path);
         const relativeDirectory = path.dirname(relativePath);
@@ -190,9 +233,12 @@ export async function scanOrphans(config, arrResults) {
       }
     }
 
+    if (!libraryTrustworthy && connection.downloadRoots.length) {
+      warnings.push(`${app} completed-download results were withheld because its library could not be surveyed completely.`);
+    }
     const minimumModifiedAt = Date.now() - config.hardlinkMinAgeHours * 60 * 60 * 1000;
     for (const configuredRoot of connection.downloadRoots) {
-      if (!downloadScanAllowed) continue;
+      if (!downloadScanAllowed || !libraryTrustworthy) continue;
       let root;
       try {
         await access(configuredRoot, constants.R_OK);
@@ -212,8 +258,12 @@ export async function scanOrphans(config, arrResults) {
       }
 
       const files = [];
-      await walk(root, config, files);
+      const unreadableDownloads = await walk(root, config, files);
       roots.push({ app, kind: 'download', path: root, filesScanned: files.length });
+      if (unreadableDownloads.length) {
+        warnings.push(`${app} could not read ${unreadableDownloads.length} folder(s) under ${root} (for example ${unreadableDownloads[0].path}: ${unreadableDownloads[0].reason}). Results for this root were withheld.`);
+        continue;
+      }
       for (const file of files) {
         if (pathIsProtected(file.path, protectedDownloadPaths)) continue;
         if (libraryIdentities.has(file.identity)) continue;

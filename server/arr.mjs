@@ -30,17 +30,33 @@ function joinArrPath(parent, child) {
   return `${parent.replace(/[\\/]$/, '')}${separator}${child.replace(/^[\\/]/, '')}`;
 }
 
+/**
+ * Translates a path an application reports into a path inside this container.
+ *
+ * Returns null when it cannot be resolved. That matters: the previous fall-through of
+ * `path.resolve(input)` turned an unmappable Windows, UNC or relative path into a
+ * cwd-relative fiction that could never match a real file on disk, so every file the
+ * application tracked in that root looked untracked - i.e. deletable.
+ */
 export function mapArrPath(input, pathMaps) {
-  if (!input) return null;
+  if (typeof input !== 'string' || !input) return null;
   const normalizedInput = input.replaceAll('\\', '/');
   for (const mapping of pathMaps) {
-    const from = mapping.from.replaceAll('\\', '/').replace(/\/$/, '');
+    // Trailing slashes are stripped greedily. Stripping only one meant a mapping
+    // written as `/mnt/media//` silently never matched anything.
+    const from = String(mapping.from ?? '').replaceAll('\\', '/').replace(/\/+$/, '');
+    if (!from) continue;
     if (normalizedInput === from || normalizedInput.startsWith(`${from}/`)) {
-      const suffix = normalizedInput.slice(from.length).replace(/^\//, '');
-      return path.resolve(mapping.to, suffix);
+      const suffix = normalizedInput.slice(from.length).replace(/^\/+/, '');
+      const destination = path.resolve(String(mapping.to ?? ''));
+      const mapped = path.resolve(destination, suffix);
+      const relative = path.relative(destination, mapped);
+      // A mapping must not be usable to escape its own destination.
+      return relative.startsWith('..') || path.isAbsolute(relative) ? null : mapped;
     }
   }
-  return path.resolve(input);
+  if (/^[a-z]:\//i.test(normalizedInput) || normalizedInput.startsWith('//')) return null;
+  return path.isAbsolute(normalizedInput) ? path.resolve(normalizedInput) : null;
 }
 
 // Resolves which configured media root contains a mapped library file, so an
