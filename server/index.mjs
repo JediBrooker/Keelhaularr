@@ -28,6 +28,7 @@ import {
   stopJobWorker,
 } from './jobs.mjs';
 import { historySummary } from './history.mjs';
+import { createLoginThrottle } from './login-throttle.mjs';
 import { inspectMediaServer } from './mediaserver.mjs';
 import { previewOrphans, previewOversized, summarizePreview } from './preview.mjs';
 import { scanOrphans } from './orphans.mjs';
@@ -56,6 +57,17 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 const distPath = path.join(projectRoot, 'dist');
 
 app.disable('x-powered-by');
+// Deployment-level and env-only, because trusting X-Forwarded-For when nothing strips
+// it lets any caller claim any address. Set TRUST_PROXY only when a reverse proxy in
+// front of Keelhaularr sets that header itself: `1` for a single proxy, or a subnet
+// list such as `loopback, 172.16.0.0/12`. Without it every request behind a proxy looks
+// like it came from the proxy, which is what the login throttle below has to survive.
+const trustProxy = (process.env.TRUST_PROXY ?? '').trim();
+if (trustProxy && trustProxy !== 'false') {
+  if (/^\d+$/.test(trustProxy)) app.set('trust proxy', Number(trustProxy));
+  else if (trustProxy === 'true') app.set('trust proxy', true);
+  else app.set('trust proxy', trustProxy);
+}
 app.use(express.json({ limit: '256kb' }));
 app.use((request, response, next) => {
   response.setHeader('Cache-Control', 'no-store');
@@ -80,7 +92,18 @@ app.use((request, response, next) => {
   next();
 });
 
-const failedLogins = new Map();
+const loginThrottle = createLoginThrottle();
+
+// One password check at a time. scrypt costs memory and CPU by design, so answering a
+// burst of parallel guesses concurrently would turn the login route into a way to
+// exhaust the container rather than a way to guess the password.
+let verifyQueue = Promise.resolve();
+function queuedVerify(password, stored) {
+  const run = () => verifyPassword(password, stored);
+  verifyQueue = verifyQueue.then(run, run);
+  return verifyQueue;
+}
+
 const currentConfig = () => getConfig(getSettingsOverrides());
 
 function safeConnectionText(value, maxLength, secrets = []) {
@@ -240,9 +263,8 @@ app.post('/api/auth/login', async (request, response) => {
     return;
   }
   const key = request.ip ?? request.socket.remoteAddress ?? 'unknown';
-  const now = Date.now();
-  const recent = (failedLogins.get(key) ?? []).filter((timestamp) => now - timestamp < 15 * 60 * 1000);
-  if (recent.length >= 10) {
+  if (loginThrottle.refuses(key)) {
+    // Refused without hashing, so a sustained attack cannot keep spending scrypt.
     response.status(429).json({ error: 'Too many failed logins. Try again later.' });
     return;
   }
@@ -251,14 +273,14 @@ app.post('/api/auth/login', async (request, response) => {
   // Both halves are always evaluated so a wrong username costs the same as a wrong
   // password, and the credential may be stored either hashed or - from .env - plain.
   const usernameMatches = safeEqual(username, config.username);
-  const passwordMatches = await verifyPassword(password, config.password);
+  const passwordMatches = await queuedVerify(password, config.password);
   if (!usernameMatches || !passwordMatches) {
-    recent.push(now);
-    failedLogins.set(key, recent);
+    const delay = loginThrottle.fail(key);
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     response.status(401).json({ error: 'Incorrect username or password.' });
     return;
   }
-  failedLogins.delete(key);
+  loginThrottle.succeed(key);
   const maxAge = Math.round(config.sessionDays * 86400);
   response.setHeader('Set-Cookie', sessionCookie(config, signSession(config), maxAge));
   response.json({ authenticated: true });
