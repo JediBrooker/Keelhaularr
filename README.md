@@ -402,6 +402,12 @@ all active jobs, with per-file outcomes and errors.
 - **Retry failures** retries failed items without repeating successful ones.
 - Restarting resumes unfinished items. If a delete succeeded but its response
   was lost, an already-missing original file is accepted and its search resumes.
+- Stopping the container during a job waits for the file action in flight, then
+  leaves the rest of the job exactly as it was so the next start picks it up.
+  Files it never reached are not reported as failures. The wait is capped at
+  eight seconds, below Docker's ten-second grace period; a long cross-filesystem
+  copy will still be cut short, and resumes on the next start like any other
+  interrupted item.
 - A job is **completed** when its file actions and search requests finish, not
   when all downloads finish. Expand item progress for separate replacement
   statuses: searching, download queued, downloaded, no result, or search failed.

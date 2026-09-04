@@ -43,6 +43,9 @@ const POST_MUTATION_RECOVERY_PHASES = new Set([
   'search_requested',
 ]);
 let configProvider = null;
+let stopping = false;
+let workerFinished = Promise.resolve();
+let monitorFinished = Promise.resolve();
 let workerRunning = false;
 let monitorRunning = false;
 let workerTimer = null;
@@ -816,6 +819,10 @@ async function processJob(job) {
     validationError = error instanceof Error ? error.message : String(error);
   }
   for (const originalItem of job.items) {
+    // Between items is the only safe place to stop: the file operation itself is not
+    // interruptible, and the job is durable, so leaving it active resumes it on the
+    // next start rather than failing files that were never touched.
+    if (stopping) return;
     const currentJob = getJob(job.id);
     const item = currentJob?.items.find((value) => value.id === originalItem.id);
     if (!item || ['complete', 'cancelled'].includes(item.status)) continue;
@@ -886,10 +893,10 @@ async function processJob(job) {
 }
 
 async function runWorker() {
-  if (workerRunning || !configProvider) return;
+  if (workerRunning || !configProvider || stopping) return;
   workerRunning = true;
   try {
-    while (true) {
+    while (!stopping) {
       const job = listJobs().reverse().find((value) => ACTIVE_STATUSES.has(value.status));
       if (!job) break;
       await processJob(job);
@@ -901,12 +908,14 @@ async function runWorker() {
 
 function kickWorker() {
   clearTimeout(workerTimer);
-  workerTimer = setTimeout(() => runWorker().catch((error) => console.error('Job worker failed:', error)), 20);
+  workerTimer = setTimeout(() => {
+    workerFinished = runWorker().catch((error) => console.error('Job worker failed:', error));
+  }, 20);
   workerTimer.unref?.();
 }
 
 async function monitorReplacements() {
-  if (monitorRunning || !configProvider) return;
+  if (monitorRunning || !configProvider || stopping) return;
   monitorRunning = true;
   try {
     const candidates = listJobs().flatMap((job) => job.items
@@ -935,14 +944,28 @@ async function monitorReplacements() {
 
 export function startJobWorker(getConfig) {
   configProvider = getConfig;
+  stopping = false;
   kickWorker();
   clearInterval(monitorTimer);
-  monitorTimer = setInterval(() => monitorReplacements().catch((error) => console.error('Replacement monitor failed:', error)), 15000);
+  monitorTimer = setInterval(() => {
+    monitorFinished = monitorReplacements().catch((error) => console.error('Replacement monitor failed:', error));
+  }, 15000);
   monitorTimer.unref?.();
 }
 
+/**
+ * Stops taking new work and resolves once whatever was in flight has stopped.
+ *
+ * configProvider is deliberately left in place. Clearing it used to make the very next
+ * `configProvider()` inside the running item loop throw, so shutting the server down
+ * during a job marked every remaining file as failed with `configProvider is not a
+ * function` - a job that had done nothing wrong, reported in a way nobody could act on,
+ * and needing a manual retry afterwards. Items that were never attempted are now simply
+ * left as they were, and the job stays active so it resumes on the next start.
+ */
 export function stopJobWorker() {
+  stopping = true;
   clearTimeout(workerTimer);
   clearInterval(monitorTimer);
-  configProvider = null;
+  return Promise.allSettled([workerFinished, monitorFinished]).then(() => undefined);
 }
