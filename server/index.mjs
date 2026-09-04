@@ -820,11 +820,27 @@ startScheduler(currentConfig);
 startQbittorrentRecovery(currentConfig, createQbittorrentRecoveryJob);
 reconcileQuarantine().catch((error) => console.error('Quarantine reconciliation failed:', error));
 
+// A file action is not interruptible, so shutdown stops taking new work and then waits
+// for whatever is in flight to reach a point where stopping is safe. Jobs are durable
+// and resume on the next start, so anything not reached is left untouched rather than
+// being reported as a failure it never had.
+const SHUTDOWN_GRACE_MS = 8000;
+let shuttingDown = false;
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
+    // A second signal means whoever sent it has stopped waiting.
+    if (shuttingDown) process.exit(1);
+    shuttingDown = true;
     stopQbittorrentRecovery();
     stopScheduler();
-    stopJobWorker();
-    server.close(() => process.exit(0));
+    server.close();
+    const forced = setTimeout(() => {
+      console.warn('Shutting down with a file action still running; it will resume on the next start.');
+      process.exit(0);
+    }, SHUTDOWN_GRACE_MS);
+    forced.unref?.();
+    stopJobWorker()
+      .catch((error) => console.error('Job worker shutdown failed:', error))
+      .finally(() => process.exit(0));
   });
 }

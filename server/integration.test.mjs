@@ -1481,3 +1481,141 @@ test('manual and scheduled scans refresh exact overages while non-authoritative 
   assert.equal(failedScan.connections.radarr.status, 'error');
   assert.deepEqual(failedScan.ignoreSummary, refreshedSummary);
 });
+
+test('shutting down mid-job leaves the untouched files alone and resumes them on restart', async (context) => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-shutdown-test-'));
+  const movies = [12, 13, 14];
+  const deleted = new Set();
+  let deleteRequests = 0;
+  const mock = createServer(async (request, response) => {
+    const url = new URL(request.url, 'http://mock');
+    if (request.method === 'GET' && url.pathname === '/api/v3/system/status') {
+      response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ version: 'shutdown-test' }));
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/api/v3/movie') {
+      response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(movies.map((id) => ({
+        id,
+        title: `Shutdown Movie ${id}`,
+        year: 2026,
+        runtime: 100,
+        monitored: true,
+        hasFile: !deleted.has(id),
+        path: `/library/Shutdown Movie ${id}`,
+        movieFile: deleted.has(id)
+          ? null
+          : { id: id * 100, size: 20 * 1024 ** 3, relativePath: `Shutdown.Movie.${id}.mkv` },
+      }))));
+      return;
+    }
+    const deleteMatch = /^\/api\/v3\/moviefile\/(\d+)$/.exec(url.pathname);
+    if (request.method === 'DELETE' && deleteMatch) {
+      deleteRequests += 1;
+      // Every delete is slow, so a signal arriving now is guaranteed to land while one
+      // file action is genuinely in flight and the rest are still waiting their turn.
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      deleted.add(Number(deleteMatch[1]) / 100);
+      if (!response.destroyed) response.writeHead(204).end();
+      return;
+    }
+    if (request.method === 'POST' && url.pathname === '/api/v3/command') {
+      for await (const chunk of request) void chunk;
+      response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ id: 99 }));
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/api/v3/queue/details') {
+      response.writeHead(200, { 'Content-Type': 'application/json' }).end('[]');
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/api/v3/command/99') {
+      response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ id: 99, status: 'completed' }));
+      return;
+    }
+    response.writeHead(404, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: `${request.method} ${url.pathname}` }));
+  });
+  mock.listen(0, '127.0.0.1');
+  await once(mock, 'listening');
+  const mockPort = mock.address().port;
+  const configDir = path.join(tempRoot, 'config');
+  const environment = {
+    ...process.env,
+    CONFIG_DIR: configDir,
+    APP_USERNAME: 'captain',
+    APP_PASSWORD: 'shutdown-password',
+    APP_SESSION_SECRET: 'shutdown-secret',
+    RADARR_URL: `http://127.0.0.1:${mockPort}`,
+    RADARR_API_KEY: 'test',
+    RADARR_MAX_MB_PER_MIN: '10',
+    RADARR_MEDIA_ROOTS: '',
+    RADARR_DOWNLOAD_ROOTS: '',
+    SONARR_URL: '',
+    SONARR_API_KEY: '',
+  };
+  let child;
+  let restartedChild;
+  context.after(async () => {
+    child?.kill('SIGKILL');
+    restartedChild?.kill('SIGKILL');
+    mock.close();
+    await rm(tempRoot, { recursive: true, force: true });
+  });
+
+  const start = async () => {
+    const port = await freePort();
+    const processChild = spawn(process.execPath, ['server/index.mjs'], {
+      cwd: path.resolve('.'),
+      env: { ...environment, PORT: String(port) },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const base = `http://127.0.0.1:${port}`;
+    await waitFor(`${base}/api/auth/status`, processChild);
+    const login = await fetch(`${base}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'captain', password: 'shutdown-password' }),
+    });
+    assert.equal(login.status, 200);
+    return { processChild, base, cookie: login.headers.get('set-cookie')?.split(';', 1)[0] };
+  };
+
+  const first = await start();
+  child = first.processChild;
+  const scanResponse = await fetch(`${first.base}/api/scan`, { method: 'POST', headers: { Cookie: first.cookie } });
+  assert.equal(scanResponse.status, 200);
+  const ids = (await scanResponse.json()).oversized.map((candidate) => candidate.id);
+  assert.equal(ids.length, 3);
+  const createResponse = await fetch(`${first.base}/api/oversized/apply`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: first.cookie },
+    body: JSON.stringify({ ids, action: 'permanent', confirmPermanent: true }),
+  });
+  assert.equal(createResponse.status, 202);
+  const jobId = (await createResponse.json()).job.id;
+
+  await waitUntil(() => deleteRequests === 1, 'the first delete request');
+  const stopped = Date.now();
+  child.kill('SIGTERM');
+  const [code] = await once(child, 'exit');
+  assert.equal(code, 0, 'a clean shutdown should exit zero');
+  // It has to wait for the file action in flight, and it has to not wait forever.
+  assert.ok(Date.now() - stopped < 9000, `shutdown took ${Date.now() - stopped}ms`);
+
+  const state = JSON.parse(await readFile(path.join(configDir, 'jobs.json'), 'utf8'));
+  const job = state.jobs.find((entry) => entry.id === jobId);
+  // Clearing the worker's config provider on shutdown used to make the next item in the
+  // loop throw, so every file the job had not reached yet was marked failed with
+  // "configProvider is not a function" - a job that had done nothing wrong, reported in
+  // a way nobody could act on, and left needing a manual retry.
+  const errors = job.items.map((item) => item.error).filter(Boolean);
+  assert.deepEqual(errors, [], `no item should have failed: ${errors.join(' | ')}`);
+  assert.equal(job.items.filter((item) => item.status === 'failed').length, 0);
+  assert.ok(['queued', 'running', 'cancelling'].includes(job.status), `job status was ${job.status}`);
+  assert.equal(job.items.filter((item) => item.status === 'complete').length, 1);
+
+  const second = await start();
+  restartedChild = second.processChild;
+  const resumed = await waitForJob(second.base, second.cookie, jobId, 200);
+  assert.equal(resumed.status, 'completed');
+  assert.equal(resumed.items.filter((item) => item.status === 'complete').length, 3);
+  assert.equal(deleted.size, 3);
+});
