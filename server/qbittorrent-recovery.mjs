@@ -47,6 +47,7 @@ function policyDocument(config) {
     slowSpeedKibPerSecond: finiteNumber(recovery.slowSpeedKibPerSecond),
     slowMinutes: finiteNumber(recovery.slowMinutes),
     stalledMinutes: finiteNumber(recovery.stalledMinutes),
+    metadataMinutes: finiteNumber(recovery.metadataMinutes ?? 15),
     excludedCategories: Array.isArray(recovery.excludedCategories)
       ? [...new Set(recovery.excludedCategories.filter((category) => typeof category === 'string'))].sort()
       : [],
@@ -63,8 +64,9 @@ function timestamp(value = Date.now()) {
   return Number(value);
 }
 
-function observationThresholdMs(reason, recovery) {
-  const minutes = finiteNumber(reason === 'slow' ? recovery.slowMinutes : recovery.stalledMinutes);
+export function observationThresholdMs(reason, recovery) {
+  const minutes = finiteNumber(reason === 'metadata' ? (recovery.metadataMinutes ?? 15)
+    : reason === 'slow' ? recovery.slowMinutes : reason === 'stalled' ? recovery.stalledMinutes : undefined);
   return minutes === null ? null : minutes * 60_000;
 }
 
@@ -76,7 +78,9 @@ export function classifyQbittorrentRecoveryTorrent(torrent, recovery) {
   if (!(torrent.amount_left > 0 || torrent.progress < 1)) return null;
 
   let reason = null;
-  if (torrent.state === 'stalledDL') {
+  if (['metaDL', 'forcedMetaDL'].includes(torrent.state)) {
+    reason = 'metadata';
+  } else if (torrent.state === 'stalledDL') {
     reason = 'stalled';
   } else if (torrent.state === 'downloading') {
     const slowSpeedKibPerSecond = finiteNumber(recovery?.slowSpeedKibPerSecond);

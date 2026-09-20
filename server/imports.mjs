@@ -512,6 +512,7 @@ export async function identifyScanCandidates(config, arrResults, candidates, lim
   // and leave Sonarr's untracked files permanently unidentified.
   const share = Math.max(1, Math.floor(limit / byApp.size));
   for (const [app, group] of byApp) {
+    if (arrResults?.[app]?.status === 'error') continue;
     const withFile = arrResults?.[app]?.withFile ?? new Set();
     const results = await identifyByName(config[app], group, withFile, share);
     for (const [id, result] of results) merged.set(id, result);

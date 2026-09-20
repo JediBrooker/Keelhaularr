@@ -299,6 +299,9 @@ function qbittorrentConnection(overrides) {
       slowMinutes: readBoundedInteger(
         'QBITTORRENT_RECOVERY_SLOW_MINUTES', 30, 1, 10080, overrides,
       ),
+      metadataMinutes: readBoundedInteger(
+        'QBITTORRENT_RECOVERY_METADATA_MINUTES', 15, 1, 10080, overrides,
+      ),
       stalledMinutes: readBoundedInteger(
         'QBITTORRENT_RECOVERY_STALLED_MINUTES', 30, 1, 10080, overrides,
       ),

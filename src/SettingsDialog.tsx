@@ -25,6 +25,7 @@ interface QBittorrentRecoverySettings {
   slowSpeedKibPerSecond: number;
   slowMinutes: number;
   stalledMinutes: number;
+  metadataMinutes: number;
   excludedCategories: string[];
 }
 
@@ -128,6 +129,7 @@ interface QBittorrentForm {
     slowSpeedKibPerSecond: string;
     slowMinutes: string;
     stalledMinutes: string;
+    metadataMinutes: string;
     excludedCategories: string[];
   };
 }
@@ -355,6 +357,7 @@ function qbittorrentForm(settings: QBittorrentSettings): QBittorrentForm {
       slowSpeedKibPerSecond: settings.recovery.slowSpeedKibPerSecond.toString(),
       slowMinutes: settings.recovery.slowMinutes.toString(),
       stalledMinutes: settings.recovery.stalledMinutes.toString(),
+      metadataMinutes: (settings.recovery.metadataMinutes ?? 15).toString(),
       excludedCategories: [...settings.recovery.excludedCategories],
     },
   };
@@ -581,7 +584,7 @@ function QBittorrentRecoverySection({ form, categoryDiscovery, canRefreshCategor
       <div className={`recovery-panel ${form.recovery.enabled ? 'enabled' : ''}`}>
         <label className="check-row feature-toggle recovery-toggle">
           <input type="checkbox" checked={form.recovery.enabled} onChange={(event) => updateRecovery('enabled', event.target.checked)} />
-          <span><strong>Automatically replace slow or stalled downloads</strong><small>Off by default. Turning this off keeps the thresholds and exclusions below.</small></span>
+          <span><strong>Automatically replace slow, stalled, or metadata-stuck downloads</strong><small>Off by default. Turning this off keeps the thresholds and exclusions below.</small></span>
         </label>
         <div className="recovery-warning">
           <strong>Destructive automation</strong>
@@ -591,6 +594,7 @@ function QBittorrentRecoverySection({ form, categoryDiscovery, canRefreshCategor
           <label className="field">Slow below (KiB/s) <span>0 disables slow-speed detection</span><input type="number" min="0" max="1048576" step="1" inputMode="numeric" value={form.recovery.slowSpeedKibPerSecond} onChange={(event) => updateRecovery('slowSpeedKibPerSecond', event.target.value)} /></label>
           <label className="field">Slow for (minutes)<input type="number" min="1" max="10080" step="1" inputMode="numeric" value={form.recovery.slowMinutes} onChange={(event) => updateRecovery('slowMinutes', event.target.value)} /></label>
           <label className="field">Stalled for (minutes)<input type="number" min="1" max="10080" step="1" inputMode="numeric" value={form.recovery.stalledMinutes} onChange={(event) => updateRecovery('stalledMinutes', event.target.value)} /></label>
+          <label className="field">Fetching metadata for (minutes)<input type="number" min="1" max="10080" step="1" inputMode="numeric" value={form.recovery.metadataMinutes} onChange={(event) => updateRecovery('metadataMinutes', event.target.value)} /></label>
         </div>
         <div className="category-picker" aria-labelledby="qbittorrent-recovery-categories-title">
           <div className="category-picker-head">
@@ -838,6 +842,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
               slowSpeedKibPerSecond: numeric(form.qbittorrent.recovery.slowSpeedKibPerSecond, 'qBittorrent slow-speed threshold'),
               slowMinutes: numeric(form.qbittorrent.recovery.slowMinutes, 'qBittorrent slow duration'),
               stalledMinutes: numeric(form.qbittorrent.recovery.stalledMinutes, 'qBittorrent stalled duration'),
+              metadataMinutes: numeric(form.qbittorrent.recovery.metadataMinutes, 'qBittorrent metadata duration'),
               excludedCategories: [...form.qbittorrent.recovery.excludedCategories],
             },
           },

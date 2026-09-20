@@ -215,3 +215,21 @@ test('the quarantine directory cannot sit inside or around a scanned root', asyn
   assert.equal(withRoots(brig, { mediaRoots: [movies] }).ORPHAN_TRASH_DIR, brig);
   assert.equal(withRoots('', { mediaRoots: [movies] }).ORPHAN_TRASH_DIR, '');
 });
+
+test('metadata recovery timeout defaults, round trips, and rejects unsafe values', async () => {
+  const { getConfig } = await import('./config.mjs');
+  const config = getConfig();
+  assert.equal(config.qbittorrent.recovery.metadataMinutes, 15);
+  const input = settingsView(config);
+  input.qbittorrent.recovery.metadataMinutes = 7;
+  const saved = buildSettingsOverrides(input, {});
+  assert.equal(saved.QBITTORRENT_RECOVERY_METADATA_MINUTES, '7');
+  assert.equal(getConfig(saved).qbittorrent.recovery.metadataMinutes, 7);
+  delete input.qbittorrent.recovery.metadataMinutes;
+  assert.equal(buildSettingsOverrides(input, saved).QBITTORRENT_RECOVERY_METADATA_MINUTES, '7');
+  for (const invalid of [0, -1, 1.5, 10081, 'invalid']) {
+    input.qbittorrent.recovery.metadataMinutes = invalid;
+    assert.throws(() => buildSettingsOverrides(input, {}), /metadata duration/);
+    assert.throws(() => getConfig({ QBITTORRENT_RECOVERY_METADATA_MINUTES: String(invalid) }), /METADATA_MINUTES/);
+  }
+});

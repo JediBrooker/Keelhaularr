@@ -332,12 +332,24 @@ export async function scanSonarr(connection) {
     const tagLabels = tagLabelMap(tags);
     let unknownRuntimeFiles = 0;
 
+    // File inventory is the evidence needed for orphan detection. Episode metadata
+    // is only needed for sizing and identification; failure there must not discard
+    // a complete inventory or masquerade as a disconnected Sonarr.
+    if (!Array.isArray(seriesList)) throw new Error('Sonarr returned an invalid series inventory.');
     const perSeries = await mapLimit(seriesList, 6, async (series) => {
-      const [files, episodes] = await Promise.all([
-        arrRequest(connection, `episodefile?seriesId=${series.id}`),
-        arrRequest(connection, `episode?seriesId=${series.id}`),
-      ]);
-      return { series, files, episodes };
+      const files = await arrRequest(connection, `episodefile?seriesId=${series.id}`);
+      if (!Array.isArray(files)) throw new Error(`Sonarr returned an invalid file inventory for series ${series.id}.`);
+      for (const file of files) {
+        const localPath = mapArrPath(file.path || joinArrPath(series.path, file.relativePath), connection.pathMaps);
+        if (!localPath) throw new Error(`Sonarr file ${file.id} has no usable local path; check path mappings.`);
+        result.knownPaths.add(localPath);
+      }
+      return { series, files };
+    });
+    result.knownPathsComplete = true;
+    await mapLimit(perSeries, 6, async (entry) => {
+      entry.episodes = await arrRequest(connection, `episode?seriesId=${entry.series.id}`);
+      if (!Array.isArray(entry.episodes)) throw new Error(`Sonarr returned invalid episodes for series ${entry.series.id}.`);
     });
 
     for (const { series, files, episodes } of perSeries) {
@@ -457,7 +469,10 @@ export function arrInstances(config) {
   if (Array.isArray(config?.instances) && config.instances.length) return config.instances;
   return [config?.radarr, config?.sonarr]
     .filter(Boolean)
-    .map((connection, index) => ({ ...connection, id: connection.id ?? (index === 0 ? 'radarr' : 'sonarr') }));
+    .map((connection) => {
+      const kind = connection.kind ?? (connection === config.sonarr ? 'sonarr' : 'radarr');
+      return { ...connection, kind, id: connection.id ?? kind };
+    });
 }
 
 // Durable jobs record the URL of every instance so a connection change can be detected

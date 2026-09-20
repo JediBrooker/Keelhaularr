@@ -36,6 +36,7 @@ import {
 import { REPLACEMENT_AVAILABLE, findReplacements } from './replacements.mjs';
 import {
   classifyQbittorrentRecoveryTorrent,
+  observationThresholdMs,
   qbittorrentRecoveryPolicyIdentity,
 } from './qbittorrent-recovery.mjs';
 import { listQbittorrentTorrents } from './qbittorrent.mjs';
@@ -305,7 +306,7 @@ export async function createQbittorrentRecoveryJob(config, candidates) {
     createdJob = {
       id: randomUUID(),
       type: 'qbittorrent-recovery',
-      title: `Recover ${selected.length} slow or stalled torrent${selected.length === 1 ? '' : 's'}`,
+      title: `Recover ${selected.length} slow, stalled, or metadata-stuck torrent${selected.length === 1 ? '' : 's'}`,
       status: 'queued',
       createdAt: now,
       updatedAt: now,
@@ -683,18 +684,18 @@ function sameIds(left, right) {
 
 function assertRecoveryObservationMature(config, candidate) {
   const recovery = config.qbittorrent.recovery;
-  const minutes = Number(candidate.reason === 'slow' ? recovery.slowMinutes : recovery.stalledMinutes);
+  const thresholdMs = observationThresholdMs(candidate.reason, recovery);
   const observedSince = Date.parse(candidate.observedSince);
-  if (!Number.isFinite(minutes) || minutes < 0 || !Number.isFinite(observedSince)
-    || Date.now() - observedSince < minutes * 60_000) {
-    throw new Error('The saved slow/stalled observation window is missing, malformed, or no longer satisfies the policy.');
+  if (thresholdMs === null || !Number.isFinite(thresholdMs) || thresholdMs < 0 || !Number.isFinite(observedSince)
+    || Date.now() - observedSince < thresholdMs) {
+    throw new Error('The saved slow/stalled/metadata observation window is missing, malformed, or no longer satisfies the policy.');
   }
 }
 
 function assertRecoveryTorrentEligible(config, candidate, torrent) {
   const classification = classifyQbittorrentRecoveryTorrent(torrent, config.qbittorrent.recovery);
   if (!classification || classification.reason !== candidate.reason || torrent.category !== candidate.category) {
-    throw new Error('The torrent recovered, changed category, or no longer matches the approved slow/stalled policy.');
+    throw new Error('The torrent recovered, changed category, or no longer matches the approved slow/stalled/metadata policy.');
   }
   assertRecoveryObservationMature(config, candidate);
 }
@@ -744,7 +745,7 @@ async function finishRecoverySearch(job, item, config) {
     await updateItem(job.id, item.id, (value) => {
       value.status = 'complete';
       value.phase = 'search_queued';
-      value.outcome = 'Slow/stalled torrent removed, blocklisted, and replacement search queued.';
+      value.outcome = 'Unhealthy torrent removed, blocklisted, and replacement search queued.';
       value.replacement = {
         status: 'searching',
         commandId: existing.id ?? null,
@@ -769,7 +770,7 @@ async function finishRecoverySearch(job, item, config) {
   await updateItem(job.id, item.id, (value) => {
     value.status = 'complete';
     value.phase = 'search_queued';
-    value.outcome = 'Slow/stalled torrent removed, blocklisted, and replacement search queued.';
+    value.outcome = 'Unhealthy torrent removed, blocklisted, and replacement search queued.';
     value.replacement = {
       status: 'searching',
       commandId: command?.id ?? null,

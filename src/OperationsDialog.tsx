@@ -190,7 +190,8 @@ function JobItemRow({ item, recovery }: { item: JobItem; recovery: boolean }) {
     : item.candidate.category === undefined ? 'Unknown category' : `Category ${JSON.stringify(item.candidate.category)}`;
   const reason = item.candidate.reason === 'slow'
     ? 'Slow download'
-    : item.candidate.reason === 'stalled' ? 'Stalled download' : 'Automatic replacement candidate';
+    : item.candidate.reason === 'stalled' ? 'Stalled download'
+      : item.candidate.reason === 'metadata' ? 'Metadata timeout' : 'Automatic replacement candidate';
   const terminal = ['failed', 'cancelled', 'skipped'].includes(item.status);
   let badgeValue = item.status;
   let badgeLabel = statusLabel(item.status, itemStatusLabels);

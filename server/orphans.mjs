@@ -180,9 +180,14 @@ export async function scanOrphans(config, arrResults) {
     const app = connection.id;
     const arrResult = arrResults[app];
     if (!connection.mediaRoots.length && !connection.downloadRoots.length) continue;
-    if (arrResult.status !== 'connected') {
-      warnings.push(`${app} orphan scan withheld because ${app} is not connected.`);
+    if (arrResult?.status !== 'connected' && arrResult?.knownPathsComplete !== true) {
+      const detail = arrResult?.error || (connection.configured ? 'No complete library inventory is available.' : 'The connection is not configured.');
+      warnings.push(`${app} orphan scan withheld because its library inventory is incomplete: ${detail}`);
       continue;
+    }
+
+    if (arrResult.status !== 'connected' && arrResult.error) {
+      warnings.push(`${app} library file inventory is complete; orphan scanning can continue, but episode analysis failed: ${arrResult.error}`);
     }
 
     const known = new Set([...arrResult.knownPaths].map((knownPath) => path.resolve(knownPath)));

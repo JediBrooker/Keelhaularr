@@ -468,7 +468,7 @@ test('durable recovery jobs dedupe, revalidate, delete through Arr, and never se
       hash: active.hash,
       name: `Release ${active.hash}`,
       category: active.category,
-      state: 'downloading',
+      state: active.state ?? 'downloading',
       dlspeed: active.speed,
       progress: 0.4,
       amount_left: 600,
@@ -530,8 +530,8 @@ test('durable recovery jobs dedupe, revalidate, delete through Arr, and never se
       title: `Release ${active.hash}`,
       subtitle: 'Radarr download',
       category: active.category,
-      state: 'downloading',
-      reason: 'slow',
+      state: active.state ?? 'downloading',
+      reason: active.state === 'metaDL' ? 'metadata' : 'slow',
       observedSince: new Date(Date.now() - 120_000).toISOString(),
       detectedAt: new Date().toISOString(),
       policyIdentity,
@@ -675,10 +675,49 @@ test('durable recovery jobs dedupe, revalidate, delete through Arr, and never se
   assert.equal(deletes.length, deletionCountAfterInterruption);
   assert.equal(commands.length, 1);
   assert.equal(await createQbittorrentRecoveryJob(value, [candidateForCurrent()]), null);
+
+  value.qbittorrent.recovery.metadataMinutes = 1;
+  active = { hash: 'metadatajob', movieId: 13, queueId: 47, present: true,
+    speed: 0, category: 'movies', state: 'metaDL', deleteRemoves: true };
+  const metadata = await createQbittorrentRecoveryJob(value, [candidateForCurrent()]);
+  assert.equal((await waitForJob(metadata.id)).status, 'completed');
+  assert.equal(commands.length, 2);
+  assert.equal(deletes.length, deletionCountAfterInterruption + 1);
+
+  value.qbittorrent.recovery.metadataMinutes = 15;
+  active = { ...active, hash: 'youngmetadata', queueId: 48, present: true };
+  const young = await createQbittorrentRecoveryJob(value, [candidateForCurrent()]);
+  assert.equal((await waitForJob(young.id)).status, 'completed_with_errors');
+  assert.equal(deletes.length, deletionCountAfterInterruption + 1);
 });
 
 test('recovery state is persisted in the private JSON store', { concurrency: false }, async () => {
   const body = JSON.parse(await readFile(path.join(process.env.CONFIG_DIR, 'qbittorrent-recovery.json'), 'utf8'));
   assert.equal(body.version, 1);
   assert.ok(Object.hasOwn(body, 'observations'));
+});
+
+test('metadata has an independent continuous timeout, including forced metadata', { concurrency: false }, async () => {
+  const value = config('metadata-window', { metadataMinutes: 2, stalledMinutes: 1 });
+  const captured = [];
+  const base = Date.UTC(2026, 1, 1);
+  let state = 'metaDL';
+  const options = {
+    listTorrents: async () => [torrent('metahash', { state, progress: 0, amount_left: 0 })],
+    resolveOwnership: async (_config, item) => ownershipFor(item),
+  };
+  for (const seconds of [0, 60, 119]) {
+    await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + seconds * 1000 });
+  }
+  assert.equal(captured.length, 0);
+  state = 'forcedMetaDL';
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + 120_000 });
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].reason, 'metadata');
+  state = 'queuedDL';
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + 180_000 });
+  state = 'metaDL';
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + 240_000 });
+  assert.equal(captured.length, 1);
+  assert.notEqual(qbittorrentRecoveryPolicyIdentity(value), qbittorrentRecoveryPolicyIdentity(config('metadata-window', { metadataMinutes: 3 })));
 });

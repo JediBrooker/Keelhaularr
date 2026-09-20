@@ -28,7 +28,7 @@ Both destructive automations are opt-in and disabled by default.
 - One-press import that hands a missing file back to Radarr/Sonarr to hardlink or move per their own settings
 - Inode-based hardlink integrity checks for completed torrent/download folders
 - Optional qBittorrent guard that withholds every incomplete torrent from orphan actions
-- Opt-in automatic recovery for continuously slow or stalled qBittorrent downloads
+- Opt-in automatic recovery for continuously slow, stalled, or metadata-stuck qBittorrent downloads
 - Recoverable orphan quarantine or confirmed permanent deletion per selected batch
 - Built-in login with the password stored as a salted scrypt hash, never in the clear
 - HttpOnly, SameSite=Strict signed sessions, all of which end the moment the password changes
@@ -481,6 +481,12 @@ disable size-limit checks for a tracked movie or episode.
 
 ## Orphan scanning
 
+Sonarr orphan scanning uses its complete episode-file inventory independently of
+episode analysis. If episode analysis fails after all file paths are collected,
+orphan scanning can continue and reports the underlying error. An incomplete or
+unmappable file inventory still withholds cleanup; a successful connection test
+alone is not enough to establish that files are untracked.
+
 Set separate local roots for the two applications:
 
 ```dotenv
@@ -664,6 +670,7 @@ QBITTORRENT_RECOVERY_ENABLED=false
 QBITTORRENT_RECOVERY_SLOW_KIB_PER_SECOND=100
 QBITTORRENT_RECOVERY_SLOW_MINUTES=30
 QBITTORRENT_RECOVERY_STALLED_MINUTES=30
+QBITTORRENT_RECOVERY_METADATA_MINUTES=15
 QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON=[]
 ```
 
@@ -675,8 +682,9 @@ exclusions. Settings discovers categories from the saved connection, while a
 successful test of unsaved credentials replaces the displayed discovery list.
 
 Eligibility is deliberately narrow. The torrent must still be incomplete and
-must remain either exactly `downloading` below the configured speed or exactly
-`stalledDL` for its full threshold. Paused, queued, forced, checking, metadata,
+must remain `downloading` below the configured speed, `stalledDL`, or fetching
+metadata for its full threshold. Metadata states (`metaDL` and `forcedMetaDL`)
+have a separate timeout, defaulting to 15 minutes. Paused, queued, forced downloads, checking,
 uploading, completed, malformed, and unknown states are left untouched. The
 server polls once per minute and records the observation durably, but the timer
 must be continuous for the same hash, reason, and category. Recovery being

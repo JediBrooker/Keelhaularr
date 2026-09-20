@@ -261,6 +261,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     slowSpeedKibPerSecond: 100,
     slowMinutes: 30,
     stalledMinutes: 30,
+    metadataMinutes: 15,
     excludedCategories: [],
   });
   assert.deepEqual(initialSettings.server.storageRoots, [moviesRoot, tvRoot]);
@@ -344,6 +345,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
         slowSpeedKibPerSecond: 0,
         slowMinutes: 45,
         stalledMinutes: 60,
+        metadataMinutes: 20,
         excludedCategories: ['', 'do-not-touch', ' Kids Movies '],
       },
     },
@@ -417,6 +419,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     [{ ...settingsUpdate.qbittorrent.recovery, slowSpeedKibPerSecond: 1048577 }, /slow-speed threshold/i],
     [{ ...settingsUpdate.qbittorrent.recovery, slowMinutes: 0 }, /slow duration/i],
     [{ ...settingsUpdate.qbittorrent.recovery, stalledMinutes: 10081 }, /stalled duration/i],
+    [{ ...settingsUpdate.qbittorrent.recovery, metadataMinutes: 0 }, /metadata duration/i],
     [{ ...settingsUpdate.qbittorrent.recovery, excludedCategories: ['duplicate', 'duplicate'] }, /duplicate/i],
     [{ ...settingsUpdate.qbittorrent.recovery, excludedCategories: ['x'.repeat(257)] }, /256/i],
     [{ ...settingsUpdate.qbittorrent.recovery, excludedCategories: Array.from({ length: 101 }, (_, index) => `category-${index}`) }, /100/i],

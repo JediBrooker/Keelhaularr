@@ -18,7 +18,7 @@ const SETTINGS_KEYS = new Set([
   'RADARR_SIZE_RULES_JSON', 'SONARR_SIZE_RULES_JSON',
   'QBITTORRENT_RECOVERY_ENABLED', 'QBITTORRENT_RECOVERY_SLOW_KIB_PER_SECOND',
   'QBITTORRENT_RECOVERY_SLOW_MINUTES', 'QBITTORRENT_RECOVERY_STALLED_MINUTES',
-  'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON',
+  'QBITTORRENT_RECOVERY_METADATA_MINUTES', 'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON',
   'ORPHAN_ACTION', 'ORPHAN_TRASH_DIR', 'ALLOW_PERMANENT_ORPHAN_DELETE',
   'ORPHAN_IGNORE_DIRECTORIES', 'ORPHAN_MAX_FILES', 'MEDIA_EXTENSIONS', 'HARDLINK_MIN_AGE_HOURS',
   'QUARANTINE_RETENTION_DAYS', 'OVERSIZE_REQUIRE_REPLACEMENT', 'ORPHAN_AUTO_IDENTIFY',
@@ -289,6 +289,12 @@ function qbittorrentOverrides(input, output) {
       'qBittorrent slow duration',
       { min: 1, max: 10080, integer: true },
     ).toString();
+    if (recovery.metadataMinutes !== undefined) {
+      output.QBITTORRENT_RECOVERY_METADATA_MINUTES = numberValue(
+        recovery.metadataMinutes, 'qBittorrent metadata duration',
+        { min: 1, max: 10080, integer: true },
+      ).toString();
+    }
     output.QBITTORRENT_RECOVERY_STALLED_MINUTES = numberValue(
       recovery.stalledMinutes,
       'qBittorrent stalled duration',
