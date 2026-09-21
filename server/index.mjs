@@ -27,6 +27,8 @@ import {
   startJobWorker,
   stopJobWorker,
 } from './jobs.mjs';
+import { summarizeDuplicates, verifyDuplicates } from './duplicates.mjs';
+import { auditImports } from './hardlink-audit.mjs';
 import { historySummary } from './history.mjs';
 import { identifyOrphansForCandidates, identifyScanCandidates } from './imports.mjs';
 import { createLoginThrottle } from './login-throttle.mjs';
@@ -51,7 +53,7 @@ import {
   saveSettingsOverrides,
   settingsView,
 } from './settings.mjs';
-import { storageHealth } from './storage-health.mjs';
+import { hardlinkConfigurationWarnings, storageHealth } from './storage-health.mjs';
 
 const app = express();
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -519,6 +521,17 @@ app.post('/api/scan', async (request, response, next) => {
     const identifications = config.orphanAutoIdentify
       ? await identifyScanCandidates(config, arr, orphanCandidates, config.orphanAutoIdentifyLimit)
       : [];
+    // Two stats per spare copy, which is cheap enough to run on every row of every
+    // scan. It only ever separates "different sizes, so definitely not the same file"
+    // from "worth a closer look"; reading contents is left to an explicit check.
+    const duplicates = await verifyDuplicates(orphanCandidates, identifications, { mode: 'size' });
+    // Both of these explain why untracked files keep appearing, so they belong on the
+    // scan rather than on a page nobody opens. Neither is allowed to fail a scan: a
+    // diagnostic that breaks the tool it is diagnosing is worse than no diagnostic.
+    const [hardlinkWarnings, importAudit] = await Promise.all([
+      hardlinkConfigurationWarnings(config).catch(() => []),
+      auditImports(config).catch(() => ({ checkedAt: null, instances: [], warnings: [] })),
+    ]);
     response.json({
       scannedAt: new Date().toISOString(),
       config: publicConfig(config),
@@ -529,9 +542,16 @@ app.post('/api/scan', async (request, response, next) => {
       oversized: oversized.sort((a, b) => b.overageBytes - a.overageBytes),
       orphans: orphanCandidates.sort((a, b) => b.sizeBytes - a.sizeBytes),
       identifications,
+      duplicates,
+      duplicateSummary: summarizeDuplicates(duplicates),
+      importAudit,
       roots: orphans.roots,
       qbittorrentSafety: orphans.qbittorrentSafety,
       warnings: [...arr.radarr.warnings, ...arr.sonarr.warnings, ...orphans.warnings],
+      // Deliberately not folded into `warnings`. A warning there means the scan could
+      // not see everything, so its results may be incomplete. These say the opposite:
+      // the results are accurate, and here is why they keep looking like this.
+      advisories: [...hardlinkWarnings, ...importAudit.warnings],
       ignoreSummary: exclusionSummary(),
     });
   } catch (error) {
@@ -578,8 +598,13 @@ app.post('/api/preview', async (request, response, next) => {
       return;
     }
     const action = request.body?.action;
-    if (action !== 'quarantine' && action !== 'permanent') {
-      response.status(400).json({ error: 'Preview requires either quarantine or permanent.' });
+    // Relink only exists for untracked files: there is no tracked-file equivalent of
+    // "this is a second copy of something the library already holds".
+    const allowed = tab === 'orphans'
+      ? ['quarantine', 'permanent', 'relink']
+      : ['quarantine', 'permanent'];
+    if (!allowed.includes(action)) {
+      response.status(400).json({ error: `Preview requires ${allowed.slice(0, -1).join(', ')} or ${allowed.at(-1)}.` });
       return;
     }
     const checkReplacements = request.body?.checkReplacements === true;
@@ -658,7 +683,12 @@ app.post('/api/orphans/identify', async (request, response, next) => {
       response.status(409).json({ error: 'None of the selected files are still untracked.' });
       return;
     }
-    response.json({ identifications: await identifyOrphansForCandidates(config, candidates) });
+    const identifications = await identifyOrphansForCandidates(config, candidates);
+    // Asked for explicitly and bounded to 200 rows, so this one reads the files: the
+    // sampled windows separate "the library has this film" from "the library has these
+    // exact bytes", which is the difference between deleting and relinking.
+    const duplicates = await verifyDuplicates(candidates, identifications, { mode: 'sampled' });
+    response.json({ identifications, duplicates, duplicateSummary: summarizeDuplicates(duplicates) });
   } catch (error) {
     next(error);
   }
@@ -672,8 +702,8 @@ app.post('/api/orphans/apply', async (request, response, next) => {
       return;
     }
     const action = request.body?.action;
-    if (!['quarantine', 'permanent', 'import'].includes(action)) {
-      response.status(400).json({ error: 'Choose quarantine, permanent or import for the selected files.' });
+    if (!['quarantine', 'permanent', 'import', 'relink'].includes(action)) {
+      response.status(400).json({ error: 'Choose quarantine, permanent, import or relink for the selected files.' });
       return;
     }
     if (action === 'permanent' && request.body?.confirmPermanent !== true) {

@@ -754,7 +754,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const missingAction = await request('/api/orphans/apply', { ids: orphanIds });
   assert.equal(missingAction.status, 400);
   assert.deepEqual(await missingAction.json(), {
-    error: 'Choose quarantine, permanent or import for the selected files.',
+    error: 'Choose quarantine, permanent, import or relink for the selected files.',
   });
   const invalidAction = await request('/api/orphans/apply', { ids: orphanIds, action: 'Permanent' });
   assert.equal(invalidAction.status, 400);

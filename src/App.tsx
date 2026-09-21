@@ -14,7 +14,7 @@ interface InstanceConfig extends PublicConnectionConfig {
   label: string;
 }
 type Tab = 'oversized' | 'orphans';
-type OrphanAction = 'quarantine' | 'permanent' | 'import';
+type OrphanAction = 'quarantine' | 'permanent' | 'import' | 'relink';
 type ConfirmationStage = 'closed' | 'choose' | 'preview' | 'permanent';
 type GateStatus = 'pass' | 'fail' | 'warn' | 'unknown';
 
@@ -62,7 +62,29 @@ interface IdentityVerdict {
   reason: string | null;
   title: string | null;
   quality: string | null;
-  existing: { path: string | null; sizeBytes: number | null; quality: string | null } | null;
+  existing: { path: string | null; localPath: string | null; sizeBytes: number | null; quality: string | null } | null;
+}
+
+// Whether a spare copy is the *same* copy. Identification answers by name, which cannot
+// tell a second copy of one release from a different release of the same film; only a
+// content check can, and only that difference makes a file relinkable.
+type DuplicateStatus = 'duplicate' | 'distinct' | 'linked' | 'unverified' | 'not-applicable';
+
+interface DuplicateVerdict {
+  id: string;
+  status: DuplicateStatus;
+  reason: string;
+  libraryPath: string | null;
+  mode: 'size' | 'sampled' | 'full' | null;
+  reclaimableBytes: number;
+  relinkable: boolean;
+}
+
+interface DuplicateSummary {
+  checked: number;
+  duplicates: number;
+  relinkable: number;
+  reclaimableBytes: number;
 }
 
 interface ReplacementRelease {
@@ -257,10 +279,15 @@ interface ScanData {
   oversized: OversizedItem[];
   orphans: OrphanItem[];
   identifications?: IdentityVerdict[];
+  duplicates?: DuplicateVerdict[];
+  duplicateSummary?: DuplicateSummary;
   roots: Array<{ app: AppKind; kind: 'library' | 'download'; path: string; filesScanned: number }>;
   qbittorrentSafety: QBittorrentSafety;
   ignoreSummary?: IgnoreSummary;
   warnings: string[];
+  // Configuration problems that explain why untracked files keep appearing. Separate
+  // from `warnings`, which mean the scan itself could not see everything.
+  advisories?: string[];
 }
 
 class ApiError extends Error {
@@ -487,6 +514,31 @@ function ReplacementChip({ verdict, checking }: { verdict?: ReplacementVerdict; 
   );
 }
 
+function DuplicateChip({ verdict }: { verdict?: DuplicateVerdict }) {
+  if (!verdict) return null;
+  if (verdict.status === 'duplicate') {
+    // The strongest answer there is short of acting: same bytes, so the space behind
+    // this row can be handed back without anything being removed.
+    return (
+      <span className="replacement-chip available" title={`${verdict.reason} Library copy: ${verdict.libraryPath ?? 'unknown'}`}>
+        {verdict.relinkable
+          ? `Identical · ${formatBytes(verdict.reclaimableBytes)} reclaimable by re-linking`
+          : 'Identical, but on another filesystem'}
+      </span>
+    );
+  }
+  if (verdict.status === 'distinct') {
+    return <span className="replacement-chip unknown" title={verdict.reason}>A different release, not a duplicate</span>;
+  }
+  if (verdict.status === 'linked') {
+    return <span className="replacement-chip available" title={verdict.reason}>Already linked · costing no space</span>;
+  }
+  if (verdict.status === 'unverified') {
+    return <span className="replacement-chip pending" title={verdict.reason}>Contents not checked yet</span>;
+  }
+  return null;
+}
+
 function IdentityChip({ verdict, checking }: { verdict?: IdentityVerdict; checking: boolean }) {
   if (checking) return <span className="replacement-chip pending">Identifying…</span>;
   if (!verdict) return <span className="replacement-chip unknown">Not identified</span>;
@@ -552,7 +604,7 @@ function PreviewPanel({ state }: { state: PreviewState }) {
   );
 }
 
-function ConfirmDialog({ stage, tab, count, busy, replacementSummary, identitySummary, requireReplacement, preview, onDryRun, onCancel, onQuarantine, onImport, onChoosePermanent, onConfirmPermanent }: {
+function ConfirmDialog({ stage, tab, count, busy, replacementSummary, identitySummary, relinkSummary, requireReplacement, preview, onDryRun, onCancel, onQuarantine, onImport, onRelink, onChoosePermanent, onConfirmPermanent }: {
   stage: ConfirmationStage;
   tab: Tab;
   count: number;
@@ -560,17 +612,21 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, identitySu
   onCancel: () => void;
   replacementSummary: { checked: number; available: number } | null;
   identitySummary: { checked: number; importable: number; occupied: number } | null;
+  relinkSummary: { relinkable: number; reclaimableBytes: number } | null;
   requireReplacement: boolean;
   preview: PreviewState | null;
   onDryRun: () => void;
   onQuarantine: () => void;
   onImport: () => void;
+  onRelink: () => void;
   onChoosePermanent: () => void;
   onConfirmPermanent: () => void;
 }) {
   const oversized = tab === 'oversized';
   const finalPermanentConfirmation = stage === 'permanent';
   const previewing = stage === 'preview';
+  const relinkOnly = !oversized && relinkSummary !== null && relinkSummary.relinkable === count;
+  const dryRunLabel = relinkOnly ? 'DRY RUN RE-LINK' : 'DRY RUN';
   const unavailable = replacementSummary ? replacementSummary.checked - replacementSummary.available : 0;
   const cancelRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -632,6 +688,13 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, identitySu
               : `All ${identitySummary.checked} identified file(s) are spare: the library already has a tracked copy of each.`}
           </p>
         )}
+        {!oversized && relinkSummary && relinkSummary.relinkable > 0 && (
+          <p className="confirm-note ok">
+            {relinkSummary.relinkable} of the selected file(s) are byte-for-byte copies of what the library already
+            holds. Re-linking collapses each pair into one file on disk, handing back {formatBytes(relinkSummary.reclaimableBytes)} without
+            removing anything - the file keeps its path and contents, so a torrent seeding it carries on seeding.
+          </p>
+        )}
         {oversized && requireReplacement && (
           <p className="confirm-note ok">
             Each file is re-checked for a compliant replacement immediately before it is removed. Any file without one is preserved.
@@ -644,10 +707,15 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, identitySu
               {busy ? 'DELETING…' : 'DELETE PERMANENTLY'}
             </button>
           ) : <>
-            {!previewing && <button type="button" className="ghost-button" onClick={onDryRun} disabled={busy || Boolean(preview?.loading)}>{preview?.loading ? 'DRY RUN…' : 'DRY RUN'}</button>}
+            {!previewing && <button type="button" className="ghost-button" onClick={onDryRun} disabled={busy || Boolean(preview?.loading)}>{preview?.loading ? 'DRY RUN…' : dryRunLabel}</button>}
             {!oversized && (
               <button type="button" className="ghost-button" onClick={onImport} disabled={busy} title="Hand these files back to Radarr/Sonarr, which will hardlink or move them into the library according to their own settings. Files whose movie or episode already has a tracked copy are refused.">
                 {busy ? 'IMPORTING…' : 'IMPORT INTO LIBRARY'}
+              </button>
+            )}
+            {!oversized && relinkSummary && relinkSummary.relinkable > 0 && (
+              <button type="button" className="ghost-button" onClick={onRelink} disabled={busy} title="Replace each proven duplicate with a hardlink to the library file it matches. Both files are hashed in full first, nothing is removed, and any pair that is not identical is refused.">
+                {busy ? 'RE-LINKING…' : `RE-LINK · FREE ${formatBytes(relinkSummary.reclaimableBytes)}`}
               </button>
             )}
             <button type="button" className="primary-button" onClick={onQuarantine} disabled={busy}>
@@ -679,6 +747,7 @@ export default function App() {
   const [replacements, setReplacements] = useState<Record<string, ReplacementVerdict>>({});
   const [checkingReplacements, setCheckingReplacements] = useState<string[]>([]);
   const [identities, setIdentities] = useState<Record<string, IdentityVerdict>>({});
+  const [duplicates, setDuplicates] = useState<Record<string, DuplicateVerdict>>({});
   const [identifying, setIdentifying] = useState<string[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [showOperations, setShowOperations] = useState(false);
@@ -1057,6 +1126,16 @@ export default function App() {
       // into it: a stale verdict about a file the library has since gained or lost is
       // exactly what must not linger on screen.
       setIdentities(Object.fromEntries((data.identifications ?? []).map((verdict) => [verdict.id, verdict])));
+      // The scan's pass only compares sizes, so anything a deliberate check already
+      // settled by reading the files is kept rather than downgraded back to unverified.
+      setDuplicates((current) => {
+        const next: Record<string, DuplicateVerdict> = {};
+        for (const verdict of data.duplicates ?? []) {
+          const known = current[verdict.id];
+          next[verdict.id] = known && known.mode !== 'size' && verdict.mode === 'size' ? known : verdict;
+        }
+        return next;
+      });
       setMessage(`Manifest refreshed at ${new Date(data.scannedAt).toLocaleTimeString()}.`);
       return true;
     } catch (scanError) {
@@ -1233,13 +1312,18 @@ export default function App() {
     setError('');
     setIdentifying(batch);
     try {
-      const result = await api<{ identifications: IdentityVerdict[] }>('/api/orphans/identify', {
+      const result = await api<{ identifications: IdentityVerdict[]; duplicates: DuplicateVerdict[] }>('/api/orphans/identify', {
         method: 'POST',
         body: JSON.stringify({ ids: batch }),
       });
       setIdentities((current) => {
         const next = { ...current };
         for (const verdict of result.identifications) next[verdict.id] = verdict;
+        return next;
+      });
+      setDuplicates((current) => {
+        const next = { ...current };
+        for (const verdict of result.duplicates ?? []) next[verdict.id] = verdict;
         return next;
       });
       if (selectedVisible.length > IDENTIFY_LIMIT) {
@@ -1262,6 +1346,24 @@ export default function App() {
       occupied: identified.filter((item) => identities[item.id].status === 'occupied').length,
     };
   }, [identities, selectedVisible, tab]);
+
+  // Only rows a content check has actually settled count here: the button must never
+  // offer to relink something whose contents nothing has compared.
+  const relinkSummary = useMemo(() => {
+    if (tab !== 'orphans') return null;
+    const relinkable = selectedVisible.filter((item) => duplicates[item.id]?.status === 'duplicate'
+      && duplicates[item.id]?.relinkable);
+    if (!relinkable.length) return null;
+    return {
+      relinkable: relinkable.length,
+      reclaimableBytes: relinkable.reduce((sum, item) => sum + (duplicates[item.id]?.reclaimableBytes ?? 0), 0),
+    };
+  }, [duplicates, selectedVisible, tab]);
+
+  // The dry run follows the selection: when every selected row is a proven duplicate,
+  // previewing a quarantine would answer a question nobody asked.
+  const relinkDryRun = tab === 'orphans' && relinkSummary !== null
+    && relinkSummary.relinkable === selectedVisible.length;
 
   const replacementSummary = useMemo(() => {
     if (tab !== 'oversized') return null;
@@ -1298,9 +1400,10 @@ export default function App() {
   }
 
   // The dry run previews the recoverable action where one exists, since the gates are
-  // the same either way; only recoverability and the destination differ.
-  async function runDryRun() {
-    const action: OrphanAction = 'quarantine';
+  // the same either way; only recoverability and the destination differ. Re-linking is
+  // the exception: it has a gate of its own - are these two files actually the same
+  // bytes - so when that is what the selection is for, that is what gets previewed.
+  async function runDryRun(action: OrphanAction = 'quarantine') {
     setPreview({ loading: true, error: '', action, rows: [], summary: null });
     setConfirmationStage('preview');
     try {
@@ -1415,6 +1518,7 @@ export default function App() {
         </div>
       )}
       {scan?.warnings.filter((warning) => warning !== scan.qbittorrentSafety.warning).map((warning) => <div className="notice warning" key={warning}>{warning}</div>)}
+      {scan?.advisories?.map((advisory) => <div className="notice warning" key={advisory}>{advisory}</div>)}
       {scan && <QBittorrentSafetyNotices safety={scan.qbittorrentSafety} />}
 
       <section className="stat-grid" aria-label="Scan summary">
@@ -1507,7 +1611,7 @@ export default function App() {
             ) : tab === 'oversized' ? (
               <OversizedTable items={visible as OversizedItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} replacements={replacements} checking={checkingReplacements} instances={arrInstances} />
             ) : (
-              <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} instances={arrInstances} identities={identities} identifyingIds={new Set(identifying)} />
+              <OrphanTable items={visible as OrphanItem[]} selected={selected} onToggle={toggle} onToggleAll={toggleAll} instances={arrInstances} identities={identities} identifyingIds={new Set(identifying)} duplicates={duplicates} />
             )}
 
             <p className="safety-note"><span aria-hidden="true">⚓</span>{tab === 'oversized' ? 'Remove tracked files through Radarr or Sonarr and search again, or ignore them in future size-limit scans. Remove an item from Operations → Ignore list to include it again.' : 'Quarantine or permanently delete selected files, or ignore their paths in future untracked-file scans. Remove a path from Operations → Ignore list to include it again.'}</p>
@@ -1522,13 +1626,15 @@ export default function App() {
         count={selectedVisible.length}
         busy={applying}
         preview={preview}
-        onDryRun={() => { void runDryRun(); }}
+        onDryRun={() => { void runDryRun(relinkDryRun ? 'relink' : 'quarantine'); }}
         replacementSummary={replacementSummary}
         identitySummary={identitySummary}
+        relinkSummary={relinkSummary}
         requireReplacement={Boolean(config?.oversizeRequireReplacement)}
         onCancel={() => { setConfirmationStage('closed'); setPreview(null); }}
         onQuarantine={() => { void applySelection('quarantine'); }}
         onImport={() => { void applySelection('import'); }}
+        onRelink={() => { void applySelection('relink'); }}
         onChoosePermanent={() => setConfirmationStage('permanent')}
         onConfirmPermanent={() => { void applySelection('permanent'); }}
       />
@@ -1549,6 +1655,6 @@ function OversizedTable({ items, selected, onToggle, onToggleAll, replacements, 
   return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Title</th><th>App</th><th>Actual size</th><th>Allowed</th><th>Over by</th><th>Replacement</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Title"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip" title={item.subtitle}>{item.subtitle}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} instances={instances} /></td><td className="numeric" data-label="Actual size">{formatBytes(item.sizeBytes)}</td><td data-label="Allowed" title={limitSourceExplanation(item)}><div className="numeric muted">{formatBytes(item.limitBytes)}</div><div className="limit-note">{formatBytes(item.configuredLimitBytes)} + {formatBytes(item.toleranceBytes)}</div></td><td data-label="Over by"><span className="excess-chip">+{formatBytes(item.overageBytes)}</span><div className="diagnosis-line" title={limitSourceExplanation(item)}>{oversizeDiagnosis(item)}</div></td><td data-label="Replacement"><ReplacementChip verdict={replacements[item.id]} checking={checkingIds.has(item.id)} /></td></tr>)}</tbody></table></div>;
 }
 
-function OrphanTable({ items, selected, onToggle, onToggleAll, instances, identities, identifyingIds }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; instances: InstanceConfig[]; identities: Record<string, IdentityVerdict>; identifyingIds: Set<string> }) {
-  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th><th>In the library?</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Untracked file"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} instances={instances} /></td><td className="numeric" data-label="Size">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell" data-label="Modified">{new Date(item.modifiedAt).toLocaleDateString()}</td><td data-label="In the library?"><IdentityChip verdict={identities[item.id]} checking={identifyingIds.has(item.id)} /></td></tr>)}</tbody></table></div>;
+function OrphanTable({ items, selected, onToggle, onToggleAll, instances, identities, identifyingIds, duplicates }: { items: OrphanItem[]; selected: Set<string>; onToggle: (id: string) => void; onToggleAll: () => void; instances: InstanceConfig[]; identities: Record<string, IdentityVerdict>; identifyingIds: Set<string>; duplicates: Record<string, DuplicateVerdict> }) {
+  return <div className="table-wrap"><table className="manifest-table"><thead><tr><th><SelectAll items={items} selected={selected} onToggleAll={onToggleAll} /></th><th>Untracked file</th><th>App</th><th>Size</th><th>Modified</th><th>In the library?</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={selected.has(item.id) ? 'selected-row' : ''}><td className="cell-select"><input type="checkbox" checked={selected.has(item.id)} onChange={() => onToggle(item.id)} aria-label={`Select ${item.title}`} /></td><td data-label="Untracked file"><div className="movie-title" title={item.title}>{item.title}</div><div className="quality-chip">{item.source === 'download' ? 'Broken hardlink' : 'Untracked library file'}</div><div className="path-line" title={item.path}>{item.path}</div></td><td data-label="App"><AppBadge app={item.app} instances={instances} /></td><td className="numeric" data-label="Size">{formatBytes(item.sizeBytes)}</td><td className="muted date-cell" data-label="Modified">{new Date(item.modifiedAt).toLocaleDateString()}</td><td data-label="In the library?"><IdentityChip verdict={identities[item.id]} checking={identifyingIds.has(item.id)} /><DuplicateChip verdict={duplicates[item.id]} /></td></tr>)}</tbody></table></div>;
 }

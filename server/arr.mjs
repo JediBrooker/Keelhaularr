@@ -212,6 +212,11 @@ function baseResult(app, configured) {
     // scan is already walking this data, so answering "does the library already have a
     // copy of this?" costs nothing extra later.
     withFile: new Set(),
+    // Which file each movie or episode is tracking, keyed `movie:<id>` / `episode:<id>`.
+    // `withFile` answers whether the library has a copy; this answers which file it is,
+    // which is what turns "already tracked" into a pair that can actually be compared
+    // byte for byte.
+    filesByTarget: new Map(),
     warnings: [],
     error: null,
   };
@@ -249,7 +254,15 @@ export async function scanRadarr(connection) {
       if (!movie.hasFile || !mediaFile) continue;
       const arrPath = mediaFile.path || joinArrPath(movie.path, mediaFile.relativePath);
       const localPath = mapArrPath(arrPath, connection.pathMaps);
-      if (localPath) result.knownPaths.add(localPath);
+      if (localPath) {
+        result.knownPaths.add(localPath);
+        result.filesByTarget.set(`movie:${Number(movie.id)}`, {
+          arrPath,
+          localPath,
+          sizeBytes: safeSizeBytes(mediaFile.size),
+          quality: qualityName(mediaFile),
+        });
+      }
 
       if (!connection.includeUnmonitored && !movie.monitored) continue;
       const runtimeMinutes = Number(movie.runtime) || 110;
@@ -368,6 +381,18 @@ export async function scanSonarr(connection) {
         if (localPath) result.knownPaths.add(localPath);
 
         const fileEpisodes = episodesByFile.get(Number(mediaFile.id)) ?? [];
+        // Recorded before any of the sizing filters below, because a spare copy of an
+        // unmonitored episode or a special is still a spare copy worth comparing.
+        if (localPath) {
+          for (const episode of fileEpisodes) {
+            result.filesByTarget.set(`episode:${Number(episode.id)}`, {
+              arrPath,
+              localPath,
+              sizeBytes: safeSizeBytes(mediaFile.size),
+              quality: qualityName(mediaFile),
+            });
+          }
+        }
         if (!fileEpisodes.length || fileEpisodes.some((episode) => Number(episode.seasonNumber) === 0)) {
           continue;
         }
@@ -489,6 +514,39 @@ export function allArrCandidates(scan) {
 export async function deleteCandidate(connection, candidate) {
   const endpoint = candidate.app === 'radarr' ? 'moviefile' : 'episodefile';
   await arrRequest(connection, `${endpoint}/${candidate.fileId}`, { method: 'DELETE' });
+}
+
+/**
+ * Reads the import settings that decide whether this application can hardlink at all.
+ *
+ * `copyUsingHardlinks` is "Use Hardlinks instead of Copy" in Media Management →
+ * Importing. With it off, every completed download is duplicated into the library even
+ * when the two live on one filesystem, which is the single most common reason a
+ * download folder fills up with spare copies. It is reported as null rather than false
+ * when the application did not send it, because "we could not read the setting" and
+ * "the setting is off" call for very different advice.
+ */
+export async function readImportSettings(connection) {
+  if (!connection?.configured) {
+    return { app: connection?.id ?? null, copyUsingHardlinks: null, recycleBin: null, error: 'The connection is not configured.' };
+  }
+  try {
+    const settings = await arrRequest(connection, 'config/mediamanagement');
+    const recycleBin = typeof settings?.recycleBin === 'string' ? settings.recycleBin.trim() : '';
+    return {
+      app: connection.id,
+      copyUsingHardlinks: typeof settings?.copyUsingHardlinks === 'boolean' ? settings.copyUsingHardlinks : null,
+      recycleBin: recycleBin || null,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      app: connection.id,
+      copyUsingHardlinks: null,
+      recycleBin: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 export async function queueSearch(connection, kind, ids) {
