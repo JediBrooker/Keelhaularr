@@ -10,11 +10,14 @@ import {
   removeQbittorrentRecoveryFromArr,
   replacementProgress,
   resolveQbittorrentRecoveryOwnership,
+  resolveMediaRoot,
   scanArr,
   allArrCandidates,
   arrInstanceUrls,
 } from './arr.mjs';
+import { libraryTwinPath } from './duplicates.mjs';
 import { filterExcluded } from './exclusions.mjs';
+import { relinkDuplicate } from './hardlinks.mjs';
 import { recordRun, summarizeJobOutcome } from './history.mjs';
 import { assertNotRecentlyWatched } from './mediaserver.mjs';
 import {
@@ -28,6 +31,7 @@ import {
 import { recordQuarantine } from './quarantine.mjs';
 import {
   IMPORTABLE,
+  OCCUPIED,
   identifyOrphans,
   importCommandStatus,
   requestImport,
@@ -246,11 +250,13 @@ export async function createOversizeJob(config, requestedIds, action = 'permanen
   });
 }
 
-const ORPHAN_ACTION_TITLES = { permanent: 'Delete', quarantine: 'Quarantine', import: 'Import' };
+const ORPHAN_ACTION_TITLES = {
+  permanent: 'Delete', quarantine: 'Quarantine', import: 'Import', relink: 'Re-link',
+};
 
 export async function createOrphanJob(config, requestedIds, action) {
   if (!Object.hasOwn(ORPHAN_ACTION_TITLES, action)) {
-    inputError('Orphan jobs require quarantine, permanent or import as the action.');
+    inputError('Orphan jobs require quarantine, permanent, import or relink as the action.');
   }
   const arr = await scanArr(config);
   const current = await scanOrphans(config, arr);
@@ -624,8 +630,83 @@ async function processOrphanImportItem(job, item, config) {
   });
 }
 
+function formatGib(bytes) {
+  return `${(Number(bytes) / 1024 ** 3).toFixed(2)} GiB`;
+}
+
+/**
+ * Collapses a proven duplicate back into a single inode.
+ *
+ * This is the only action here that reclaims space without anything leaving the disk.
+ * The untracked copy keeps its path, its name and its exact contents - so a torrent
+ * seeding it carries on seeding - but stops being a second copy of the data, and the
+ * blocks it was holding go back to the filesystem.
+ *
+ * The library file is the one kept, always. Its inode, path and timestamps are never
+ * touched, so Radarr and Sonarr see nothing change at all.
+ *
+ * Three things are re-established here rather than trusted from the scan, because each
+ * one would be a way to destroy a file if it were wrong:
+ *   - the application still reports this slot as occupied, and names the file holding it
+ *   - that file is inside a configured media root, so an odd path mapping cannot make
+ *     an arbitrary location the link source
+ *   - every byte of both files hashes the same, which relinkDuplicate proves for itself
+ *     immediately before it acts
+ */
+async function processOrphanRelinkItem(job, item, config) {
+  const connection = config[item.candidate.app];
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'processing';
+    value.phase = 'identifying';
+    value.error = null;
+  });
+
+  // A partial file would hash differently anyway, but failing here gives the honest
+  // reason instead of "the files are not identical".
+  await assertQbittorrentSafe(config, item.candidate);
+  await assertCandidateUnchanged(item.candidate);
+
+  const identified = (await identifyOrphans(connection, [item.candidate])).get(item.candidate.id);
+  if (identified?.status !== OCCUPIED) {
+    throw new Error(identified?.reason
+      ?? 'The library no longer reports a tracked file for this, so there is nothing to link it to.');
+  }
+  const libraryPath = libraryTwinPath(identified);
+  if (!libraryPath) {
+    throw new Error('The library file could not be located on disk, so nothing was linked. Check this application\'s path mappings.');
+  }
+  if (!resolveMediaRoot(libraryPath, connection?.mediaRoots ?? [])) {
+    throw new Error(`The library file at ${libraryPath} is outside every configured media root, so it was not used as a link source.`);
+  }
+
+  await updateItem(job.id, item.id, (value) => {
+    value.phase = 'verifying';
+    value.libraryPath = libraryPath;
+    value.importTitle = identified.title ?? null;
+  });
+
+  const outcome = await relinkDuplicate(item.candidate.path, libraryPath);
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'complete';
+    value.phase = outcome.status;
+    // Counted as reclaimed rather than quarantined: these blocks are back, and unlike a
+    // deletion nothing needs to be restorable, because the file is still there.
+    value.removal = outcome.status === 'relinked' ? 'relinked' : null;
+    value.reclaimedBytes = outcome.reclaimedBytes;
+    value.destination = libraryPath;
+    value.outcome = outcome.status === 'already-linked'
+      ? 'Already one inode with the library file; nothing needed changing.'
+      : outcome.reclaimedBytes
+        // "Frees" rather than "freed": a client still holding the old copy open keeps
+        // its blocks alive until it lets go, so the space can arrive a moment later.
+        ? `Linked to the library file. The file is still in place and still seedable, and this frees ${formatGib(outcome.reclaimedBytes)} once any client holding the old copy open releases it.`
+        : 'Linked to the library file. Another name still held the old copy, so no space was freed.';
+  });
+}
+
 async function processOrphanItem(job, item, config) {
   if (job.action === 'import') return processOrphanImportItem(job, item, config);
+  if (job.action === 'relink') return processOrphanRelinkItem(job, item, config);
   const jobConfig = { ...config, orphanAction: job.action, orphanTrashDir: job.trashDir };
   await assertNotRecentlyWatched(config, item.candidate);
   let destination = item.plannedDestination ?? null;

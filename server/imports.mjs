@@ -58,12 +58,33 @@ function rejectionReasons(raw) {
     .slice(0, 5);
 }
 
-function existingFileSummary(file) {
+/**
+ * Summarises the file the library already tracks.
+ *
+ * `localPath` is the same file spelled the way this container reaches it, which is what
+ * makes the pair comparable on disk. It is null when no mapping resolves, and callers
+ * treat that as "cannot be compared" rather than "not a duplicate".
+ */
+function existingFileSummary(file, pathMaps) {
   if (!file) return null;
+  const arrPath = safeText(file.path, 1024);
   return {
-    path: safeText(file.path, 1024),
+    path: arrPath,
+    localPath: arrPath ? mapArrPath(arrPath, pathMaps ?? []) : null,
     sizeBytes: safeBytes(file.size),
     quality: safeText(file.quality?.quality?.name, 64),
+  };
+}
+
+// The same shape, built from what a scan already holds rather than from an application
+// response, so the cheap per-scan identification can answer the same question.
+function trackedFileSummary(tracked) {
+  if (!tracked) return null;
+  return {
+    path: safeText(tracked.arrPath, 1024),
+    localPath: tracked.localPath ?? null,
+    sizeBytes: safeBytes(tracked.sizeBytes),
+    quality: safeText(tracked.quality, 64),
   };
 }
 
@@ -121,7 +142,7 @@ function createTargetCache(connection) {
   };
 }
 
-async function classifyRadarr(item, lookup) {
+async function classifyRadarr(item, lookup, pathMaps) {
   const movieId = positiveId(item?.movie?.id);
   if (!movieId) {
     return verdict('unidentified', 'Radarr could not work out which movie this file is.');
@@ -142,7 +163,7 @@ async function classifyRadarr(item, lookup) {
     return verdict(OCCUPIED, `${label} already has a tracked file, so this copy is spare.`, {
       title: label,
       quality: safeText(item?.quality?.quality?.name, 64),
-      existing: existingFileSummary(movie.movieFile),
+      existing: existingFileSummary(movie.movieFile, pathMaps),
     });
   }
 
@@ -167,7 +188,7 @@ async function classifyRadarr(item, lookup) {
   });
 }
 
-async function classifySonarr(item, lookup) {
+async function classifySonarr(item, lookup, pathMaps) {
   const seriesId = positiveId(item?.series?.id);
   const episodeIds = (Array.isArray(item?.episodes) ? item.episodes : [])
     .map((episode) => positiveId(episode?.id))
@@ -196,7 +217,7 @@ async function classifySonarr(item, lookup) {
     return verdict(OCCUPIED, `${which} already has a tracked file, so this copy is spare.`, {
       title: label,
       quality: safeText(item?.quality?.quality?.name, 64),
-      existing: existingFileSummary(taken[0].episodeFile),
+      existing: existingFileSummary(taken[0].episodeFile, pathMaps),
     });
   }
 
@@ -296,8 +317,8 @@ export async function identifyOrphans(connection, candidates) {
         continue;
       }
       const classified = connection.kind === 'sonarr'
-        ? await classifySonarr(item, lookup)
-        : await classifyRadarr(item, lookup);
+        ? await classifySonarr(item, lookup, connection.pathMaps)
+        : await classifyRadarr(item, lookup, connection.pathMaps);
       results.set(candidate.id, stamp({ ...classified, arrPath }));
     }
   }
@@ -449,8 +470,11 @@ async function parseTitle(connection, title) {
  *
  * `withFile` is the set of movie or episode ids the scan already found to have a
  * tracked file, so no extra request is needed to answer the question that matters.
+ * `filesByTarget` is which file each of those ids is tracking, which turns the answer
+ * from "the library has one of these" into a named file that can be compared with this
+ * one byte for byte.
  */
-export async function identifyByName(connection, candidates, withFile, limit) {
+export async function identifyByName(connection, candidates, withFile, limit, filesByTarget) {
   const results = new Map();
   if (!connection?.configured) return results;
 
@@ -485,14 +509,20 @@ export async function identifyByName(connection, candidates, withFile, limit) {
           ? label
           : `${taken.length} of the ${parsed.episodes.length} episodes in ${label}`;
         results.set(candidate.id, taken.length
-          ? verdict(OCCUPIED, `${which} already has a tracked file, so this copy is spare.`, { title: label })
+          ? verdict(OCCUPIED, `${which} already has a tracked file, so this copy is spare.`, {
+            title: label,
+            existing: trackedFileSummary(filesByTarget?.get(`episode:${taken[0].id}`)),
+          })
           : verdict(IMPORTABLE, `${label} has no tracked file. Sonarr can import this copy.`, { title: label }));
         continue;
       }
 
       const label = movieLabel({ title: parsed.title, year: parsed.year });
       results.set(candidate.id, withFile.has(parsed.movieId)
-        ? verdict(OCCUPIED, `${label} already has a tracked file, so this copy is spare.`, { title: label })
+        ? verdict(OCCUPIED, `${label} already has a tracked file, so this copy is spare.`, {
+          title: label,
+          existing: trackedFileSummary(filesByTarget?.get(`movie:${parsed.movieId}`)),
+        })
         : verdict(IMPORTABLE, `${label} has no tracked file. Radarr can import this copy.`, { title: label }));
     }
   });
@@ -514,7 +544,7 @@ export async function identifyScanCandidates(config, arrResults, candidates, lim
   for (const [app, group] of byApp) {
     if (arrResults?.[app]?.status === 'error') continue;
     const withFile = arrResults?.[app]?.withFile ?? new Set();
-    const results = await identifyByName(config[app], group, withFile, share);
+    const results = await identifyByName(config[app], group, withFile, share, arrResults?.[app]?.filesByTarget);
     for (const [id, result] of results) merged.set(id, result);
   }
   return candidates

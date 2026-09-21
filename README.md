@@ -25,8 +25,12 @@ Both destructive automations are opt-in and disabled by default.
 - Recoverable Brig quarantine for oversized files as well as untracked files
 - Filesystem orphan scanning against the files actually tracked by each app
 - Every scan says whether each untracked file is a spare copy or the only copy of something the library is missing
+- Content checks that tell a second copy of one release apart from a different release of the same film
+- One-press re-link that collapses a proven duplicate into a single file, reclaiming the space without removing anything or interrupting seeding
 - One-press import that hands a missing file back to Radarr/Sonarr to hardlink or move per their own settings
 - Inode-based hardlink integrity checks for completed torrent/download folders
+- Import auditing that reports a copy-instead-of-hardlink misconfiguration on the first import rather than after terabytes
+- A check of each application's own "Use Hardlinks instead of Copy" setting against whether the storage could hardlink at all
 - Optional qBittorrent guard that withholds every incomplete torrent from orphan actions
 - Opt-in automatic recovery for continuously slow, stalled, or metadata-stuck qBittorrent downloads
 - Recoverable orphan quarantine or confirmed permanent deletion per selected batch
@@ -533,6 +537,70 @@ file is fully rescanned and its inode and size are checked again immediately
 before quarantine or deletion; if a library hardlink appeared in the meantime,
 the download copy is withheld.
 
+### Why a hardlink was never made, and how to stop it happening
+
+A hardlink cannot break on its own - nothing in the kernel severs one. A completed
+download that shares no inode with its library file was either never linked, or had one
+side replaced afterwards. Keelhaularr reports both causes it can see:
+
+- **Storage that cannot hold the link.** Each scan compares the filesystem device of
+  every completed-download root with every library root of the same application.
+  Different devices mean every import must copy. Two separate bind mounts of the same
+  host storage still count as two devices inside a container, which is the usual
+  surprise; one mount such as `/data`, with `/data/torrents/...` and `/data/media/...`
+  beneath it and the same path in every container, avoids it.
+- **An application set to copy.** Each scan reads `copyUsingHardlinks` - "Use Hardlinks
+  instead of Copy" in Media Management → Importing - from Radarr and Sonarr, and says so
+  when the storage could link but the application is not going to.
+- **Imports that already copied.** Each scan reads the last few dozen
+  `downloadFolderImported` records from each application and compares the inode of the
+  imported file with the source it came from. A move import legitimately leaves one
+  link, so link counts alone are not used: what marks a copy is the source still
+  existing as a separate inode. The result names how many recent imports were duplicated
+  and how much space that cost.
+
+These appear as advisories rather than warnings. A warning means the scan could not see
+everything and its results may be incomplete; an advisory means the results are accurate
+and explains why they keep looking like this.
+
+### Re-linking a duplicate instead of deleting it
+
+"Spare copy" is answered by name: the release parses to a movie, and that movie already
+has a tracked file. That is enough to know the copy is redundant, but not enough to know
+it is the *same* copy - a 1080p WEBRip and a 2160p remux of one film both read as spare.
+
+Every scan compares the two files' sizes, which is cheap enough to do on every row and
+settles the common case: different sizes cannot be the same data. Identifying a selection
+goes further and hashes three windows - head, middle and tail - of each file. A row that
+comes back identical offers **RE-LINK**.
+
+Re-linking replaces the untracked copy with a hardlink to the library file it matches.
+The space the duplicate was holding goes back to the filesystem, and nothing is removed:
+the file keeps its path, its name and its exact contents, so a torrent seeding it carries
+on seeding. The library file is the one kept in every case - its inode, path and
+timestamps are never touched, so Radarr and Sonarr see nothing change.
+
+Before anything is replaced, the job proves the pair:
+
+- the application is asked again whether that slot is still occupied, and by which file
+- that file must sit inside a configured media root, so a path mapping cannot make some
+  arbitrary location the link source
+- **every byte of both files is hashed**, not sampled, because a mismatch here would
+  corrupt a live torrent
+- both files are re-checked afterwards, so one written during the hash cannot slip through
+
+The link is made under a temporary name in the same directory and moved into place with
+`rename()`, which is atomic: an interruption leaves either the old file or the new link,
+never a partial one. A pair that is not proven identical, or that turns out to be on two
+filesystems, is refused and left exactly as it was. Reclaimed space is counted only when
+the duplicate was the last name for its data.
+
+One timing note: a torrent client with the old copy still open keeps its blocks alive
+until it releases the handle, so the freed space can show up in `df` a moment after the
+job reports it rather than instantly. The client goes on serving the old copy until it
+reopens the path, and since the contents are identical byte for byte, seeding is
+unaffected either way and no recheck is needed.
+
 For a stronger guarantee, connect qBittorrent in Settings or configure:
 
 ```dotenv
@@ -859,9 +927,13 @@ on the few files that matter instead of reading every row.
 **Operations → Storage → Run health check** shows whether each configured root
 exists and is readable/writable, plus available disk space. It also compares
 filesystem device IDs between each application's completed-download folders
-and library roots. Different devices cannot share hardlinks; matching devices
+and library roots, and reads each application's own "Use Hardlinks instead of
+Copy" setting. Different devices cannot share hardlinks; matching devices
 indicate compatibility, not proof that individual files are currently linked.
-The check does not modify storage or create test files.
+An application that could hardlink but is set to copy is reported separately
+from storage that cannot hardlink at all, because the two have different fixes.
+An application that cannot be reached is reported as unknown rather than as
+misconfigured. The check does not modify storage or create test files.
 
 ## Security
 

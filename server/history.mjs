@@ -107,6 +107,12 @@ export function summarizeJobOutcome(job) {
     } else if (removal === 'deleted') {
       reclaimedBytes += bytes;
       fileCount += 1;
+    } else if (removal === 'relinked') {
+      // A relink frees space without the file leaving the disk, so what counts is the
+      // duplicate's own blocks - which the job measured - and not the file's size. A
+      // duplicate that shared its inode with something else freed nothing at all.
+      reclaimedBytes += safeBytes(item?.reclaimedBytes);
+      fileCount += 1;
     }
   }
   return { reclaimedBytes, quarantinedBytes, fileCount };

@@ -1,4 +1,6 @@
 import path from 'node:path';
+import { DISTINCT, DUPLICATE, LINKED, verifyDuplicate } from './duplicates.mjs';
+import { identifyOrphans } from './imports.mjs';
 import { localOversizeCandidate } from './jobs.mjs';
 import { assertNotRecentlyWatched } from './mediaserver.mjs';
 import { assertCandidateUnchanged, assertQbittorrentSafe, quarantineDestination } from './orphans.mjs';
@@ -141,14 +143,38 @@ export async function previewOrphans(config, candidates, { action = 'quarantine'
           : 'Library file, not a completed download.'));
 
 
-    gates.push(config.mediaServer?.configured
-      ? await runGate('Not recently watched', async () => {
-        await assertNotRecentlyWatched(config, candidate);
-        return `No play recorded in the last ${config.mediaServer.watchedWithinDays} day(s).`;
-      })
-      : gate('Not recently watched', 'warn', 'No media server is configured, so recent viewing cannot be ruled out.'));
+    // A relink removes nothing, so what somebody watched last week has no bearing on it.
+    gates.push(action === 'relink'
+      ? gate('Not recently watched', 'pass', 'A relink removes nothing, so recent viewing does not matter.')
+      : config.mediaServer?.configured
+        ? await runGate('Not recently watched', async () => {
+          await assertNotRecentlyWatched(config, candidate);
+          return `No play recorded in the last ${config.mediaServer.watchedWithinDays} day(s).`;
+        })
+        : gate('Not recently watched', 'warn', 'No media server is configured, so recent viewing cannot be ruled out.'));
 
-    if (action === 'quarantine') {
+    if (action === 'relink') {
+      // Read-only, like every other gate here: the pair is sampled, never rewritten. The
+      // job itself hashes both files in full before it touches anything, so a pass here
+      // is an invitation to try rather than a promise it will succeed.
+      gates.push(await runGate('Identical to the library file', async () => {
+        const identified = (await identifyOrphans(config[candidate.app], [candidate])).get(candidate.id);
+        const verdict = await verifyDuplicate(candidate, identified, { mode: 'sampled' });
+        if (verdict.status === LINKED) {
+          throw new Error('This file already shares the library file\'s inode, so there is nothing to reclaim.');
+        }
+        if (verdict.status === DISTINCT) {
+          throw new Error(`${verdict.reason} Relinking would replace this file with different data, so it was refused.`);
+        }
+        if (verdict.status !== DUPLICATE) throw new Error(verdict.reason);
+        if (!verdict.relinkable) {
+          throw new Error('The two files are on different filesystems, so they cannot share an inode.');
+        }
+        destination = verdict.libraryPath;
+        return `Sampled contents match ${verdict.libraryPath}. The job re-hashes both files in full before acting.`;
+      }));
+      gates.push(gate('Recoverable afterwards', 'pass', 'Nothing is removed. The file keeps its path and contents and simply stops being a second copy.'));
+    } else if (action === 'quarantine') {
       destination = quarantineDestination(config, candidate, RUN_PLACEHOLDER);
       gates.push(gate('Recoverable afterwards', 'pass', `Would move to ${destination}`));
     } else {
@@ -178,7 +204,9 @@ export function summarizePreview(rows) {
     eligibleCount: eligible.length,
     withheldCount: rows.length - eligible.length,
     eligibleBytes: eligible.reduce((sum, row) => sum + (Number(row.sizeBytes) || 0), 0),
-    recoverable: rows.length > 0 && rows.every((row) => row.action === 'quarantine'),
+    // "Nothing is irreversibly lost", which quarantine satisfies by keeping the file in
+    // the Brig and a relink satisfies by not removing anything in the first place.
+    recoverable: rows.length > 0 && rows.every((row) => row.action === 'quarantine' || row.action === 'relink'),
   };
 }
 
