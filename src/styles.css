@@ -170,6 +170,10 @@ body:has(.modal-dialog[open]){overflow:hidden}
 .replacement-chip.error{color:#8a6516;background:#f7ecd6}
 .replacement-chip.pending{color:#536665;background:#eceee9}
 .replacement-chip.unknown{padding-left:0;color:#8b9695;background:none;font-weight:600}
+.library-verdict{display:flex;flex-direction:column;align-items:flex-start;gap:5px;min-width:0}
+.library-verdict .replacement-chip{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+.table-wrap .orphan-table{min-width:880px}
+.table-wrap .orphan-table th:nth-child(6),.table-wrap .orphan-table td:nth-child(6){width:235px}
 .confirm-note{margin:0 0 4px;padding:9px 11px;border-radius:8px;font-size:12px;line-height:1.4;text-align:left}
 .confirm-note.ok{color:#2f6b3e;background:#dff0e3}
 .confirm-note.warn{color:#9c3326;background:#f8ded7}
@@ -194,6 +198,8 @@ body:has(.modal-dialog[open]){overflow:hidden}
   .table-wrap .manifest-table td.numeric{text-align:left}
   .table-wrap .manifest-table .path-line{overflow-wrap:anywhere;white-space:normal}
   .table-wrap .manifest-table .diagnosis-line,.table-wrap .manifest-table .replacement-chip{white-space:normal}
+  .table-wrap .orphan-table{min-width:0}
+  .table-wrap .orphan-table th:nth-child(6),.table-wrap .orphan-table td:nth-child(6){width:auto}
 }
 
 @media(max-width:780px){

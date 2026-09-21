@@ -247,14 +247,38 @@ test('manifest rows carry cell labels so they can render as mobile cards', () =>
   for (const label of ['Untracked file', 'App', 'Size', 'Modified']) {
     assert.match(orphanTable, new RegExp(`data-label="${label}"`));
   }
-  assert.match(oversizedTable, /className="manifest-table"/);
-  assert.match(orphanTable, /className="manifest-table"/);
+  // Matched as a class among others: both tables may carry extra classes of their
+  // own, and what the card layout needs is that `manifest-table` is one of them.
+  assert.match(oversizedTable, /className="manifest-table[^"]*"/);
+  assert.match(orphanTable, /className="manifest-table[^"]*"/);
   assert.match(oversizedTable, /className="cell-select"/);
 
   // The card layout has to beat `.table-wrap table { min-width: 760px }`, so the
   // reset must be specific enough to win.
   assert.match(stylesSource, /\.table-wrap \.manifest-table\{min-width:0/);
   assert.match(stylesSource, /td\[data-label\]::before\{[^}]*content:attr\(data-label\)/);
+  // The orphan table widens its own verdict column, which would otherwise keep that
+  // width inside the card layout and reintroduce a horizontal overflow on a phone.
+  assert.match(stylesSource, /\.table-wrap \.orphan-table\{min-width:0/);
+});
+
+test('the library verdict column is wide enough for its chips, and they wrap inside it', () => {
+  const orphanTable = appSource.slice(appSource.indexOf('function OrphanTable'));
+
+  // Two stacked chips share this cell - what the library has, and whether it is the
+  // same bytes - so they are wrapped in a container that stacks them.
+  assert.match(orphanTable, /className="library-verdict"/);
+  assert.match(stylesSource, /\.library-verdict\{[^}]*flex-direction:column/);
+
+  // `.replacement-chip` is nowrap by default. In a table-layout:fixed cell that does
+  // not widen the column, so an unwrapped chip simply spills out of the card and is
+  // clipped - which is exactly what shipped once a second chip joined this cell.
+  assert.match(stylesSource, /\.library-verdict \.replacement-chip\{[^}]*white-space:normal/);
+  assert.match(stylesSource, /\.library-verdict \.replacement-chip\{[^}]*max-width:100%/);
+
+  // And the column itself has to be wider than the 115px every other table gets.
+  const width = stylesSource.match(/\.table-wrap \.orphan-table th:nth-child\(6\)[^{]*\{width:(\d+)px\}/);
+  assert.ok(width && Number(width[1]) >= 200, `verdict column should be at least 200px, got ${width?.[1]}`);
 });
 
 test('oversized confirmation offers the Brig and a second permanent-delete confirmation', () => {
