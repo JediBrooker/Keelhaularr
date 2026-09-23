@@ -280,7 +280,11 @@ test('a scan root that cannot be used says why, and where the files actually are
     const readOnly = path.join(root, 'read-only');
     await mkdir(readOnly);
     await chmod(readOnly, 0o555);
-    context.after(() => chmod(readOnly, 0o755));
-    assert.match(rootAccessProblem(readOnly, { label: 'Radarr library folder' }), /is read-only inside Keelhaularr.*owned by UID/);
+    try {
+      assert.match(rootAccessProblem(readOnly, { label: 'Radarr library folder' }), /is read-only inside Keelhaularr\..*UID \d+/);
+    } finally {
+      // Restored before the temporary directory is removed, not in a later hook.
+      await chmod(readOnly, 0o755);
+    }
   }
 });
