@@ -33,6 +33,7 @@ import { historySummary } from './history.mjs';
 import { identifyOrphansForCandidates, identifyScanCandidates } from './imports.mjs';
 import { createLoginThrottle } from './login-throttle.mjs';
 import { inspectMediaServer } from './mediaserver.mjs';
+import { locateReportedPath, rootAccessProblem } from './root-access.mjs';
 import { previewOrphans, previewOversized, summarizePreview } from './preview.mjs';
 import { scanOrphans } from './orphans.mjs';
 import { verifyPassword } from './passwords.mjs';
@@ -47,6 +48,7 @@ import { inspectQbittorrent, listQbittorrentCategories } from './qbittorrent.mjs
 import { runScheduledScan, scheduleStatus, startScheduler, stopScheduler } from './scheduler.mjs';
 import {
   buildSettingsOverrides,
+  buildMediaServerTestConnection,
   buildQbittorrentTestConnection,
   getSettingsOverrides,
   migrateStoredPassword,
@@ -409,6 +411,24 @@ app.get('/api/mediaserver/status', async (request, response, next) => {
   }
 });
 
+app.post('/api/mediaserver/test', async (request, response, next) => {
+  try {
+    const connection = buildMediaServerTestConnection(request.body, currentConfig().mediaServer);
+    const snapshot = await inspectMediaServer(connection);
+    response.json({
+      status: snapshot.status,
+      kind: connection.kind,
+      watchedWithinDays: connection.watchedWithinDays,
+      protectedCount: snapshot.protectedCount,
+      unmappedCount: snapshot.unmappedCount,
+      inProgressCount: snapshot.inProgressCount,
+      samples: snapshot.samples,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/qbittorrent/recovery/status', (request, response) => {
   response.json(qbittorrentRecoveryStatus(currentConfig()));
 });
@@ -494,12 +514,23 @@ app.post('/api/settings/test', async (request, response, next) => {
     }
     const status = await arrResponse.json();
     const roots = await rootResponse.json();
+    const rootFolders = Array.isArray(roots)
+      ? roots.map((root) => root?.path).filter((root) => typeof root === 'string' && root)
+      : [];
     response.json({
       connected: true,
       version: safeConnectionText(status?.version, 64, [apiKey]),
-      rootFolders: Array.isArray(roots)
-        ? roots.map((root) => root?.path).filter((root) => typeof root === 'string' && root)
-        : [],
+      rootFolders,
+      // Radarr and Sonarr report paths from inside their own containers. Saying which
+      // of them Keelhaularr can actually open, and where it sees the others, turns a
+      // save-time "does not exist" into a filled-in folder and path mapping.
+      rootFolderChecks: rootFolders.map((reported) => {
+        const problem = rootAccessProblem(reported, { label: 'Folder', storageRoots: config.storageRoots });
+        const localPath = problem && !existsSync(reported)
+          ? locateReportedPath(reported, config.storageRoots)
+          : null;
+        return { reported, usable: !problem, localPath, problem };
+      }),
     });
   } catch (error) {
     next(error);

@@ -5,6 +5,7 @@ import test from 'node:test';
 
 import {
   assertNotRecentlyWatched,
+  describeFetchFailure,
   inspectMediaServer,
   mapMediaServerPath,
   watchedPathMatch,
@@ -93,6 +94,10 @@ test('Plex sessions and recently-viewed items are both collected', async (contex
       return json(response, { MediaContainer: { Directory: [{ key: '1' }] } });
     }
     if (url.pathname === '/library/sections/1/all') {
+      // Plex's greater-than operator is `>>=`; a single `>` is not a filter it knows.
+      const since = Number(url.searchParams.get('lastViewedAt>>'));
+      assert.ok(Math.abs(since - (Date.now() - 30 * DAY) / 1000) < 60, `lastViewedAt>> was ${since}`);
+      assert.equal(url.searchParams.get('sort'), 'lastViewedAt:desc');
       if (url.searchParams.get('type') !== '1') return json(response, { MediaContainer: {} });
       return json(response, {
         MediaContainer: {
@@ -186,4 +191,24 @@ test('the watch guard withholds a watched file and permits an unwatched one', as
     /played within the last 7 day\(s\)/,
   );
   await assertNotRecentlyWatched(config, { path: '/movies/Untouched/Untouched.mkv' });
+});
+
+test('media-server connection failures say what went wrong and what to change', async (context) => {
+  const failure = (code) => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(code), { code }) });
+
+  // localhost inside the container is Keelhaularr, the most common Plex mistake.
+  assert.match(describeFetchFailure(failure('ECONNREFUSED'), 'http://localhost:32400/status/sessions'), /host\.docker\.internal:32400/);
+  assert.match(describeFetchFailure(failure('ECONNREFUSED'), 'http://127.0.0.1:32400/'), /Keelhaularr itself/);
+  assert.match(describeFetchFailure(failure('ECONNREFUSED'), 'http://192.168.1.20:32400/'), /refused the connection/);
+  assert.match(describeFetchFailure(failure('ENOTFOUND'), 'http://plex:32400/'), /could not be resolved/);
+  assert.match(describeFetchFailure(failure('DEPTH_ZERO_SELF_SIGNED_CERT'), 'https://192.168.1.20:32400/'), /plex\.direct/);
+  assert.match(describeFetchFailure(Object.assign(new Error('timed out'), { name: 'TimeoutError' }), 'http://10.0.0.5:32400/'), /did not answer/);
+
+  // A rejected token is named as such rather than as a bare status code.
+  const rejecting = await stubServer((request, response) => response.writeHead(401).end());
+  context.after(() => rejecting.close());
+  await assert.rejects(
+    inspectMediaServer({ configured: true, kind: 'plex', url: rejecting.url, token: 'bad', watchedWithinDays: 30, pathMaps: [] }),
+    /rejected the token \(HTTP 401\)/,
+  );
 });

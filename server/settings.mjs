@@ -1,9 +1,10 @@
 import { randomBytes, randomUUID } from 'node:crypto';
-import { constants, accessSync, readFileSync, statSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { chmod, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { hashPassword, isHashedPassword } from './passwords.mjs';
+import { rootAccessProblem } from './root-access.mjs';
 
 const SETTINGS_KEYS = new Set([
   'APP_USERNAME', 'APP_PASSWORD', 'APP_SESSION_SECRET', 'APP_SESSION_DAYS', 'APP_COOKIE_SECURE',
@@ -145,18 +146,14 @@ function exactCategoryArray(value, label) {
   return [...value];
 }
 
-function mediaRoots(value, label) {
+function mediaRoots(value, label, folderLabel) {
   const roots = stringArray(value, label, { maxItems: 50 });
+  const storageRoots = (process.env.STORAGE_ROOTS ?? '').split(',').map((root) => root.trim()).filter(Boolean);
   for (const root of roots) {
     if (!path.isAbsolute(root)) inputError(`${label} entries must be absolute container paths.`);
     if (root.includes(',')) inputError(`${label} entries cannot contain commas.`);
-    try {
-      if (!statSync(root).isDirectory()) inputError(`${root} is not a directory.`);
-      accessSync(root, constants.R_OK | constants.W_OK);
-    } catch (error) {
-      if (error.statusCode) throw error;
-      inputError(`${root} is not a readable and writable directory inside Keelhaularr.`);
-    }
+    const problem = rootAccessProblem(root, { label: folderLabel, storageRoots });
+    if (problem) inputError(problem);
   }
   return roots;
 }
@@ -187,8 +184,8 @@ function connectionOverrides(kind, input, output) {
   const label = kind === 'radarr' ? 'Radarr' : 'Sonarr';
   const prefix = kind.toUpperCase();
   const settings = requiredObject(input, label);
-  const roots = mediaRoots(settings.mediaRoots, `${label} media roots`);
-  const downloadRoots = mediaRoots(settings.downloadRoots, `${label} completed-download roots`);
+  const roots = mediaRoots(settings.mediaRoots, `${label} media roots`, `${label} library folder`);
+  const downloadRoots = mediaRoots(settings.downloadRoots, `${label} completed-download roots`, `${label} completed-download folder`);
   const mappings = pathMappings(settings.pathMaps, `${label} path maps`);
   const apiKey = stringValue(settings.apiKey ?? '', `${label} API key`, { allowEmpty: true, max: 1024 });
   const clearApiKey = booleanValue(settings.clearApiKey ?? false, `${label} clear API key`);
@@ -328,6 +325,36 @@ export function buildQbittorrentTestConnection(input, currentConfig) {
     ? currentConfig.pathMaps
     : pathMappings(settings.pathMaps, 'qBittorrent path maps');
   return { url, username, password, configured: true, pathMaps: mappings };
+}
+
+// Tests what is in the form, not what was last saved: saving can be blocked by an
+// unrelated field, and a connection that can only be tested after saving is one that
+// cannot be tested at all while anything else on the page is wrong.
+export function buildMediaServerTestConnection(input, currentConfig) {
+  const settings = requiredObject(input, 'Media server');
+  const kind = stringValue(settings.kind ?? 'jellyfin', 'Media server type', { max: 32 }).toLowerCase();
+  if (!['plex', 'jellyfin', 'emby'].includes(kind)) {
+    inputError('Media server type must be Plex, Jellyfin, or Emby.');
+  }
+  const url = urlValue(settings.url, 'Media server URL');
+  if (!url) inputError('Media server URL cannot be empty.');
+  let token = secretValue(settings.token ?? '', 'Media server token', { allowEmpty: true, max: 1024 });
+  if (!token && currentConfig?.token) {
+    // The same rule as saving: a stored token is only ever sent to the server it was
+    // entered for.
+    if (url !== currentConfig.url) inputError('Enter the media-server token again to test a different URL.');
+    token = currentConfig.token;
+  }
+  if (!token) inputError(kind === 'plex' ? 'Enter the X-Plex-Token to test Plex.' : 'Enter the API key to test the media server.');
+  const pathMaps = settings.pathMaps === undefined
+    ? currentConfig?.pathMaps ?? []
+    : pathMappings(settings.pathMaps, 'Media server path maps');
+  const watchedWithinDays = numberValue(
+    settings.watchedWithinDays ?? currentConfig?.watchedWithinDays ?? 30,
+    'Recently-watched window',
+    { min: 1, max: 3650, integer: true },
+  );
+  return { kind, url, token, configured: true, pathMaps, watchedWithinDays };
 }
 
 const MAX_SIZE_RULES = 50;

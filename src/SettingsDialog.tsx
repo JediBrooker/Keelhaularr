@@ -102,6 +102,13 @@ interface SettingsData {
   };
 }
 
+interface RootFolderCheck {
+  reported: string;
+  usable: boolean;
+  localPath: string | null;
+  problem: string | null;
+}
+
 interface ConnectionForm {
   url: string;
   apiKey: string;
@@ -635,8 +642,8 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
     setForm((current) => current ? { ...current, mediaServer: next } : current);
   };
 
-  // The status endpoint reads the saved connection, so an unsaved URL or token has to
-  // be saved first. Stated plainly rather than failing mysteriously.
+  // Tests what is in the form, so a new URL or token can be checked before saving, and
+  // is not blocked by an unrelated field that would stop the save.
   async function testMediaServer() {
     if (!form) return;
     setTesting('mediaServer');
@@ -645,13 +652,22 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
       const result = await api<{
         kind: string; watchedWithinDays: number; protectedCount: number;
         unmappedCount: number; inProgressCount: number;
-      }>('/api/mediaserver/status');
+      }>('/api/mediaserver/test', {
+        method: 'POST',
+        body: JSON.stringify({
+          kind: form.mediaServer.kind,
+          url: form.mediaServer.url,
+          token: form.mediaServer.token,
+          pathMaps: pathMapsFromText(form.mediaServer.pathMapsText, 'Media server'),
+          watchedWithinDays: numeric(form.mediaServer.watchedWithinDays, 'Recently-watched window'),
+        }),
+      });
       const unmapped = result.unmappedCount
         ? ` · ${result.unmappedCount} path${result.unmappedCount === 1 ? '' : 's'} need mapping`
         : '';
       setTestMessages((current) => ({
         ...current,
-        mediaServer: `Connected to ${result.kind}. ${result.protectedCount} file${result.protectedCount === 1 ? '' : 's'} protected from the last ${result.watchedWithinDays} day(s), ${result.inProgressCount} playing now${unmapped}.`,
+        mediaServer: `Connected to ${mediaServerLabels[result.kind as MediaServerForm['kind']] ?? result.kind}. ${result.protectedCount} file${result.protectedCount === 1 ? '' : 's'} protected from the last ${result.watchedWithinDays} day(s), ${result.inProgressCount} playing now${unmapped}.`,
       }));
       onConnectionTested?.('mediaServer');
     } catch (testError) {
@@ -719,20 +735,47 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
     setTesting(app);
     setTestMessages((current) => ({ ...current, [app]: '' }));
     try {
-      const result = await api<{ connected: boolean; version: string | null; rootFolders: string[] }>('/api/settings/test', {
+      const result = await api<{
+        connected: boolean;
+        version: string | null;
+        rootFolders: string[];
+        rootFolderChecks?: RootFolderCheck[];
+      }>('/api/settings/test', {
         method: 'POST',
         body: JSON.stringify({ app, url: form[app].url, apiKey: form[app].apiKey }),
       });
-      const autoFilledRoots = Boolean(result.rootFolders.length && !form[app].mediaRoots.some((root) => root.trim()));
-      const roots = result.rootFolders.length
+      const checks = result.rootFolderChecks ?? result.rootFolders.map((reported) => ({ reported, usable: true, localPath: null, problem: null }));
+      const localRoots = checks.map((check) => (check.usable ? check.reported : check.localPath ?? check.reported));
+      const mappings = checks
+        .filter((check) => !check.usable && check.localPath)
+        .map((check) => `${check.reported}=>${check.localPath}`);
+      // Roots are filled only when the list is empty or still exactly what an earlier
+      // test filled in, so a folder someone typed by hand is never replaced.
+      const replaceable = (roots: string[]) => {
+        const entered = roots.map((root) => root.trim()).filter(Boolean);
+        return !entered.length || (entered.length === result.rootFolders.length
+          && entered.every((root, index) => root === result.rootFolders[index]));
+      };
+      const autoFilledRoots = Boolean(checks.length && replaceable(form[app].mediaRoots));
+      const unusable = checks.filter((check) => !check.usable);
+      const located = unusable.filter((check) => check.localPath);
+      const unresolved = unusable.filter((check) => !check.localPath);
+      const roots = checks.length
         ? ` · ${result.rootFolders.join(', ')}${autoFilledRoots ? ' · added to media roots' : ''}`
         : ' · no media roots reported';
+      const locatedText = located.length
+        ? ` · Keelhaularr sees ${located.map((check) => `${check.reported} at ${check.localPath}`).join(', ')}${autoFilledRoots ? '; path mapping added' : ''}`
+        : '';
+      const unresolvedText = unresolved.length ? ` · ${unresolved.map((check) => check.problem).join(' ')}` : '';
       if (autoFilledRoots) {
-        setForm((current) => current && !current[app].mediaRoots.some((root) => root.trim())
-          ? { ...current, [app]: { ...current[app], mediaRoots: result.rootFolders } }
-          : current);
+        setForm((current) => {
+          if (!current || !replaceable(current[app].mediaRoots)) return current;
+          const existingMaps = current[app].pathMapsText.split('\n').map((line) => line.trim()).filter(Boolean);
+          const pathMapsText = [...existingMaps, ...mappings.filter((mapping) => !existingMaps.includes(mapping))].join('\n');
+          return { ...current, [app]: { ...current[app], mediaRoots: localRoots, pathMapsText } };
+        });
       }
-      setTestMessages((current) => ({ ...current, [app]: `Connected${result.version ? ` · v${result.version}` : ''}${roots}` }));
+      setTestMessages((current) => ({ ...current, [app]: `Connected${result.version ? ` · v${result.version}` : ''}${roots}${locatedText}${unresolvedText}` }));
       onConnectionTested?.(app);
     } catch (error) {
       setTestMessages((current) => ({ ...current, [app]: error instanceof Error ? error.message : String(error) }));
