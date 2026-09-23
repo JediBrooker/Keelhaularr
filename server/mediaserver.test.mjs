@@ -92,8 +92,9 @@ test('Plex sessions and recently-viewed items are both collected', async (contex
       });
     }
     if (url.pathname === '/library/sections') {
-      return json(response, { MediaContainer: { Directory: [{ key: '1' }] } });
+      return json(response, { MediaContainer: { Directory: [{ key: '1', type: 'movie' }] } });
     }
+    if (url.pathname === '/status/sessions/history/all') return json(response, { MediaContainer: { size: 0 } });
     if (url.pathname === '/library/sections/1/all') {
       // Plex's greater-than operator is `>>=`; a single `>` is not a filter it knows.
       const since = Number(url.searchParams.get('lastViewedAt>>'));
@@ -279,5 +280,175 @@ test('a media server that cannot be reached, or refuses the token, is marked as 
   await assert.rejects(
     discoverMediaServerLibraries({ kind: 'jellyfin', url: missing.url, token: 'x' }),
     (error) => !error.connectionFailure && /HTTP 404/.test(error.message),
+  );
+});
+
+function plexHistoryStub({ history, files, strictBatches = false, requests = [] }) {
+  return (request, response) => {
+    const url = new URL(request.url, 'http://stub');
+    if (url.pathname === '/status/sessions') return json(response, { MediaContainer: {} });
+    if (url.pathname === '/library/sections') {
+      return json(response, { MediaContainer: { Directory: [
+        { key: '1', type: 'movie', title: 'Films' },
+        { key: '2', type: 'show', title: 'TV' },
+        { key: '3', type: 'artist', title: 'Music' },
+      ] } });
+    }
+    if (url.pathname === '/status/sessions/history/all') {
+      requests.push(Object.fromEntries(url.searchParams));
+      const start = Number(url.searchParams.get('X-Plex-Container-Start'));
+      const size = Number(url.searchParams.get('X-Plex-Container-Size'));
+      const plays = history(url.searchParams.get('librarySectionID'), start, size);
+      return json(response, { MediaContainer: { Metadata: plays } });
+    }
+    const metadata = url.pathname.match(/^\/library\/metadata\/([\d,]+)$/);
+    if (metadata) {
+      requests.push({ metadata: metadata[1] });
+      const keys = metadata[1].split(',');
+      const found = keys.filter((key) => files(key));
+      // A strict server refuses a whole batch when any one item is gone.
+      if (!found.length || (strictBatches && found.length !== keys.length)) return response.writeHead(404).end();
+      return json(response, { MediaContainer: { Metadata: found.map((key) => ({
+        ratingKey: key, title: `Item ${key}`, Media: [{ Part: [{ file: files(key) }] }],
+      })) } });
+    }
+    if (url.pathname.startsWith('/library/sections/')) return json(response, { MediaContainer: {} });
+    response.writeHead(404).end();
+  };
+}
+
+test('Plex plays by every account are protected, not only the token owner\'s', async (context) => {
+  const now = Math.floor(Date.now() / 1000);
+  const requests = [];
+  const files = {
+    101: '/data/movies/Owner/Owner.mkv',
+    102: '/data/movies/Partner/Partner.mkv',
+    103: '/data/movies/LastYear/LastYear.mkv',
+    201: '/data/tv/Show/Show - S01E01.mkv',
+  };
+  const stub = await stubServer(plexHistoryStub({
+    requests,
+    files: (key) => files[key],
+    history: (section, start) => {
+      if (start > 0) return [];
+      if (section === '1') {
+        return [
+          { ratingKey: '101', type: 'movie', accountID: 1, viewedAt: now - 3600 },
+          { ratingKey: '102', type: 'movie', accountID: 7, viewedAt: now - 2 * 86400 },
+          // Played, then removed from the library: nothing left to protect.
+          { ratingKey: '999', type: 'movie', accountID: 7, viewedAt: now - 3 * 86400 },
+          { ratingKey: '103', type: 'movie', accountID: 7, viewedAt: now - 40 * 86400 },
+        ];
+      }
+      if (section === '2') return [{ ratingKey: '201', type: 'episode', accountID: 9, viewedAt: now - 86400 }];
+      throw new Error(`history read for section ${section}`);
+    },
+  }));
+  context.after(() => stub.close());
+
+  const snapshot = await inspectMediaServer({
+    configured: true, kind: 'plex', url: stub.url, token: 't',
+    watchedWithinDays: 30, pathMaps: [{ from: '/data', to: '/local' }],
+  });
+
+  assert.deepEqual(snapshot.protectedPaths.sort(), [
+    '/local/movies/Owner/Owner.mkv',
+    '/local/movies/Partner/Partner.mkv',
+    '/local/tv/Show/Show - S01E01.mkv',
+  ]);
+  assert.equal(snapshot.accountCount, 3);
+  const historyReads = requests.filter((entry) => entry.librarySectionID);
+  // Each film and TV library is read newest first; music never is.
+  assert.deepEqual(historyReads.map((entry) => entry.librarySectionID), ['1', '2']);
+  assert.ok(historyReads.every((entry) => entry.sort === 'viewedAt:desc'));
+  // Files are looked up in one batch, and only for plays inside the window.
+  assert.deepEqual(requests.filter((entry) => entry.metadata).map((entry) => entry.metadata), ['101,102,999,201']);
+});
+
+test('Plex history is read page by page until a play falls outside the window', async (context) => {
+  const now = Math.floor(Date.now() / 1000);
+  const requests = [];
+  const stub = await stubServer(plexHistoryStub({
+    requests,
+    files: (key) => `/data/movies/${key}/${key}.mkv`,
+    history: (section, start, size) => {
+      if (section !== '1') return [];
+      if (start === 0) {
+        return Array.from({ length: size }, (_, index) => ({
+          ratingKey: String(1000 + index), type: 'movie', accountID: 2, viewedAt: now - 60 - index,
+        }));
+      }
+      return [
+        { ratingKey: '5000', type: 'movie', accountID: 3, viewedAt: now - 86400 },
+        { ratingKey: '5001', type: 'movie', accountID: 3, viewedAt: now - 90 * 86400 },
+      ];
+    },
+  }));
+  context.after(() => stub.close());
+
+  const snapshot = await inspectMediaServer({
+    configured: true, kind: 'plex', url: stub.url, token: 't', watchedWithinDays: 30, pathMaps: [],
+  });
+  assert.equal(snapshot.protectedCount, 201);
+  assert.equal(snapshot.protectedPaths.includes('/data/movies/5001/5001.mkv'), false);
+  assert.equal(snapshot.accountCount, 2);
+  assert.deepEqual(requests.filter((entry) => entry.librarySectionID === '1').map((entry) => entry['X-Plex-Container-Start']), ['0', '200']);
+  assert.equal(requests.filter((entry) => entry.metadata).length, 5);
+});
+
+test('a lookup refused because one played item is gone still protects the rest of its batch', async (context) => {
+  const now = Math.floor(Date.now() / 1000);
+  const stub = await stubServer(plexHistoryStub({
+    strictBatches: true,
+    files: (key) => (key === '101' ? '/data/movies/Kept/Kept.mkv' : undefined),
+    history: (section, start) => (section === '1' && start === 0 ? [
+      { ratingKey: '101', type: 'movie', accountID: 4, viewedAt: now - 60 },
+      { ratingKey: '999', type: 'movie', accountID: 4, viewedAt: now - 120 },
+    ] : []),
+  }));
+  context.after(() => stub.close());
+
+  const snapshot = await inspectMediaServer({
+    configured: true, kind: 'plex', url: stub.url, token: 't', watchedWithinDays: 30, pathMaps: [],
+  });
+  assert.deepEqual(snapshot.protectedPaths, ['/data/movies/Kept/Kept.mkv']);
+});
+
+test('Plex history that cannot be read completely fails the check instead of guessing', async (context) => {
+  const now = Math.floor(Date.now() / 1000);
+  // More plays inside the window than will be read.
+  const busy = await stubServer(plexHistoryStub({
+    files: () => '/data/movies/x.mkv',
+    history: (section, start, size) => (section === '1' ? Array.from({ length: size }, (_, index) => ({
+      ratingKey: String(start + index + 1), type: 'movie', accountID: 1, viewedAt: now - start - index,
+    })) : []),
+  }));
+  context.after(() => busy.close());
+  await assert.rejects(
+    inspectMediaServer({ configured: true, kind: 'plex', url: busy.url, token: 't', watchedWithinDays: 30, pathMaps: [] }),
+    /more than 5000 plays in "Films" within the recently-watched window/,
+  );
+
+  // History that is not newest first could list a recent play after an older one.
+  const unordered = await stubServer(plexHistoryStub({
+    files: () => '/data/movies/x.mkv',
+    history: (section, start) => (section === '1' && start === 0 ? [
+      { ratingKey: '1', type: 'movie', accountID: 1, viewedAt: now - 60 },
+      { ratingKey: '2', type: 'movie', accountID: 1, viewedAt: now - 90 * 86400 },
+      { ratingKey: '3', type: 'movie', accountID: 1, viewedAt: now - 30 },
+    ] : []),
+  }));
+  context.after(() => unordered.close());
+  await assert.rejects(
+    inspectMediaServer({ configured: true, kind: 'plex', url: unordered.url, token: 't', watchedWithinDays: 30, pathMaps: [] }),
+    /out of order/,
+  );
+
+  // And the guard itself preserves the file when that happens.
+  await assert.rejects(
+    assertNotRecentlyWatched({ mediaServer: {
+      configured: true, kind: 'plex', url: unordered.url, token: 't', watchedWithinDays: 30, pathMaps: [],
+    } }, { path: '/data/movies/Anything/Anything.mkv' }),
+    /watch check failed immediately before the file change; file preserved/,
   );
 });

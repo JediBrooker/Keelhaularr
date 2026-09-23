@@ -135,6 +135,7 @@ test('testing each connection fills in the rest of the setup', async (context) =
     const url = new URL(request.url, 'http://mock');
     plexRequests.push(request.headers['x-plex-token']);
     if (url.pathname === '/status/sessions') return json(response, { MediaContainer: {} });
+    if (url.pathname === '/status/sessions/history/all') return json(response, { MediaContainer: { size: 0 } });
     if (url.pathname === '/library/sections') {
       return json(response, { MediaContainer: { Directory: [
         { key: '1', type: 'movie', title: 'Movies', Location: [{ path: '/data/movies' }] },
