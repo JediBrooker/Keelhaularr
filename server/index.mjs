@@ -412,6 +412,7 @@ app.get('/api/mediaserver/status', async (request, response, next) => {
       protectedCount: snapshot.protectedCount,
       unmappedCount: snapshot.unmappedCount,
       inProgressCount: snapshot.inProgressCount,
+      accountCount: snapshot.accountCount,
       samples: snapshot.samples,
     });
   } catch (error) {
@@ -452,6 +453,7 @@ app.post('/api/mediaserver/test', async (request, response, next) => {
       protectedCount: snapshot.protectedCount,
       unmappedCount: snapshot.unmappedCount,
       inProgressCount: snapshot.inProgressCount,
+      accountCount: snapshot.accountCount,
       samples: snapshot.samples,
       suggestedPathMaps: suggestions,
       unresolvedLocations: unresolved

@@ -94,7 +94,9 @@ async function request(url, headers) {
       { connectionFailure: true },
     );
   }
-  if (!response.ok) throw apiError(`The media server returned HTTP ${response.status}.`);
+  if (!response.ok) {
+    throw Object.assign(apiError(`The media server returned HTTP ${response.status}.`), { upstreamStatus: response.status });
+  }
   const text = await response.text();
   if (!text) return null;
   try {
@@ -134,6 +136,7 @@ async function collectJellyfin(connection, cutoffMs) {
 
   const users = await request(`${base}/Users`, headers);
   const userList = (Array.isArray(users) ? users : []).slice(0, MAX_USERS);
+  let accountCount = 0;
   for (const user of userList) {
     const id = safeText(user?.Id, 64);
     if (!id) continue;
@@ -148,13 +151,16 @@ async function collectJellyfin(connection, cutoffMs) {
       EnableUserData: 'true',
     });
     const played = await request(`${base}/Users/${encodeURIComponent(id)}/Items?${query}`, headers);
+    let playedInWindow = false;
     for (const item of Array.isArray(played?.Items) ? played.Items : []) {
       if (!item?.Path) continue;
       if (!withinWindow(item?.UserData?.LastPlayedDate, cutoffMs)) continue;
+      playedInWindow = true;
       paths.push({ raw: item.Path, reason: 'watched recently', title: safeText(item?.Name) });
     }
+    if (playedInWindow) accountCount += 1;
   }
-  return { paths, inProgress };
+  return { paths, inProgress, accountCount };
 }
 
 // ---------------------------------------------------------------- Plex
@@ -168,6 +174,91 @@ function plexPartFiles(entry) {
   for (const media of Array.isArray(entry?.Media) ? entry.Media : []) {
     for (const part of Array.isArray(media?.Part) ? media.Part : []) {
       if (part?.file) files.push(part.file);
+    }
+  }
+  return files;
+}
+
+const HISTORY_PAGE_SIZE = 200;
+// Per film or TV library: a household would have to finish over 150 things a day in
+// one library for a month to reach this. Reaching it means plays were left unread, so
+// the check fails rather than guessing.
+const MAX_HISTORY_PLAYS = 5000;
+const METADATA_BATCH_SIZE = 50;
+const HISTORY_TYPES = new Set(['movie', 'episode']);
+
+/**
+ * Every account's plays in one library since the cutoff, from the server's own play
+ * history.
+ *
+ * `lastViewedAt` on library items only describes the account that owns the token, so
+ * a film someone else in the household watched last night looked unwatched. The
+ * history lists every account's plays on this server. It is read newest first until a
+ * play falls outside the window, one film or TV library at a time so that music plays
+ * never fill the pages. No server-side date filter is sent: its operator is spelled
+ * differently here than in library searches, and a filter read the wrong way would
+ * return nothing, which looks exactly like nothing watched. History that is not newest
+ * first, or that has not reached the window's edge by the cap, fails the check
+ * instead, because an unread page could hold the file about to be removed.
+ */
+async function plexHistory(base, headers, cutoffSeconds, section) {
+  const plays = [];
+  let previous = Number.POSITIVE_INFINITY;
+  for (let start = 0; start < MAX_HISTORY_PLAYS; start += HISTORY_PAGE_SIZE) {
+    const query = new URLSearchParams({
+      sort: 'viewedAt:desc',
+      librarySectionID: section.key,
+      'X-Plex-Container-Start': String(start),
+      'X-Plex-Container-Size': String(HISTORY_PAGE_SIZE),
+    });
+    const page = await request(`${base}/status/sessions/history/all?${query}`, headers);
+    const entries = Array.isArray(page?.MediaContainer?.Metadata) ? page.MediaContainer.Metadata : [];
+    let reachedEdge = false;
+    // The whole page is checked for order before stopping at the window's edge, so a
+    // recent play listed after an older one cannot be skipped unnoticed.
+    for (const entry of entries) {
+      const viewedAt = Number(entry?.viewedAt);
+      if (!Number.isFinite(viewedAt)) continue;
+      if (viewedAt > previous) {
+        throw apiError('Plex returned its play history out of order, so recent plays cannot be ruled out.');
+      }
+      previous = viewedAt;
+      if (viewedAt < cutoffSeconds) reachedEdge = true;
+      else plays.push(entry);
+    }
+    if (reachedEdge || entries.length < HISTORY_PAGE_SIZE) return plays;
+  }
+  throw apiError(`Plex reports more than ${MAX_HISTORY_PLAYS} plays in ${section.title ? `"${section.title}"` : 'one library'} within the recently-watched window, so they cannot all be checked. Shorten the window under Settings → Connections → Media server.`);
+}
+
+async function plexMetadata(base, headers, keys) {
+  try {
+    const page = await request(`${base}/library/metadata/${keys.join(',')}`, headers);
+    return page?.MediaContainer?.Metadata ?? [];
+  } catch (error) {
+    if (error?.upstreamStatus !== 404) throw error;
+    // Played and since removed from the library: nothing is left to protect. One such
+    // item must not hide the rest of its batch, so a refused batch is retried item by
+    // item and only the ones that are really gone are dropped.
+    if (keys.length === 1) return [];
+    const items = [];
+    for (const key of keys) items.push(...await plexMetadata(base, headers, [key]));
+    return items;
+  }
+}
+
+async function plexHistoryFiles(base, headers, plays) {
+  const keys = [...new Set(plays
+    .filter((play) => HISTORY_TYPES.has(play?.type))
+    .map((play) => String(play?.ratingKey ?? ''))
+    .filter((key) => /^\d{1,12}$/.test(key)))];
+  const files = [];
+  for (let index = 0; index < keys.length; index += METADATA_BATCH_SIZE) {
+    for (const item of await plexMetadata(base, headers, keys.slice(index, index + METADATA_BATCH_SIZE))) {
+      const title = item?.grandparentTitle ? `${item.grandparentTitle} — ${item.title}` : item?.title;
+      for (const file of plexPartFiles(item)) {
+        files.push({ raw: file, reason: 'watched recently', title: safeText(title) });
+      }
     }
   }
   return files;
@@ -187,9 +278,21 @@ async function collectPlex(connection, cutoffMs) {
     }
   }
 
+  const cutoffSeconds = Math.floor(cutoffMs / 1000);
   const sections = await request(`${base}/library/sections`, headers);
   const directories = (sections?.MediaContainer?.Directory ?? []).slice(0, MAX_SECTIONS);
-  const cutoffSeconds = Math.floor(cutoffMs / 1000);
+
+  const plays = [];
+  for (const directory of directories) {
+    const key = safeText(directory?.key, 32);
+    if ((directory?.type !== 'movie' && directory?.type !== 'show') || !key || !/^\d+$/.test(key)) continue;
+    plays.push(...await plexHistory(base, headers, cutoffSeconds, { key, title: safeText(directory?.title) }));
+  }
+  paths.push(...await plexHistoryFiles(base, headers, plays));
+  const accounts = new Set(plays.map((play) => Number(play?.accountID)).filter(Number.isFinite));
+
+  // The token owner's own viewing state, read as before. The history above already
+  // includes these plays; this also covers anything marked as watched by hand.
   for (const directory of directories) {
     const key = safeText(directory?.key, 32);
     if (!key) continue;
@@ -223,7 +326,7 @@ async function collectPlex(connection, cutoffMs) {
       }
     }
   }
-  return { paths, inProgress };
+  return { paths, inProgress, accountCount: accounts.size };
 }
 
 // ---------------------------------------------------------------- library folders
@@ -315,6 +418,7 @@ export async function inspectMediaServer(connection) {
       protectedCount: 0,
       unmappedCount: 0,
       inProgressCount: 0,
+      accountCount: 0,
       samples: [],
     };
   }
@@ -341,6 +445,8 @@ export async function inspectMediaServer(connection) {
     protectedCount: mapped.size,
     unmappedCount,
     inProgressCount: collected.inProgress,
+    // How many accounts played something within the window.
+    accountCount: collected.accountCount ?? 0,
     samples: [...mapped.entries()].slice(0, 10).map(([localPath, entry]) => ({
       path: localPath,
       title: entry.title,

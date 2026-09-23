@@ -53,7 +53,7 @@ Both destructive automations are opt-in and disabled by default.
 - Brig interface for restoring or purging quarantined files
 - Optional automatic quarantine retention
 - Scheduled scan reports with generic, Discord, or Gotify webhooks
-- Optional Plex/Jellyfin/Emby watch guard that withholds recently played or in-progress media
+- Optional Plex/Jellyfin/Emby watch guard that withholds media recently played by any account, or playing now
 - Dry run that evaluates every safety gate per file and changes nothing
 - Reclaimed-space history that separates freed bytes from bytes still held in quarantine
 - Storage access, free-space, and filesystem compatibility checks
@@ -887,10 +887,19 @@ an `X-Plex-Token`. Both a URL and a token are required, because querying watch
 history without credentials would return nothing and look exactly like "nothing was
 watched". Leave the URL blank to disable the guard entirely.
 
+Every account on the server counts, not only the one whose token is used. Jellyfin
+and Emby are asked about each user. For Plex, the server's own play history lists
+every account's plays, and it is read one film or TV library at a time so music never
+crowds it out. The connection test says how many accounts played something within the
+window.
+
 Like the qBittorrent guard, this **fails closed**. A configured media server that
 cannot be reached or authenticated preserves the file rather than removing it, and so
 does a watched path that cannot be mapped to a local path - because a path that
-cannot be resolved cannot be proven different from the file about to be removed. Add
+cannot be resolved cannot be proven different from the file about to be removed. Plex
+play history that cannot be read completely preserves files too: history that is not
+returned newest first, or more than 5,000 plays in one library within the window, in
+which case shortening the window lets the check finish. Add
 `MEDIA_SERVER_PATH_MAPS` when the media server sees different paths than
 Keelhaularr; mapping translates paths and does not mount storage.
 

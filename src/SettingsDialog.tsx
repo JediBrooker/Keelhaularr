@@ -733,7 +733,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
     try {
       const result = await api<{
         kind: string; watchedWithinDays: number; protectedCount: number;
-        unmappedCount: number; inProgressCount: number;
+        unmappedCount: number; inProgressCount: number; accountCount?: number;
         suggestedPathMaps?: PathMap[]; unresolvedLocations?: string[];
       }>('/api/mediaserver/test', {
         method: 'POST',
@@ -762,7 +762,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
         : '';
       setTestMessages((current) => ({
         ...current,
-        mediaServer: `Connected to ${serverLabel}. ${result.protectedCount} file${result.protectedCount === 1 ? '' : 's'} protected from the last ${result.watchedWithinDays} day(s), ${result.inProgressCount} playing now${unmapped}.${added}`,
+        mediaServer: `Connected to ${serverLabel}. ${result.protectedCount} file${result.protectedCount === 1 ? '' : 's'} protected from the last ${result.watchedWithinDays} day(s)${result.accountCount ? `, played by ${result.accountCount} account${result.accountCount === 1 ? '' : 's'}` : ''}, ${result.inProgressCount} playing now${unmapped}.${added}`,
       }));
       setTestNotes((current) => ({
         ...current,
