@@ -109,6 +109,30 @@ interface RootFolderCheck {
   problem: string | null;
 }
 
+// What a Radarr or Sonarr test learns about the rest of the setup. Never a secret:
+// passwords and tokens are masked by the applications and have to be typed in.
+interface ArrDiscovery {
+  qbittorrent: { url: string; reachable: boolean; username: string; category: string; clientName: string } | null;
+  mediaServer: { kind: MediaServerForm['kind']; url: string; reachable: boolean } | null;
+  quarantine?: { current: string; suggested: string } | null;
+}
+
+interface FilledValue {
+  value: string;
+  source: AppKind | null;
+  reachable: boolean;
+}
+
+// The installer's default, on the LXC's own system disk rather than the media storage.
+const INSTALLER_QUARANTINE_DIR = '/config/quarantine';
+
+interface DownloadDiscovery {
+  downloadFolders: Partial<Record<AppKind, { localPaths: string[]; problems: string[] }>>;
+  qbittorrentPathMaps: PathMap[];
+  arrPathMaps: Partial<Record<AppKind, PathMap[]>>;
+  notes: string[];
+}
+
 interface ConnectionForm {
   url: string;
   apiKey: string;
@@ -272,10 +296,17 @@ const mediaServerLabels: Record<MediaServerForm['kind'], string> = {
   emby: 'Emby',
 };
 
-function MediaServerSection({ form, testing, testMessage, onChange, onTest }: {
+const mediaServerTokenHelp: Record<MediaServerForm['kind'], string> = {
+  plex: 'To find the token, open any movie in Plex Web, choose ⋯ → Get Info → View XML, and copy the value after X-Plex-Token= in the address of the page that opens.',
+  jellyfin: 'Create a key in Jellyfin under Dashboard → API Keys.',
+  emby: 'Create a key in Emby under Settings → Advanced → API Keys.',
+};
+
+function MediaServerSection({ form, testing, testMessage, notes, onChange, onTest }: {
   form: MediaServerForm;
   testing: boolean;
   testMessage: string;
+  notes: string[];
   onChange: (next: MediaServerForm) => void;
   onTest: () => void;
 }) {
@@ -290,6 +321,7 @@ function MediaServerSection({ form, testing, testMessage, onChange, onTest }: {
         </button>
       </div>
       {testMessage && <p className={`connection-result ${testMessage.startsWith('Connected') ? 'success' : 'error'}`}>{testMessage}</p>}
+      <ConnectionNotes notes={notes} />
       <div className="settings-grid two">
         <label className="field">Server type<select value={form.kind} onChange={(event) => update('kind', event.target.value as MediaServerForm['kind'])}>
           <option value="jellyfin">Jellyfin</option>
@@ -297,8 +329,9 @@ function MediaServerSection({ form, testing, testMessage, onChange, onTest }: {
           <option value="plex">Plex</option>
         </select></label>
         <label className="field">Recently-watched window (days)<input type="number" min="1" max="3650" value={form.watchedWithinDays} onChange={(event) => update('watchedWithinDays', event.target.value)} /></label>
-        <label className="field wide-field">{label} URL<input type="url" value={form.url} onChange={(event) => update('url', event.target.value)} placeholder={form.kind === 'plex' ? 'http://plex:32400' : 'http://jellyfin:8096'} /></label>
+        <label className="field wide-field">{label} URL <span>Filled in when you test Radarr or Sonarr, if either notifies it</span><input type="url" value={form.url} onChange={(event) => update('url', event.target.value)} placeholder={form.kind === 'plex' ? 'http://plex:32400' : 'http://jellyfin:8096'} /></label>
         <label className="field wide-field">{form.kind === 'plex' ? 'X-Plex-Token' : 'API key'}<input type="password" value={form.token} onChange={(event) => update('token', event.target.value)} autoComplete="new-password" placeholder={form.tokenConfigured ? 'Saved — leave blank to keep it' : 'Required to read watch history'} /></label>
+        <p className="field-hint wide-field">{mediaServerTokenHelp[form.kind]} Testing the connection then fills in the path mapping.</p>
         {form.tokenConfigured && <label className="check-row wide-field"><input type="checkbox" checked={form.clearToken} onChange={(event) => update('clearToken', event.target.checked)} />Remove the saved {label} token and disable the watch guard</label>}
         <p className="field-hint wide-field">Files played within the window, and anything playing right now, are withheld from every file action. Leave the URL blank to disable the guard. If a configured server cannot be reached, or reports a path that cannot be mapped, files are preserved rather than removed.</p>
         <details className="advanced-settings wide-field" open={Boolean(form.pathMapsText.trim())}>
@@ -425,6 +458,49 @@ function pathMapsFromText(value: string, label: string) {
   });
 }
 
+// Adds a line for each mapping whose source no existing line maps yet. Lines already
+// there are kept as they are, so filling in can only ever add.
+function withMappings(text: string, mappings: PathMap[]) {
+  const lines = listFromText(text, /\n/);
+  const mapped = new Set(lines.map((line) => line.split('=>')[0].trim()));
+  const added = mappings.filter((mapping) => !mapped.has(mapping.from)).map(({ from, to }) => `${from}=>${to}`);
+  return [...lines, ...added].join('\n');
+}
+
+// Mappings sent with a test only to help it find folders; a line still being typed
+// elsewhere on the page should not stop this test from running.
+function pathMapHints(value: string, label: string) {
+  try {
+    return pathMapsFromText(value, label);
+  } catch {
+    return [];
+  }
+}
+
+function trimmedList(values: string[]) {
+  return values.map((value) => value.trim()).filter(Boolean);
+}
+
+function sameList(first: string[], second: string[]) {
+  return first.length === second.length && first.every((value, index) => value === second[index]);
+}
+
+// Whether a test of `app` may put a new address into a field. An empty field always
+// can. One still holding what an earlier test filled in can be updated by the same
+// application, or by the other one when the earlier address did not answer and this
+// one does. Anything typed by hand is left alone.
+function mayFill(current: string, filled: FilledValue, app: AppKind, reachable: boolean) {
+  const value = current.trim();
+  if (!value) return true;
+  if (!filled.value || value !== filled.value) return false;
+  return filled.source === app || (!filled.reachable && reachable);
+}
+
+function ConnectionNotes({ notes }: { notes: string[] }) {
+  if (!notes.length) return null;
+  return <ul className="connection-notes">{notes.map((note, index) => <li key={index}>{note}</li>)}</ul>;
+}
+
 function numeric(value: string, label: string) {
   const output = Number(value);
   if (!value.trim() || !Number.isFinite(output)) throw new Error(`${label} must be a number.`);
@@ -460,11 +536,12 @@ function FolderList({ title, appLabel, hint, values, placeholder, addLabel, empt
   );
 }
 
-function ArrConnectionSection({ app, form, testing, testMessage, onChange, onTest }: {
+function ArrConnectionSection({ app, form, testing, testMessage, notes, onChange, onTest }: {
   app: AppKind;
   form: ConnectionForm;
   testing: boolean;
   testMessage: string;
+  notes: string[];
   onChange: (next: ConnectionForm) => void;
   onTest: () => void;
 }) {
@@ -479,14 +556,15 @@ function ArrConnectionSection({ app, form, testing, testMessage, onChange, onTes
         </button>
       </div>
       {testMessage && <p className={`connection-result ${testMessage.startsWith('Connected') ? 'success' : 'error'}`}>{testMessage}</p>}
+      <ConnectionNotes notes={notes} />
       <div className="settings-grid two">
         <label className="field wide-field">Server URL<input type="url" value={form.url} onChange={(event) => update('url', event.target.value)} placeholder={`http://${app}:` + (app === 'radarr' ? '7878' : '8989')} /></label>
-        <label className="field wide-field">API key<input type="password" value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} autoComplete="off" placeholder={form.apiKeyConfigured ? 'Saved — leave blank to keep it' : 'Enter API key'} /></label>
+        <label className="field wide-field">API key <span>{label} → Settings → General → Security → API Key. Testing fills in the folders below, qBittorrent and the media server.</span><input type="password" value={form.apiKey} onChange={(event) => update('apiKey', event.target.value)} autoComplete="off" placeholder={form.apiKeyConfigured ? 'Saved — leave blank to keep it' : 'Enter API key'} /></label>
         {form.apiKeyConfigured && <label className="check-row wide-field"><input type="checkbox" checked={form.clearApiKey} onChange={(event) => update('clearApiKey', event.target.checked)} />Remove the saved {label} API key</label>}
         <FolderList title="Library folders" appLabel={label} hint={`Detected automatically when you test ${label}`} values={form.mediaRoots} placeholder={app === 'radarr' ? '/data/media/movies' : '/data/media/tv'} addLabel="Add manually" emptyMessage={`Test the ${label} connection to fill this automatically.`} onChange={(next) => update('mediaRoots', next)} />
-        <FolderList title="Completed download folders" appLabel={label} hint="Folders whose completed imports may remain hardlinked" values={form.downloadRoots} placeholder={app === 'radarr' ? '/data/torrents/movies' : '/data/torrents/tv'} addLabel="Add folder" emptyMessage="No completed-download folders configured." onChange={(next) => update('downloadRoots', next)} />
+        <FolderList title="Completed download folders" appLabel={label} hint="Folders whose completed imports may remain hardlinked" values={form.downloadRoots} placeholder={app === 'radarr' ? '/data/torrents/movies' : '/data/torrents/tv'} addLabel="Add folder" emptyMessage="Filled in when you test qBittorrent below." onChange={(next) => update('downloadRoots', next)} />
         <details className="advanced-settings wide-field" open={Boolean(form.pathMapsText.trim())}>
-          <summary>Advanced path mapping <span>Most installations leave this blank</span></summary>
+          <summary>Advanced path mapping <span>Filled in by the tests when {label} and Keelhaularr see a folder under different paths</span></summary>
           <div><p>Use this only when {label} reports one path but Keelhaularr sees the same folder under another path. Format each line as <code>/arr/path=&gt;/keelhaularr/path</code>.</p><label className="field">Mappings<textarea rows={2} value={form.pathMapsText} onChange={(event) => update('pathMapsText', event.target.value)} /></label></div>
         </details>
         <SizeRulesEditor label={label} rows={form.sizeRules} onChange={(rows) => update('sizeRules', rows)} />
@@ -521,12 +599,14 @@ function QBittorrentConnectionSection({
   form,
   testing,
   testMessage,
+  notes,
   onChange,
   onTest,
 }: {
   form: QBittorrentForm;
   testing: boolean;
   testMessage: string;
+  notes: string[];
   onChange: (next: QBittorrentForm) => void;
   onTest: () => void;
 }) {
@@ -544,12 +624,13 @@ function QBittorrentConnectionSection({
         </button>
       </div>
       {testMessage && <p className={`connection-result ${testSucceededSafely ? 'success' : 'error'}`}>{testMessage}</p>}
+      <ConnectionNotes notes={notes} />
       <div className="settings-grid two">
-        <label className="field wide-field">Web UI URL<input type="url" value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="http://qbittorrent:8080" /></label>
+        <label className="field wide-field">Web UI URL <span>Filled in when you test Radarr or Sonarr</span><input type="url" value={form.url} onChange={(event) => update('url', event.target.value)} placeholder="http://qbittorrent:8080" /></label>
         <label className="field">Username<input value={form.username} onChange={(event) => update('username', event.target.value)} autoComplete="username" placeholder="admin" /></label>
         <label className="field">Password<input type="password" value={form.password} onChange={(event) => update('password', event.target.value)} autoComplete="new-password" placeholder={form.passwordConfigured ? 'Saved — leave blank to keep it' : 'Web UI password'} /></label>
         {form.passwordConfigured && <label className="check-row wide-field"><input type="checkbox" checked={form.clearPassword} onChange={(event) => update('clearPassword', event.target.checked)} />Remove the saved qBittorrent password</label>}
-        <p className="field-hint wide-field">Incomplete torrents are excluded from completed-download orphan results. If qBittorrent cannot be checked safely, those results are withheld.</p>
+        <p className="field-hint wide-field">Radarr and Sonarr never share the Web UI password, so it has to be typed here. Testing then fills in each app’s completed-download folder and the path mappings. Incomplete torrents are excluded from completed-download orphan results. If qBittorrent cannot be checked safely, those results are withheld.</p>
         <details className="advanced-settings wide-field" open={Boolean(form.pathMapsText.trim())}>
           <summary>Path mapping <span>Required when qBittorrent reports different paths</span></summary>
           <div><p>Map the path qBittorrent reports to the same folder inside Keelhaularr. For example, <code>/downloads=&gt;/radarr-downloads</code>. This translates paths; it does not mount storage.</p><label className="field">Mappings<textarea rows={2} value={form.pathMapsText} onChange={(event) => update('pathMapsText', event.target.value)} /></label></div>
@@ -648,10 +729,12 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
     if (!form) return;
     setTesting('mediaServer');
     setTestMessages((current) => ({ ...current, mediaServer: '' }));
+    setTestNotes((current) => ({ ...current, mediaServer: [] }));
     try {
       const result = await api<{
         kind: string; watchedWithinDays: number; protectedCount: number;
         unmappedCount: number; inProgressCount: number;
+        suggestedPathMaps?: PathMap[]; unresolvedLocations?: string[];
       }>('/api/mediaserver/test', {
         method: 'POST',
         body: JSON.stringify({
@@ -660,14 +743,30 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
           token: form.mediaServer.token,
           pathMaps: pathMapsFromText(form.mediaServer.pathMapsText, 'Media server'),
           watchedWithinDays: numeric(form.mediaServer.watchedWithinDays, 'Recently-watched window'),
+          libraryRoots: trimmedList([...form.radarr.mediaRoots, ...form.sonarr.mediaRoots]),
         }),
       });
+      const serverLabel = mediaServerLabels[result.kind as MediaServerForm['kind']] ?? result.kind;
+      const suggested = result.suggestedPathMaps ?? [];
+      if (suggested.length) {
+        setForm((current) => current ? {
+          ...current,
+          mediaServer: { ...current.mediaServer, pathMapsText: withMappings(current.mediaServer.pathMapsText, suggested) },
+        } : current);
+      }
       const unmapped = result.unmappedCount
         ? ` · ${result.unmappedCount} path${result.unmappedCount === 1 ? '' : 's'} need mapping`
         : '';
+      const added = suggested.length
+        ? ` Path mapping${suggested.length === 1 ? '' : 's'} filled in: ${suggested.map(({ from, to }) => `${from} → ${to}`).join(', ')}.`
+        : '';
       setTestMessages((current) => ({
         ...current,
-        mediaServer: `Connected to ${mediaServerLabels[result.kind as MediaServerForm['kind']] ?? result.kind}. ${result.protectedCount} file${result.protectedCount === 1 ? '' : 's'} protected from the last ${result.watchedWithinDays} day(s), ${result.inProgressCount} playing now${unmapped}.`,
+        mediaServer: `Connected to ${serverLabel}. ${result.protectedCount} file${result.protectedCount === 1 ? '' : 's'} protected from the last ${result.watchedWithinDays} day(s), ${result.inProgressCount} playing now${unmapped}.${added}`,
+      }));
+      setTestNotes((current) => ({
+        ...current,
+        mediaServer: (result.unresolvedLocations ?? []).map((location) => `${serverLabel} reads a library from ${location}, which Keelhaularr cannot find. If this LXC does not have that storage mounted, add it as a Proxmox mount point and rerun the installer; otherwise add a path mapping for it.`),
       }));
       onConnectionTested?.('mediaServer');
     } catch (testError) {
@@ -687,6 +786,16 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState<TestKind | null>(null);
   const [testMessages, setTestMessages] = useState<Record<TestKind, string>>({ radarr: '', sonarr: '', qbittorrent: '', mediaServer: '' });
+  const [testNotes, setTestNotes] = useState<Record<TestKind, string[]>>({ radarr: [], sonarr: [], qbittorrent: [], mediaServer: [] });
+  // What tests have filled in, so a later test may update its own values but never
+  // replaces something typed by hand.
+  const autoFilled = useRef({
+    qbittorrent: { value: '', source: null, reachable: false } as FilledValue,
+    qbittorrentUsername: '',
+    mediaServer: { value: '', source: null, reachable: false } as FilledValue,
+    trashDir: '',
+    downloads: { radarr: [] as string[], sonarr: [] as string[] },
+  });
   const [savedQbittorrentConfigured, setSavedQbittorrentConfigured] = useState(false);
   const [categoryDiscovery, setCategoryDiscovery] = useState<QBittorrentCategoryDiscovery>({
     categories: [], loading: false, loaded: false, error: '',
@@ -732,50 +841,134 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
 
   async function testConnection(app: AppKind) {
     if (!form) return;
+    const label = app === 'radarr' ? 'Radarr' : 'Sonarr';
     setTesting(app);
     setTestMessages((current) => ({ ...current, [app]: '' }));
+    setTestNotes((current) => ({ ...current, [app]: [] }));
     try {
       const result = await api<{
         connected: boolean;
         version: string | null;
         rootFolders: string[];
         rootFolderChecks?: RootFolderCheck[];
+        discovered?: ArrDiscovery;
       }>('/api/settings/test', {
         method: 'POST',
-        body: JSON.stringify({ app, url: form[app].url, apiKey: form[app].apiKey }),
+        body: JSON.stringify({ app, url: form[app].url, apiKey: form[app].apiKey, trashDir: form.orphan.trashDir }),
       });
       const checks = result.rootFolderChecks ?? result.rootFolders.map((reported) => ({ reported, usable: true, localPath: null, problem: null }));
       const localRoots = checks.map((check) => (check.usable ? check.reported : check.localPath ?? check.reported));
       const mappings = checks
         .filter((check) => !check.usable && check.localPath)
-        .map((check) => `${check.reported}=>${check.localPath}`);
+        .map((check) => ({ from: check.reported, to: check.localPath as string }));
       // Roots are filled only when the list is empty or still exactly what an earlier
       // test filled in, so a folder someone typed by hand is never replaced.
       const replaceable = (roots: string[]) => {
-        const entered = roots.map((root) => root.trim()).filter(Boolean);
-        return !entered.length || (entered.length === result.rootFolders.length
-          && entered.every((root, index) => root === result.rootFolders[index]));
+        const entered = trimmedList(roots);
+        return !entered.length || sameList(entered, result.rootFolders);
       };
       const autoFilledRoots = Boolean(checks.length && replaceable(form[app].mediaRoots));
       const unusable = checks.filter((check) => !check.usable);
       const located = unusable.filter((check) => check.localPath);
       const unresolved = unusable.filter((check) => !check.localPath);
-      const roots = checks.length
-        ? ` · ${result.rootFolders.join(', ')}${autoFilledRoots ? ' · added to media roots' : ''}`
-        : ' · no media roots reported';
-      const locatedText = located.length
-        ? ` · Keelhaularr sees ${located.map((check) => `${check.reported} at ${check.localPath}`).join(', ')}${autoFilledRoots ? '; path mapping added' : ''}`
-        : '';
-      const unresolvedText = unresolved.length ? ` · ${unresolved.map((check) => check.problem).join(' ')}` : '';
-      if (autoFilledRoots) {
-        setForm((current) => {
-          if (!current || !replaceable(current[app].mediaRoots)) return current;
-          const existingMaps = current[app].pathMapsText.split('\n').map((line) => line.trim()).filter(Boolean);
-          const pathMapsText = [...existingMaps, ...mappings.filter((mapping) => !existingMaps.includes(mapping))].join('\n');
-          return { ...current, [app]: { ...current[app], mediaRoots: localRoots, pathMapsText } };
-        });
+
+      const qbittorrent = result.discovered?.qbittorrent ?? null;
+      const mediaServer = result.discovered?.mediaServer ?? null;
+      const quarantine = result.discovered?.quarantine ?? null;
+      const before = {
+        qbittorrent: { ...autoFilled.current.qbittorrent },
+        qbittorrentUsername: autoFilled.current.qbittorrentUsername,
+        mediaServer: { ...autoFilled.current.mediaServer },
+        trashDir: autoFilled.current.trashDir,
+      };
+      const fillQbittorrent = Boolean(qbittorrent?.url && mayFill(form.qbittorrent.url, before.qbittorrent, app, qbittorrent.reachable));
+      const usernameFillable = (username: string) => !username.trim() || username.trim() === before.qbittorrentUsername;
+      const fillUsername = Boolean(fillQbittorrent && qbittorrent?.username && usernameFillable(form.qbittorrent.username));
+      const fillMediaServer = Boolean(mediaServer?.url && mayFill(form.mediaServer.url, before.mediaServer, app, mediaServer.reachable));
+      const quarantineFillable = (trashDir: string) => [INSTALLER_QUARANTINE_DIR, before.trashDir].filter(Boolean).includes(trashDir.trim());
+      const fillQuarantine = Boolean(quarantine && quarantineFillable(form.orphan.trashDir));
+
+      setForm((current) => {
+        if (!current) return current;
+        let next = current;
+        if (autoFilledRoots && replaceable(current[app].mediaRoots)) {
+          next = { ...next, [app]: { ...next[app], mediaRoots: localRoots, pathMapsText: withMappings(next[app].pathMapsText, mappings) } };
+        }
+        if (qbittorrent && fillQbittorrent && mayFill(next.qbittorrent.url, before.qbittorrent, app, qbittorrent.reachable)) {
+          next = {
+            ...next,
+            qbittorrent: {
+              ...next.qbittorrent,
+              url: qbittorrent.url,
+              username: fillUsername && usernameFillable(next.qbittorrent.username) ? qbittorrent.username : next.qbittorrent.username,
+            },
+          };
+        }
+        if (mediaServer && fillMediaServer && mayFill(next.mediaServer.url, before.mediaServer, app, mediaServer.reachable)) {
+          next = { ...next, mediaServer: { ...next.mediaServer, kind: mediaServer.kind, url: mediaServer.url } };
+        }
+        if (quarantine && fillQuarantine && quarantineFillable(next.orphan.trashDir)) {
+          next = { ...next, orphan: { ...next.orphan, trashDir: quarantine.suggested } };
+        }
+        return next;
+      });
+      if (qbittorrent && fillQbittorrent) {
+        autoFilled.current.qbittorrent = { value: qbittorrent.url, source: app, reachable: qbittorrent.reachable };
       }
-      setTestMessages((current) => ({ ...current, [app]: `Connected${result.version ? ` · v${result.version}` : ''}${roots}${locatedText}${unresolvedText}` }));
+      if (qbittorrent && fillUsername) autoFilled.current.qbittorrentUsername = qbittorrent.username;
+      if (mediaServer && fillMediaServer) {
+        autoFilled.current.mediaServer = { value: mediaServer.url, source: app, reachable: mediaServer.reachable };
+      }
+      if (quarantine && fillQuarantine) autoFilled.current.trashDir = quarantine.suggested;
+
+      const parts = [`Connected${result.version ? ` · v${result.version}` : ''}`];
+      parts.push(checks.length
+        ? `${result.rootFolders.join(', ')}${autoFilledRoots ? ' · added to media roots' : ''}`
+        : 'no media roots reported');
+      if (located.length) {
+        parts.push(`Keelhaularr sees ${located.map((check) => `${check.reported} at ${check.localPath}`).join(', ')}${autoFilledRoots ? '; path mapping added' : ''}`);
+      }
+      const notes = unresolved.map((check) => check.problem).filter((problem): problem is string => Boolean(problem));
+      const unanswered = ' (not answering from Keelhaularr yet)';
+      // "Filled in" only when the field actually changes; a second application using
+      // the same qBittorrent or Plex just confirms it.
+      const enteredQbittorrent = form.qbittorrent.url.trim();
+      const qbittorrentChanged = Boolean(qbittorrent && fillQbittorrent && enteredQbittorrent !== qbittorrent.url);
+      if (qbittorrent) {
+        parts.push(qbittorrentChanged
+          ? `qBittorrent ${qbittorrent.url} filled in${qbittorrent.reachable ? '' : unanswered}`
+          : `${label} downloads with qBittorrent at ${qbittorrent.url}`);
+        if (!fillQbittorrent && enteredQbittorrent && enteredQbittorrent !== qbittorrent.url) {
+          notes.push(`${label} uses qBittorrent at ${qbittorrent.url}, but ${enteredQbittorrent} is filled in below. Keelhaularr checks one qBittorrent, so keep the one that holds both applications' downloads.`);
+        }
+      }
+      const enteredMediaServer = form.mediaServer.url.trim();
+      const mediaServerChanged = Boolean(mediaServer && fillMediaServer && enteredMediaServer !== mediaServer.url);
+      if (mediaServer) {
+        const name = mediaServerLabels[mediaServer.kind];
+        parts.push(mediaServerChanged
+          ? `${name} ${mediaServer.url} filled in${mediaServer.reachable ? '' : unanswered}`
+          : `${label} notifies ${name} at ${mediaServer.url}`);
+        if (!fillMediaServer && enteredMediaServer && enteredMediaServer !== mediaServer.url) {
+          notes.push(`${label} notifies ${name} at ${mediaServer.url}, but ${enteredMediaServer} is filled in below. The watch guard checks one media server.`);
+        }
+      }
+      if (qbittorrentChanged) {
+        notes.push(form.qbittorrent.passwordConfigured
+          ? 'Next, test qBittorrent below: that fills in the completed-download folders.'
+          : 'Next, enter the qBittorrent password below and test qBittorrent: that fills in the completed-download folders.');
+      }
+      if (mediaServer && mediaServerChanged) {
+        const credential = mediaServer.kind === 'plex' ? 'X-Plex-Token' : `${mediaServerLabels[mediaServer.kind]} API key`;
+        notes.push(`Then enter the ${credential} below and test ${mediaServerLabels[mediaServer.kind]}: that fills in its path mapping.`);
+      }
+      if (quarantine) {
+        notes.push(fillQuarantine
+          ? `Quarantine folder changed from ${quarantine.current} to ${quarantine.suggested}, on the same drive as the library, so quarantining moves a file instead of copying it onto another disk. It is under Cleanup rules if you want it elsewhere.`
+          : `The quarantine folder ${quarantine.current} is on a different drive from the library, so quarantining copies each file across. ${quarantine.suggested} would be on the same drive (Cleanup rules → Quarantine directory).`);
+      }
+      setTestMessages((current) => ({ ...current, [app]: parts.join(' · ') }));
+      setTestNotes((current) => ({ ...current, [app]: notes }));
       onConnectionTested?.(app);
     } catch (error) {
       setTestMessages((current) => ({ ...current, [app]: error instanceof Error ? error.message : String(error) }));
@@ -788,7 +981,9 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
     if (!form) return;
     setTesting('qbittorrent');
     setTestMessages((current) => ({ ...current, qbittorrent: '' }));
+    setTestNotes((current) => ({ ...current, qbittorrent: [] }));
     try {
+      const apps: AppKind[] = ['radarr', 'sonarr'];
       const result = await api<{
         connected: boolean;
         version: string | null;
@@ -797,6 +992,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
         unmappedIncompleteCount: number;
         outsideDownloadRootCount: number;
         categories: QBittorrentCategory[];
+        discovered?: DownloadDiscovery;
       }>('/api/settings/test', {
         method: 'POST',
         body: JSON.stringify({
@@ -805,10 +1001,50 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
           username: form.qbittorrent.username,
           password: form.qbittorrent.password,
           pathMaps: pathMapsFromText(form.qbittorrent.pathMapsText, 'qBittorrent'),
-          downloadRoots: [...form.radarr.downloadRoots, ...form.sonarr.downloadRoots]
-            .map((root) => root.trim()).filter(Boolean),
+          downloadRoots: trimmedList([...form.radarr.downloadRoots, ...form.sonarr.downloadRoots]),
+          // Radarr and Sonarr are asked which qBittorrent categories are theirs, so
+          // their completed-download folders can be found and filled in.
+          arr: Object.fromEntries(apps.map((app) => [app, {
+            url: form[app].url,
+            apiKey: form[app].apiKey,
+            mediaRoots: trimmedList(form[app].mediaRoots),
+            downloadRoots: trimmedList(form[app].downloadRoots),
+            pathMaps: pathMapHints(form[app].pathMapsText, app),
+          }])),
         }),
       });
+      const discovered = result.discovered;
+      const before = { radarr: [...autoFilled.current.downloads.radarr], sonarr: [...autoFilled.current.downloads.sonarr] };
+      const folderReplaceable = (app: AppKind, roots: string[]) => {
+        const entered = trimmedList(roots);
+        return !entered.length || sameList(entered, before[app]);
+      };
+      const filled = apps.filter((app) => (discovered?.downloadFolders[app]?.localPaths.length ?? 0) > 0
+        && folderReplaceable(app, form[app].downloadRoots));
+      setForm((current) => {
+        if (!current) return current;
+        let next: SettingsForm = {
+          ...current,
+          qbittorrent: {
+            ...current.qbittorrent,
+            pathMapsText: withMappings(current.qbittorrent.pathMapsText, discovered?.qbittorrentPathMaps ?? []),
+          },
+        };
+        for (const app of filled) {
+          if (!folderReplaceable(app, next[app].downloadRoots)) continue;
+          next = {
+            ...next,
+            [app]: {
+              ...next[app],
+              downloadRoots: discovered?.downloadFolders[app]?.localPaths ?? [],
+              pathMapsText: withMappings(next[app].pathMapsText, discovered?.arrPathMaps[app] ?? []),
+            },
+          };
+        }
+        return next;
+      });
+      for (const app of filled) autoFilled.current.downloads[app] = discovered?.downloadFolders[app]?.localPaths ?? [];
+
       const incomplete = `${result.incompleteTorrentCount} incomplete of ${result.totalTorrentCount} torrent${result.totalTorrentCount === 1 ? '' : 's'}`;
       const mapping = result.unmappedIncompleteCount
         ? ` · ${result.unmappedIncompleteCount} path${result.unmappedIncompleteCount === 1 ? '' : 's'} need mapping`
@@ -816,10 +1052,20 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
       const outside = result.outsideDownloadRootCount
         ? ` · ${result.outsideDownloadRootCount} path${result.outsideDownloadRootCount === 1 ? '' : 's'} outside monitored folders`
         : '';
+      const folders = filled.map((app) => ` · ${app === 'radarr' ? 'Radarr' : 'Sonarr'} downloads ${discovered?.downloadFolders[app]?.localPaths.join(', ')} filled in`).join('');
+      const addedMaps = (discovered?.qbittorrentPathMaps.length ?? 0) > 0 ? ' · path mapping added' : '';
       setCategoryDiscovery({ categories: result.categories, loading: false, loaded: true, error: '' });
       setTestMessages((current) => ({
         ...current,
-        qbittorrent: `Connected${result.version ? ` · v${result.version}` : ''} · ${incomplete}${mapping}${outside}`,
+        // qBittorrent reports its version as "v4.6.7" already.
+        qbittorrent: `Connected${result.version ? ` · v${result.version.replace(/^v/i, '')}` : ''} · ${incomplete}${mapping}${outside}${folders}${addedMaps}`,
+      }));
+      setTestNotes((current) => ({
+        ...current,
+        qbittorrent: [
+          ...apps.flatMap((app) => discovered?.downloadFolders[app]?.problems ?? []),
+          ...(discovered?.notes ?? []),
+        ],
       }));
       onConnectionTested?.('qbittorrent');
     } catch (error) {
@@ -964,10 +1210,10 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
               {(saveError || saved) && <div className={`notice ${saveError ? 'error' : 'success'}`} role="status">{saveError || saved}</div>}
               <section className="settings-pane" aria-labelledby={`settings-nav-${section}`}>
                 {section === 'connections' && <>
-                  <ArrConnectionSection app="radarr" form={form.radarr} testing={testing === 'radarr'} testMessage={testMessages.radarr} onChange={(next) => updateConnection('radarr', next)} onTest={() => testConnection('radarr')} />
-                  <ArrConnectionSection app="sonarr" form={form.sonarr} testing={testing === 'sonarr'} testMessage={testMessages.sonarr} onChange={(next) => updateConnection('sonarr', next)} onTest={() => testConnection('sonarr')} />
-                  <MediaServerSection form={form.mediaServer} testing={testing === 'mediaServer'} testMessage={testMessages.mediaServer} onChange={updateMediaServer} onTest={testMediaServer} />
-                  <QBittorrentConnectionSection form={form.qbittorrent} testing={testing === 'qbittorrent'} testMessage={testMessages.qbittorrent} onChange={updateQbittorrent} onTest={testQbittorrent} />
+                  <ArrConnectionSection app="radarr" form={form.radarr} testing={testing === 'radarr'} testMessage={testMessages.radarr} notes={testNotes.radarr} onChange={(next) => updateConnection('radarr', next)} onTest={() => testConnection('radarr')} />
+                  <ArrConnectionSection app="sonarr" form={form.sonarr} testing={testing === 'sonarr'} testMessage={testMessages.sonarr} notes={testNotes.sonarr} onChange={(next) => updateConnection('sonarr', next)} onTest={() => testConnection('sonarr')} />
+                  <MediaServerSection form={form.mediaServer} testing={testing === 'mediaServer'} testMessage={testMessages.mediaServer} notes={testNotes.mediaServer} onChange={updateMediaServer} onTest={testMediaServer} />
+                  <QBittorrentConnectionSection form={form.qbittorrent} testing={testing === 'qbittorrent'} testMessage={testMessages.qbittorrent} notes={testNotes.qbittorrent} onChange={updateQbittorrent} onTest={testQbittorrent} />
                 </>}
 
                 {section === 'cleanup' && <>

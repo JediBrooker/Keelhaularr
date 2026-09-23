@@ -86,10 +86,13 @@ async function request(url, headers) {
       headers: { Accept: 'application/json', ...headers },
     });
   } catch (error) {
-    throw apiError(describeFetchFailure(error, url));
+    throw Object.assign(apiError(describeFetchFailure(error, url)), { connectionFailure: true });
   }
   if (response.status === 401 || response.status === 403) {
-    throw apiError(`The media server rejected the token (HTTP ${response.status}). Check the X-Plex-Token or API key, and that it belongs to the server owner or an administrator.`);
+    throw Object.assign(
+      apiError(`The media server rejected the token (HTTP ${response.status}). Check the X-Plex-Token or API key, and that it belongs to the server owner or an administrator.`),
+      { connectionFailure: true },
+    );
   }
   if (!response.ok) throw apiError(`The media server returned HTTP ${response.status}.`);
   const text = await response.text();
@@ -221,6 +224,85 @@ async function collectPlex(connection, cutoffMs) {
     }
   }
   return { paths, inProgress };
+}
+
+// ---------------------------------------------------------------- library folders
+
+const SAMPLE_ITEMS = 8;
+
+function locationPaths(values) {
+  return (Array.isArray(values) ? values : [])
+    .map((value) => (typeof value === 'string' ? value : value?.path))
+    .filter((value) => typeof value === 'string' && value && value.length <= 4096);
+}
+
+async function plexLibraries(connection) {
+  const base = connection.url.replace(/\/+$/, '');
+  const headers = plexHeaders(connection);
+  const sections = await request(`${base}/library/sections`, headers);
+  const libraries = [];
+  for (const directory of (sections?.MediaContainer?.Directory ?? []).slice(0, MAX_SECTIONS)) {
+    const type = directory?.type;
+    const key = safeText(directory?.key, 32);
+    const locations = locationPaths(directory?.Location);
+    if ((type !== 'movie' && type !== 'show') || !key || !locations.length) continue;
+    let files = [];
+    try {
+      const query = new URLSearchParams({
+        type: type === 'movie' ? '1' : '4',
+        'X-Plex-Container-Start': '0',
+        'X-Plex-Container-Size': String(SAMPLE_ITEMS),
+      });
+      const page = await request(`${base}/library/sections/${encodeURIComponent(key)}/all?${query}`, headers);
+      files = (page?.MediaContainer?.Metadata ?? []).flatMap(plexPartFiles);
+    } catch {
+      // Items are only evidence for finding the folder; a library without them can
+      // still be matched on its name.
+    }
+    libraries.push({ title: safeText(directory?.title), locations, files });
+  }
+  return libraries;
+}
+
+async function jellyfinLibraries(connection) {
+  const base = connection.url.replace(/\/+$/, '');
+  const headers = jellyfinHeaders(connection);
+  const folders = await request(`${base}/Library/VirtualFolders`, headers);
+  const libraries = [];
+  for (const folder of (Array.isArray(folders) ? folders : []).slice(0, MAX_SECTIONS)) {
+    // Mixed libraries report no collection type and may hold films or episodes.
+    const type = folder?.CollectionType;
+    if (type && type !== 'movies' && type !== 'tvshows') continue;
+    const locations = locationPaths(folder?.Locations);
+    if (!locations.length) continue;
+    let files = [];
+    const parentId = safeText(folder?.ItemId, 64);
+    if (parentId) {
+      try {
+        const query = new URLSearchParams({
+          ParentId: parentId,
+          Recursive: 'true',
+          IncludeItemTypes: 'Movie,Episode',
+          Fields: 'Path',
+          Limit: String(SAMPLE_ITEMS),
+        });
+        const page = await request(`${base}/Items?${query}`, headers);
+        files = (Array.isArray(page?.Items) ? page.Items : []).map((item) => item?.Path).filter(Boolean);
+      } catch {
+        // As for Plex: evidence only.
+      }
+    }
+    libraries.push({ title: safeText(folder?.Name), locations, files });
+  }
+  return libraries;
+}
+
+/**
+ * The folders each movie and TV library reads from, as the media server sees them,
+ * with a few of the files inside as evidence of where those folders are here.
+ */
+export async function discoverMediaServerLibraries(connection) {
+  return connection.kind === 'plex' ? plexLibraries(connection) : jellyfinLibraries(connection);
 }
 
 // ---------------------------------------------------------------- public surface

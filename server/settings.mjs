@@ -158,7 +158,7 @@ function mediaRoots(value, label, folderLabel) {
   return roots;
 }
 
-function pathMappings(value, label) {
+export function pathMappings(value, label) {
   if (!Array.isArray(value) || value.length > 50) inputError(`${label} must contain at most 50 mappings.`);
   return value.map((entry, index) => {
     const item = requiredObject(entry, `${label} mapping ${index + 1}`);

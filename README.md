@@ -42,6 +42,7 @@ Both destructive automations are opt-in and disabled by default.
 - API keys kept server-side
 - Authenticated GUI settings with immediate apply and durable, atomic storage
 - Server-side folder autocomplete for library, completed-download, and quarantine paths
+- Setup that fills itself in from Radarr, Sonarr, qBittorrent and the media server, including path mappings
 - Durable background jobs, restart recovery, cancellation, retries, and item history
 - Replacement search/download status tracking
 - Per-tag, per-folder and per-quality size rules with their own limits
@@ -78,8 +79,18 @@ verifies its health endpoint.
 Sign in at the printed URL and the **First voyage setup** screen opens
 automatically. Radarr/Sonarr URLs, API keys, qBittorrent credentials,
 independent size limits, media and download roots, path mappings, quarantine,
-and all scanner controls are entered there. Testing an *arr connection copies its API-reported media roots
-into the empty path fields. A mistake in the GUI can simply be corrected and
+and all scanner controls are entered there, and most of it fills itself in:
+
+1. Enter the Radarr and Sonarr URLs and API keys and test each. Keelhaularr
+   finds their library folders inside the LXC, adding a path mapping when
+   Radarr calls a folder something else, and fills in the qBittorrent and
+   Plex/Jellyfin/Emby addresses they already use.
+2. Type the qBittorrent Web UI password and test qBittorrent. That fills in each
+   application's completed-download folder and the path mappings to reach it.
+3. Type the media server's token and test it. That fills in its path mapping.
+
+Passwords, API keys and tokens are never read from another application and
+always have to be typed. A mistake in the GUI can simply be corrected and
 saved; the terminal installer does not need to be restarted.
 
 The installer is safe to rerun for updates and preserves existing settings. If
@@ -217,12 +228,31 @@ API keys, the qBittorrent safety and recovery connection, unmonitored-media
 behavior, media roots, completed-download roots, hardlink minimum age, path
 mappings, quarantine, the require-a-replacement policy, ignored directories,
 scan limits, and media extensions. Connection tests are available before
-saving and automatically fill empty library-folder fields. The qBittorrent test
-also discovers exact category names for recovery exclusions; saved connections
-refresh that list whenever Settings opens. Missing categories already selected
-as exclusions remain visible until explicitly removed. Folders use individual
-add/remove rows; path mapping is kept in a collapsed advanced section because
-normal installer-based deployments use identical paths and do not need it.
+saving and fill in what they can find; a field is only filled when it is empty
+or still holds what an earlier test put there, so nothing typed by hand is
+replaced:
+
+- **Radarr/Sonarr** fill their library folders, finding each one inside the LXC
+  even under a different name (confirmed against the application's recent
+  imports), and the qBittorrent address and username and media-server address
+  from their own Download Clients and Connect settings. An address Radarr
+  reaches as `localhost` or by a Docker name is tried on Radarr's host instead.
+  When the quarantine folder is still the installer's `/config/quarantine` on
+  the LXC's system disk, it is moved beside the library, where quarantining is
+  a rename rather than a copy.
+- **qBittorrent** fills each application's completed-download folder from
+  where the torrents in its categories actually are. A folder that also holds
+  other categories' torrents is refused with the reason, because every file in
+  it without a library hardlink would be offered for removal.
+- **The media server** fills the path mapping for each library folder it reads,
+  confirmed against items in that library.
+
+The qBittorrent test also discovers exact category names for recovery
+exclusions; saved connections refresh that list whenever Settings opens.
+Missing categories already selected as exclusions remain visible until
+explicitly removed. Folders use individual add/remove rows; path mapping is
+kept in a collapsed section, which the tests fill in when an application and
+Keelhaularr see a folder under different paths.
 
 Library, completed-download, and quarantine fields discover folders as you
 type. Start with `/data/` (or another mounted path), click a suggestion to look

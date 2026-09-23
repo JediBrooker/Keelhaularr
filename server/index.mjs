@@ -32,8 +32,15 @@ import { auditImports } from './hardlink-audit.mjs';
 import { historySummary } from './history.mjs';
 import { identifyOrphansForCandidates, identifyScanCandidates } from './imports.mjs';
 import { createLoginThrottle } from './login-throttle.mjs';
-import { inspectMediaServer } from './mediaserver.mjs';
-import { locateReportedPath, rootAccessProblem } from './root-access.mjs';
+import { discoverMediaServerLibraries, inspectMediaServer } from './mediaserver.mjs';
+import { locateReportedPath, quarantineSuggestion, relativeSamples, rootAccessProblem } from './root-access.mjs';
+import {
+  discoverArrSettings,
+  discoverDownloadFolders,
+  readArrDownloadClient,
+  suggestMediaServerPathMaps,
+  urlHost,
+} from './discovery.mjs';
 import { previewOrphans, previewOversized, summarizePreview } from './preview.mjs';
 import { scanOrphans } from './orphans.mjs';
 import { verifyPassword } from './passwords.mjs';
@@ -44,13 +51,14 @@ import {
   startQbittorrentRecovery,
   stopQbittorrentRecovery,
 } from './qbittorrent-recovery.mjs';
-import { inspectQbittorrent, listQbittorrentCategories } from './qbittorrent.mjs';
+import { categoryList, inspectQbittorrent, listQbittorrentCategories, readQbittorrentLayout } from './qbittorrent.mjs';
 import { runScheduledScan, scheduleStatus, startScheduler, stopScheduler } from './scheduler.mjs';
 import {
   buildSettingsOverrides,
   buildMediaServerTestConnection,
   buildQbittorrentTestConnection,
   getSettingsOverrides,
+  pathMappings,
   migrateStoredPassword,
   saveSettingsOverrides,
   settingsView,
@@ -413,8 +421,30 @@ app.get('/api/mediaserver/status', async (request, response, next) => {
 
 app.post('/api/mediaserver/test', async (request, response, next) => {
   try {
-    const connection = buildMediaServerTestConnection(request.body, currentConfig().mediaServer);
-    const snapshot = await inspectMediaServer(connection);
+    const config = currentConfig();
+    const connection = buildMediaServerTestConnection(request.body, config.mediaServer);
+    const libraryRoots = pathHints(request.body?.libraryRoots)
+      ?? [...config.radarr.mediaRoots, ...config.sonarr.mediaRoots];
+    let suggestions = [];
+    let unresolved = [];
+    try {
+      const libraries = await discoverMediaServerLibraries(connection);
+      ({ suggestions, unresolved } = suggestMediaServerPathMaps(libraries, {
+        pathMaps: connection.pathMaps,
+        storageRoots: config.storageRoots,
+        libraryRoots,
+      }));
+    } catch (error) {
+      // An unreachable server or a rejected token would fail the check below in the
+      // same way, so it is reported once; anything else only means nothing to suggest.
+      if (error?.connectionFailure) throw error;
+    }
+    // Counted with the suggested mappings in place, because those are what the form
+    // will hold once they are filled in.
+    const snapshot = await inspectMediaServer({
+      ...connection,
+      pathMaps: longestFirst([...connection.pathMaps, ...suggestions]),
+    });
     response.json({
       status: snapshot.status,
       kind: connection.kind,
@@ -423,6 +453,10 @@ app.post('/api/mediaserver/test', async (request, response, next) => {
       unmappedCount: snapshot.unmappedCount,
       inProgressCount: snapshot.inProgressCount,
       samples: snapshot.samples,
+      suggestedPathMaps: suggestions,
+      unresolvedLocations: unresolved
+        .map((location) => safeConnectionText(location, 4096, [connection.token]))
+        .filter(Boolean),
     });
   } catch (error) {
     next(error);
@@ -432,6 +466,89 @@ app.post('/api/mediaserver/test', async (request, response, next) => {
 app.get('/api/qbittorrent/recovery/status', (request, response) => {
   response.json(qbittorrentRecoveryStatus(currentConfig()));
 });
+
+function longestFirst(mappings) {
+  return [...mappings].sort((first, second) => String(second.from).length - String(first.from).length);
+}
+
+// Folders sent along with a test only as hints for what to look for. A half-typed or
+// relative entry in some other field is skipped rather than failing this test: the
+// save checks every field properly, and a test that cannot run until everything else
+// on the page is right is not much of a test.
+function pathHints(value) {
+  if (!Array.isArray(value)) return null;
+  return value.slice(0, 100)
+    .filter((entry) => typeof entry === 'string' && entry.length <= 4096
+      && !/[\u0000-\u001f\u007f]/.test(entry) && path.isAbsolute(entry.trim()))
+    .map((entry) => path.resolve(entry.trim()));
+}
+
+function pathMapHints(value, label) {
+  try {
+    return pathMappings(value, label);
+  } catch {
+    return null;
+  }
+}
+
+function httpUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return ['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The qBittorrent categories and remote path mappings Radarr and Sonarr use, read from
+ * the applications themselves using what is in the form. A saved API key is only sent
+ * to the URL it was saved for. Failures become notes, never a failed qBittorrent test,
+ * and name only the status code so this cannot be used to read other services' pages.
+ */
+async function arrDownloadSettings(input, config) {
+  const apps = {};
+  const notes = [];
+  const secrets = [];
+  const libraryRoots = [];
+  for (const kind of ['radarr', 'sonarr']) {
+    const label = kind === 'radarr' ? 'Radarr' : 'Sonarr';
+    const entry = input && typeof input === 'object' && !Array.isArray(input) ? input[kind] : undefined;
+    const saved = config[kind];
+    const url = typeof entry?.url === 'string' ? entry.url.trim().replace(/\/+$/, '') : saved?.url ?? '';
+    libraryRoots.push(...(pathHints(entry?.mediaRoots) ?? saved?.mediaRoots ?? []));
+    const downloadRoots = pathHints(entry?.downloadRoots) ?? saved?.downloadRoots ?? [];
+    const pathMaps = pathMapHints(entry?.pathMaps, `${label} path maps`) ?? saved?.pathMaps ?? [];
+    if (!url) continue;
+    if (!httpUrl(url)) {
+      notes.push(`${label}'s URL is not a valid http(s) address, so its download settings were not read.`);
+      continue;
+    }
+    const enteredKey = typeof entry?.apiKey === 'string' ? entry.apiKey.trim() : '';
+    const apiKey = enteredKey || (saved?.apiKey && url === saved.url ? saved.apiKey : '');
+    if (!apiKey) {
+      notes.push(`Enter ${label}'s API key to find its completed-download folder.`);
+      continue;
+    }
+    secrets.push(apiKey);
+    try {
+      const { client, remotePathMappings } = await readArrDownloadClient({ kind, url, apiKey }, kind);
+      if (!client) {
+        notes.push(`${label} has no enabled qBittorrent download client, so it has no qBittorrent folder to fill in.`);
+        continue;
+      }
+      const categories = [client.category, client.importedCategory].filter(Boolean);
+      if (!categories.length) {
+        notes.push(`${label}'s qBittorrent download client has no category, so its downloads cannot be told apart from anything else in qBittorrent. Set one in ${label} → Settings → Download Clients.`);
+        continue;
+      }
+      apps[kind] = { categories, remotePathMappings, pathMaps, downloadRoots };
+    } catch (error) {
+      notes.push(`${label}'s download client settings could not be read (${error?.statusCode ? `HTTP ${error.statusCode}` : 'no answer'}).`);
+    }
+  }
+  return { apps, notes, secrets, libraryRoots };
+}
 
 app.post('/api/settings/test', async (request, response, next) => {
   try {
@@ -455,15 +572,35 @@ app.post('/api/settings/test', async (request, response, next) => {
         throw error;
       }
       const downloadRoots = suppliedRoots.map((root) => path.resolve(root.trim()));
-      const [snapshot, categories] = await Promise.all([
-        inspectQbittorrent(connection),
-        listQbittorrentCategories(connection),
-      ]);
-      const outsideDownloadRootCount = downloadRoots.length
+      const layout = await readQbittorrentLayout(connection);
+      const arr = await arrDownloadSettings(request.body?.arr, config);
+      const discovery = discoverDownloadFolders(layout, arr.apps, {
+        qbittorrentPathMaps: connection.pathMaps,
+        storageRoots: config.storageRoots,
+        libraryRoots: arr.libraryRoots,
+      });
+      // Checked with the discovered folders and mappings in place, because those are
+      // what the form will hold once they are filled in: an application whose folders
+      // were typed in keeps them, and one left empty gets what was found.
+      const snapshot = await inspectQbittorrent({
+        ...connection,
+        pathMaps: longestFirst([...connection.pathMaps, ...discovery.qbittorrentPathMaps]),
+      });
+      const effectiveRoots = [
+        ...downloadRoots,
+        ...Object.entries(discovery.folders).flatMap(([app, found]) => (
+          arr.apps[app]?.downloadRoots.length ? arr.apps[app].downloadRoots : found.localPaths
+        )),
+      ];
+      const outsideDownloadRootCount = effectiveRoots.length
         ? snapshot.incompletePaths.filter((candidatePath) => (
-          !downloadRoots.some((root) => pathsOverlap(root, candidatePath))
+          !effectiveRoots.some((root) => pathsOverlap(root, candidatePath))
         )).length
         : 0;
+      // Notes hold paths and category names. The API keys used to read them are
+      // redacted anyway; the qBittorrent password is not, because a short one would
+      // blank out ordinary words in every path it happens to appear in.
+      const safe = (value) => safeConnectionText(value, 1000, arr.secrets);
       response.json({
         connected: true,
         version: snapshot.version,
@@ -471,7 +608,16 @@ app.post('/api/settings/test', async (request, response, next) => {
         incompleteTorrentCount: snapshot.incompleteTorrentCount,
         unmappedIncompleteCount: snapshot.unmappedIncompleteCount,
         outsideDownloadRootCount,
-        categories,
+        categories: categoryList(layout.categories),
+        discovered: {
+          downloadFolders: Object.fromEntries(Object.entries(discovery.folders).map(([app, found]) => [app, {
+            localPaths: found.localPaths,
+            problems: found.problems.map(safe).filter(Boolean),
+          }])),
+          qbittorrentPathMaps: discovery.qbittorrentPathMaps,
+          arrPathMaps: discovery.arrPathMaps,
+          notes: arr.notes.map(safe).filter(Boolean),
+        },
       });
       return;
     }
@@ -517,20 +663,47 @@ app.post('/api/settings/test', async (request, response, next) => {
     const rootFolders = Array.isArray(roots)
       ? roots.map((root) => root?.path).filter((root) => typeof root === 'string' && root)
       : [];
+    // Everything else the application knows that the form asks for. Best effort: the
+    // connection itself has already passed, and that is what this test reports.
+    const discovery = await discoverArrSettings({ kind, url: rawUrl, apiKey }, { kind, arrHost: urlHost(rawUrl) })
+      .catch(() => ({ qbittorrent: null, mediaServer: null, remotePathMappings: [], importedPaths: [] }));
+    const text = (value, maximumLength) => safeConnectionText(value, maximumLength, [apiKey]) ?? '';
+    // Radarr and Sonarr report paths from inside their own containers. Saying which of
+    // them Keelhaularr can actually open, and where it sees the others, turns a
+    // save-time "does not exist" into a filled-in folder and path mapping. Recent
+    // imports are the evidence that a folder found under another name is the same.
+    const rootFolderChecks = rootFolders.map((reported) => {
+      const problem = rootAccessProblem(reported, { label: 'Folder', storageRoots: config.storageRoots });
+      const localPath = problem && !existsSync(reported)
+        ? locateReportedPath(reported, config.storageRoots, {
+          samples: relativeSamples(reported, discovery.importedPaths),
+        })
+        : null;
+      return { reported, usable: !problem, localPath, problem };
+    });
+    const libraryRoot = rootFolderChecks.map((check) => (check.usable ? check.reported : check.localPath)).find(Boolean);
+    const trashDir = typeof request.body?.trashDir === 'string' ? request.body.trashDir.trim() : '';
+    const suggestedTrashDir = libraryRoot && path.isAbsolute(trashDir) ? quarantineSuggestion(libraryRoot, trashDir) : null;
     response.json({
       connected: true,
       version: safeConnectionText(status?.version, 64, [apiKey]),
       rootFolders,
-      // Radarr and Sonarr report paths from inside their own containers. Saying which
-      // of them Keelhaularr can actually open, and where it sees the others, turns a
-      // save-time "does not exist" into a filled-in folder and path mapping.
-      rootFolderChecks: rootFolders.map((reported) => {
-        const problem = rootAccessProblem(reported, { label: 'Folder', storageRoots: config.storageRoots });
-        const localPath = problem && !existsSync(reported)
-          ? locateReportedPath(reported, config.storageRoots)
-          : null;
-        return { reported, usable: !problem, localPath, problem };
-      }),
+      rootFolderChecks,
+      discovered: {
+        qbittorrent: discovery.qbittorrent ? {
+          url: text(discovery.qbittorrent.url, 2048),
+          reachable: discovery.qbittorrent.reachable === true,
+          username: text(discovery.qbittorrent.username, 256),
+          category: text(discovery.qbittorrent.category, 256),
+          clientName: text(discovery.qbittorrent.clientName, 128),
+        } : null,
+        mediaServer: discovery.mediaServer ? {
+          kind: discovery.mediaServer.kind,
+          url: text(discovery.mediaServer.url, 2048),
+          reachable: discovery.mediaServer.reachable === true,
+        } : null,
+        quarantine: suggestedTrashDir ? { current: trashDir, suggested: suggestedTrashDir } : null,
+      },
     });
   } catch (error) {
     next(error);
