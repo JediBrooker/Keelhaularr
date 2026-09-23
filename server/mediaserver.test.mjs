@@ -5,6 +5,8 @@ import test from 'node:test';
 
 import {
   assertNotRecentlyWatched,
+  describeFetchFailure,
+  discoverMediaServerLibraries,
   inspectMediaServer,
   mapMediaServerPath,
   watchedPathMatch,
@@ -93,6 +95,10 @@ test('Plex sessions and recently-viewed items are both collected', async (contex
       return json(response, { MediaContainer: { Directory: [{ key: '1' }] } });
     }
     if (url.pathname === '/library/sections/1/all') {
+      // Plex's greater-than operator is `>>=`; a single `>` is not a filter it knows.
+      const since = Number(url.searchParams.get('lastViewedAt>>'));
+      assert.ok(Math.abs(since - (Date.now() - 30 * DAY) / 1000) < 60, `lastViewedAt>> was ${since}`);
+      assert.equal(url.searchParams.get('sort'), 'lastViewedAt:desc');
       if (url.searchParams.get('type') !== '1') return json(response, { MediaContainer: {} });
       return json(response, {
         MediaContainer: {
@@ -186,4 +192,92 @@ test('the watch guard withholds a watched file and permits an unwatched one', as
     /played within the last 7 day\(s\)/,
   );
   await assertNotRecentlyWatched(config, { path: '/movies/Untouched/Untouched.mkv' });
+});
+
+test('media-server connection failures say what went wrong and what to change', async (context) => {
+  const failure = (code) => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(code), { code }) });
+
+  // localhost inside the container is Keelhaularr, the most common Plex mistake.
+  assert.match(describeFetchFailure(failure('ECONNREFUSED'), 'http://localhost:32400/status/sessions'), /host\.docker\.internal:32400/);
+  assert.match(describeFetchFailure(failure('ECONNREFUSED'), 'http://127.0.0.1:32400/'), /Keelhaularr itself/);
+  assert.match(describeFetchFailure(failure('ECONNREFUSED'), 'http://192.168.1.20:32400/'), /refused the connection/);
+  assert.match(describeFetchFailure(failure('ENOTFOUND'), 'http://plex:32400/'), /could not be resolved/);
+  assert.match(describeFetchFailure(failure('DEPTH_ZERO_SELF_SIGNED_CERT'), 'https://192.168.1.20:32400/'), /plex\.direct/);
+  assert.match(describeFetchFailure(Object.assign(new Error('timed out'), { name: 'TimeoutError' }), 'http://10.0.0.5:32400/'), /did not answer/);
+
+  // A rejected token is named as such rather than as a bare status code.
+  const rejecting = await stubServer((request, response) => response.writeHead(401).end());
+  context.after(() => rejecting.close());
+  await assert.rejects(
+    inspectMediaServer({ configured: true, kind: 'plex', url: rejecting.url, token: 'bad', watchedWithinDays: 30, pathMaps: [] }),
+    /rejected the token \(HTTP 401\)/,
+  );
+});
+
+test('Plex and Jellyfin report their movie and TV folders with a few items from each', async (context) => {
+  const plex = await stubServer((request, response) => {
+    const url = new URL(request.url, 'http://stub');
+    assert.equal(request.headers['x-plex-token'], 'plex-token');
+    if (url.pathname === '/library/sections') {
+      return json(response, { MediaContainer: { Directory: [
+        { key: '1', type: 'movie', title: 'Films', Location: [{ id: 1, path: '/media/movies' }] },
+        { key: '2', type: 'show', title: 'TV', Location: [{ id: 2, path: '/media/tv' }, { id: 3, path: '/media/tv2' }] },
+        { key: '3', type: 'artist', title: 'Music', Location: [{ id: 4, path: '/media/music' }] },
+      ] } });
+    }
+    if (url.pathname === '/library/sections/1/all') {
+      assert.equal(url.searchParams.get('type'), '1');
+      return json(response, { MediaContainer: { Metadata: [
+        { Media: [{ Part: [{ file: '/media/movies/Film (2020)/Film.mkv' }] }] },
+      ] } });
+    }
+    // A section whose items cannot be listed still reports its folders.
+    response.writeHead(500).end();
+  });
+  context.after(() => plex.close());
+  assert.deepEqual(await discoverMediaServerLibraries({ kind: 'plex', url: plex.url, token: 'plex-token' }), [
+    { title: 'Films', locations: ['/media/movies'], files: ['/media/movies/Film (2020)/Film.mkv'] },
+    { title: 'TV', locations: ['/media/tv', '/media/tv2'], files: [] },
+  ]);
+
+  const jellyfin = await stubServer((request, response) => {
+    const url = new URL(request.url, 'http://stub');
+    assert.equal(request.headers['x-emby-token'], 'jellyfin-key');
+    if (url.pathname === '/Library/VirtualFolders') {
+      return json(response, [
+        { Name: 'Movies', CollectionType: 'movies', ItemId: 'abc', Locations: ['/data/movies'] },
+        { Name: 'Books', CollectionType: 'books', ItemId: 'def', Locations: ['/data/books'] },
+        { Name: 'Mixed', ItemId: 'ghi', Locations: ['/data/mixed'] },
+      ]);
+    }
+    if (url.pathname === '/Items') {
+      if (url.searchParams.get('ParentId') !== 'abc') return json(response, { Items: [] });
+      return json(response, { Items: [{ Path: '/data/movies/Film (2020)/Film.mkv' }] });
+    }
+    response.writeHead(404).end();
+  });
+  context.after(() => jellyfin.close());
+  assert.deepEqual(await discoverMediaServerLibraries({ kind: 'jellyfin', url: jellyfin.url, token: 'jellyfin-key' }), [
+    { title: 'Movies', locations: ['/data/movies'], files: ['/data/movies/Film (2020)/Film.mkv'] },
+    { title: 'Mixed', locations: ['/data/mixed'], files: [] },
+  ]);
+});
+
+test('a media server that cannot be reached, or refuses the token, is marked as a connection failure', async (context) => {
+  const refusing = await stubServer((request, response) => response.writeHead(401).end());
+  context.after(() => refusing.close());
+  await assert.rejects(
+    discoverMediaServerLibraries({ kind: 'plex', url: refusing.url, token: 'bad' }),
+    (error) => error.connectionFailure === true && /rejected the token/.test(error.message),
+  );
+  await assert.rejects(
+    discoverMediaServerLibraries({ kind: 'jellyfin', url: 'http://127.0.0.1:1', token: 'x' }),
+    (error) => error.connectionFailure === true,
+  );
+  const missing = await stubServer((request, response) => response.writeHead(404).end());
+  context.after(() => missing.close());
+  await assert.rejects(
+    discoverMediaServerLibraries({ kind: 'jellyfin', url: missing.url, token: 'x' }),
+    (error) => !error.connectionFailure && /HTTP 404/.test(error.message),
+  );
 });

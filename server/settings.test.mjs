@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -231,5 +231,60 @@ test('metadata recovery timeout defaults, round trips, and rejects unsafe values
     input.qbittorrent.recovery.metadataMinutes = invalid;
     assert.throws(() => buildSettingsOverrides(input, {}), /metadata duration/);
     assert.throws(() => getConfig({ QBITTORRENT_RECOVERY_METADATA_MINUTES: String(invalid) }), /METADATA_MINUTES/);
+  }
+});
+
+test('media-server connection tests use the form and never replay a token to a new URL', async () => {
+  const { buildMediaServerTestConnection } = await import('./settings.mjs');
+  const saved = { url: 'http://192.168.1.20:32400', token: 'saved-token', pathMaps: [], watchedWithinDays: 30 };
+
+  const same = buildMediaServerTestConnection({ kind: 'plex', url: 'http://192.168.1.20:32400/', token: '' }, saved);
+  assert.equal(same.token, 'saved-token');
+  assert.equal(same.kind, 'plex');
+
+  const entered = buildMediaServerTestConnection({ kind: 'plex', url: 'http://10.0.0.5:32400', token: 'new-token', watchedWithinDays: 7 }, saved);
+  assert.equal(entered.token, 'new-token');
+  assert.equal(entered.watchedWithinDays, 7);
+
+  assert.throws(() => buildMediaServerTestConnection({ kind: 'plex', url: 'http://10.0.0.5:32400', token: '' }, saved), /token again/);
+  assert.throws(() => buildMediaServerTestConnection({ kind: 'plex', url: 'http://10.0.0.5:32400', token: '' }, {}), /X-Plex-Token/);
+  assert.throws(() => buildMediaServerTestConnection({ kind: 'plex', url: '', token: 'x' }, {}), /cannot be empty/);
+});
+
+test('a scan root that cannot be used says why, and where the files actually are', async (context) => {
+  const { locateReportedPath, rootAccessProblem } = await import('./root-access.mjs');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'kh-roots-'));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const lxcMovies = path.join(root, 'mnt', 'data', 'media', 'movies');
+  await mkdir(lxcMovies, { recursive: true });
+  const storage = path.join(root, 'mnt');
+
+  // Radarr's own path, seen by Keelhaularr under a different mount point.
+  assert.equal(locateReportedPath('/data/media/movies', [storage]), lxcMovies);
+  assert.match(
+    rootAccessProblem('/kh-test-missing/data/media/movies', { label: 'Radarr library folder', storageRoots: [storage] }),
+    new RegExp(`does not exist inside Keelhaularr, but ${lxcMovies} does.*path mapping /kh-test-missing/data/media/movies=>${lxcMovies}`),
+  );
+  // One shared folder name is not evidence of the same library.
+  await mkdir(path.join(storage, 'films'), { recursive: true });
+  assert.equal(locateReportedPath('/elsewhere/films', [storage]), null);
+  assert.match(rootAccessProblem('/kh-test-missing/films', { label: 'Radarr library folder', storageRoots: [storage] }), /does not exist inside Keelhaularr\. If this is the path/);
+
+  const file = path.join(root, 'file.mkv');
+  await writeFile(file, '');
+  assert.match(rootAccessProblem(file, { label: 'Radarr library folder' }), /is a file, not a folder/);
+  assert.equal(rootAccessProblem(lxcMovies, { label: 'Radarr library folder' }), null);
+
+  // Root bypasses permission bits, so read-only can only be exercised as a normal user.
+  if (process.getuid?.() !== 0) {
+    const readOnly = path.join(root, 'read-only');
+    await mkdir(readOnly);
+    await chmod(readOnly, 0o555);
+    try {
+      assert.match(rootAccessProblem(readOnly, { label: 'Radarr library folder' }), /is read-only inside Keelhaularr\..*UID \d+/);
+    } finally {
+      // Restored before the temporary directory is removed, not in a later hook.
+      await chmod(readOnly, 0o755);
+    }
   }
 });

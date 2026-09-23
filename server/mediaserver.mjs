@@ -39,12 +39,61 @@ export function mapMediaServerPath(input, pathMaps = []) {
   return path.isAbsolute(normalizedInput) ? path.resolve(normalizedInput) : null;
 }
 
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]', '0.0.0.0']);
+const TLS_CODES = new Set([
+  'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'ERR_TLS_CERT_ALTNAME_INVALID', 'CERT_HAS_EXPIRED',
+]);
+
+// "fetch failed" is all Node says on its own. The reason is in `cause`, and each one
+// has a different fix, so it is named rather than passed through.
+export function describeFetchFailure(error, url) {
+  let parsed = null;
+  try {
+    parsed = new URL(url);
+  } catch {
+    // Reported below without a host.
+  }
+  const host = parsed?.host ?? 'the media server';
+  if (parsed && LOOPBACK_HOSTS.has(parsed.hostname)) {
+    return `Could not connect to ${host}. Inside Keelhaularr's Docker container, ${parsed.hostname} is Keelhaularr itself, not the machine it runs on. Use the media server's LAN address instead (for example http://192.168.1.20:32400), or http://host.docker.internal:${parsed.port || (parsed.protocol === 'https:' ? '443' : '80')} when it runs on this same LXC.`;
+  }
+  if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+    return `${host} did not answer within ${REQUEST_TIMEOUT_MS / 1000} seconds. Check the address, and that a firewall or VLAN is not blocking this LXC from reaching it.`;
+  }
+  const code = error?.cause?.code ?? error?.code;
+  if (code === 'ECONNREFUSED') return `${host} refused the connection. Check the port, and that the media server is running and listening on that address.`;
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return `The name ${parsed?.hostname ?? host} could not be resolved from inside Keelhaularr. Use the media server's IP address instead.`;
+  if (['EHOSTUNREACH', 'ENETUNREACH', 'ETIMEDOUT', 'ECONNRESET'].includes(code)) {
+    return `${host} could not be reached from inside Keelhaularr (${code}). Check the address and that this LXC can reach that network.`;
+  }
+  if (TLS_CODES.has(code)) {
+    return `${host} presented a certificate Keelhaularr cannot verify (${code}). Use http:// on the local network, or the server's own https:// address whose certificate matches, such as Plex's *.plex.direct URL.`;
+  }
+  const causeMessage = error?.cause?.message ?? '';
+  if (/redirect/i.test(causeMessage) || /redirect/i.test(error?.message ?? '')) {
+    return `${host} answered with a redirect, which is not followed so the token is never sent elsewhere. Enter the address it redirects to, usually https:// instead of http://.`;
+  }
+  return `Could not connect to ${host}: ${causeMessage || error?.message || String(error)}`;
+}
+
 async function request(url, headers) {
-  const response = await fetch(url, {
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    redirect: 'error',
-    headers: { Accept: 'application/json', ...headers },
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      redirect: 'error',
+      headers: { Accept: 'application/json', ...headers },
+    });
+  } catch (error) {
+    throw Object.assign(apiError(describeFetchFailure(error, url)), { connectionFailure: true });
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw Object.assign(
+      apiError(`The media server rejected the token (HTTP ${response.status}). Check the X-Plex-Token or API key, and that it belongs to the server owner or an administrator.`),
+      { connectionFailure: true },
+    );
+  }
   if (!response.ok) throw apiError(`The media server returned HTTP ${response.status}.`);
   const text = await response.text();
   if (!text) return null;
@@ -144,11 +193,17 @@ async function collectPlex(connection, cutoffMs) {
   for (const directory of directories) {
     const key = safeText(directory?.key, 32);
     if (!key) continue;
-    // type 1 = movie, 4 = episode. Plex filters server-side on lastViewedAt.
+    // type 1 = movie, 4 = episode. Plex filters server-side on lastViewedAt: its
+    // "greater than" operator is `>>=`, so the key is `lastViewedAt>>`. A single `>`
+    // is not an operator Plex knows, and the page then came back unfiltered and in
+    // library order, so a recent watch beyond the first page was never seen. Sorting
+    // newest first keeps the most recent plays on the page even if the filter is not
+    // applied.
     for (const type of ['1', '4']) {
       const query = new URLSearchParams({
         type,
-        'lastViewedAt>': String(cutoffSeconds),
+        'lastViewedAt>>': String(cutoffSeconds),
+        sort: 'lastViewedAt:desc',
         'X-Plex-Container-Start': '0',
         'X-Plex-Container-Size': String(MAX_ITEMS_PER_QUERY),
       });
@@ -169,6 +224,85 @@ async function collectPlex(connection, cutoffMs) {
     }
   }
   return { paths, inProgress };
+}
+
+// ---------------------------------------------------------------- library folders
+
+const SAMPLE_ITEMS = 8;
+
+function locationPaths(values) {
+  return (Array.isArray(values) ? values : [])
+    .map((value) => (typeof value === 'string' ? value : value?.path))
+    .filter((value) => typeof value === 'string' && value && value.length <= 4096);
+}
+
+async function plexLibraries(connection) {
+  const base = connection.url.replace(/\/+$/, '');
+  const headers = plexHeaders(connection);
+  const sections = await request(`${base}/library/sections`, headers);
+  const libraries = [];
+  for (const directory of (sections?.MediaContainer?.Directory ?? []).slice(0, MAX_SECTIONS)) {
+    const type = directory?.type;
+    const key = safeText(directory?.key, 32);
+    const locations = locationPaths(directory?.Location);
+    if ((type !== 'movie' && type !== 'show') || !key || !locations.length) continue;
+    let files = [];
+    try {
+      const query = new URLSearchParams({
+        type: type === 'movie' ? '1' : '4',
+        'X-Plex-Container-Start': '0',
+        'X-Plex-Container-Size': String(SAMPLE_ITEMS),
+      });
+      const page = await request(`${base}/library/sections/${encodeURIComponent(key)}/all?${query}`, headers);
+      files = (page?.MediaContainer?.Metadata ?? []).flatMap(plexPartFiles);
+    } catch {
+      // Items are only evidence for finding the folder; a library without them can
+      // still be matched on its name.
+    }
+    libraries.push({ title: safeText(directory?.title), locations, files });
+  }
+  return libraries;
+}
+
+async function jellyfinLibraries(connection) {
+  const base = connection.url.replace(/\/+$/, '');
+  const headers = jellyfinHeaders(connection);
+  const folders = await request(`${base}/Library/VirtualFolders`, headers);
+  const libraries = [];
+  for (const folder of (Array.isArray(folders) ? folders : []).slice(0, MAX_SECTIONS)) {
+    // Mixed libraries report no collection type and may hold films or episodes.
+    const type = folder?.CollectionType;
+    if (type && type !== 'movies' && type !== 'tvshows') continue;
+    const locations = locationPaths(folder?.Locations);
+    if (!locations.length) continue;
+    let files = [];
+    const parentId = safeText(folder?.ItemId, 64);
+    if (parentId) {
+      try {
+        const query = new URLSearchParams({
+          ParentId: parentId,
+          Recursive: 'true',
+          IncludeItemTypes: 'Movie,Episode',
+          Fields: 'Path',
+          Limit: String(SAMPLE_ITEMS),
+        });
+        const page = await request(`${base}/Items?${query}`, headers);
+        files = (Array.isArray(page?.Items) ? page.Items : []).map((item) => item?.Path).filter(Boolean);
+      } catch {
+        // As for Plex: evidence only.
+      }
+    }
+    libraries.push({ title: safeText(folder?.Name), locations, files });
+  }
+  return libraries;
+}
+
+/**
+ * The folders each movie and TV library reads from, as the media server sees them,
+ * with a few of the files inside as evidence of where those folders are here.
+ */
+export async function discoverMediaServerLibraries(connection) {
+  return connection.kind === 'plex' ? plexLibraries(connection) : jellyfinLibraries(connection);
 }
 
 // ---------------------------------------------------------------- public surface

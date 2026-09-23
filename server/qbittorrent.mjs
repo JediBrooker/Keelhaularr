@@ -163,26 +163,67 @@ export async function getQbittorrentTorrent(connection, hash) {
   });
 }
 
+function categoryEntries(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw apiError('qBittorrent returned an invalid category list.');
+  }
+  return Object.entries(payload)
+    .filter(([name]) => name !== '')
+    .map(([name, details]) => {
+      const extra = details && typeof details === 'object' && !Array.isArray(details) ? details : {};
+      return {
+        ...extra,
+        name,
+        savePath: typeof extra.savePath === 'string' ? extra.savePath : '',
+      };
+    });
+}
+
+// The empty category is listed first because "uncategorized" can be excluded from
+// recovery like any other.
+export function categoryList(categories) {
+  return [{ name: '', savePath: '', synthetic: true }, ...categories];
+}
+
 export async function listQbittorrentCategories(connection) {
   assertConfigured(connection);
   return withSession(connection, async (request) => {
     const categoriesResponse = await request('torrents/categories');
-    const payload = await categoriesResponse.json();
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-      throw apiError('qBittorrent returned an invalid category list.');
-    }
+    return categoryList(categoryEntries(await categoriesResponse.json()));
+  });
+}
 
-    const categories = Object.entries(payload)
-      .filter(([name]) => name !== '')
-      .map(([name, details]) => {
-        const extra = details && typeof details === 'object' && !Array.isArray(details) ? details : {};
-        return {
-          ...extra,
-          name,
-          savePath: typeof extra.savePath === 'string' ? extra.savePath : '',
-        };
-      });
-    return [{ name: '', savePath: '', synthetic: true }, ...categories];
+/**
+ * Where qBittorrent keeps things: its default save path, each category's configured
+ * path, and where every torrent actually is. Read in one session because the three
+ * only make sense together.
+ */
+export async function readQbittorrentLayout(connection) {
+  assertConfigured(connection);
+  return withSession(connection, async (request) => {
+    const [defaultSavePath, categoriesResponse, torrentsResponse] = await Promise.all([
+      // Only used to work out an empty category's implicit folder, so its absence is
+      // not a reason to fail the rest.
+      request('app/defaultSavePath', { accept: 'text/plain' })
+        .then((response) => response.text())
+        .then((text) => text.trim())
+        .catch(() => ''),
+      request('torrents/categories'),
+      request('torrents/info'),
+    ]);
+    const categories = categoryEntries(await categoriesResponse.json());
+    const torrents = await torrentsResponse.json();
+    if (!Array.isArray(torrents)) throw apiError('qBittorrent returned an invalid torrent list.');
+    const pathText = (value) => (typeof value === 'string' && value.length <= MAX_TORRENT_PATH_LENGTH ? value : '');
+    return {
+      defaultSavePath: pathText(defaultSavePath),
+      categories,
+      torrents: torrents.map((torrent) => ({
+        category: typeof torrent?.category === 'string' ? torrent.category : '',
+        savePath: pathText(torrent?.save_path),
+        contentPath: pathText(torrent?.content_path),
+      })),
+    };
   });
 }
 
