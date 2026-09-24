@@ -812,6 +812,16 @@ This policy does not make guesses from names, paths, categories, or a generic
 the hash and qBittorrent-backed Arr ownership proof remain mandatory for every
 non-excluded candidate.
 
+A status line under the switch in **Settings → Automation** says what recovery
+is doing, from the server's own record of its last check:
+- whether it is off, waiting for a saved qBittorrent or Arr connection, or unable to reach qBittorrent
+- how many torrents it is watching, by reason, and how many are past their limit or being replaced
+- how many it replaced or failed to replace in the last seven days, with the latest failure
+- each torrent past its limit that it is leaving alone, and why, such as a download added by hand that no Arr queue owns
+
+It refreshes every 30 seconds while the section is open and immediately after a
+save.
+
 ## The Brig
 
 Open **Operations → Brig** to restore a quarantined file to its original path

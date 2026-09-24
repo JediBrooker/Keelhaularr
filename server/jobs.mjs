@@ -128,6 +128,36 @@ export function listJobSummaries() {
   }));
 }
 
+/**
+ * What automatic qBittorrent recovery has done lately, for the settings screen: how
+ * many stuck downloads it replaced, how many attempts failed and why the latest did,
+ * and how many are still being worked on.
+ */
+export function summarizeRecoveryJobs(jobs, { now = Date.now(), days = 7 } = {}) {
+  const since = now - days * 86_400_000;
+  const items = (Array.isArray(jobs) ? jobs : [])
+    .filter((job) => job?.type === 'qbittorrent-recovery' && Date.parse(job.createdAt) >= since)
+    .sort((left, right) => String(right.createdAt).localeCompare(String(left.createdAt)))
+    .flatMap((job) => (Array.isArray(job.items) ? job.items : []).map((item) => ({ job, item })));
+  const failed = items.filter(({ item }) => item?.status === 'failed');
+  const latest = failed[0];
+  return {
+    days,
+    replacedCount: items.filter(({ item }) => item?.status === 'complete').length,
+    failedCount: failed.length,
+    inProgressCount: items.filter(({ item }) => !['complete', 'failed', 'cancelled'].includes(item?.status)).length,
+    latestFailure: latest ? {
+      title: latest.item.candidate?.title ?? null,
+      error: String(latest.item.error ?? '').slice(0, 500) || null,
+      at: latest.job.updatedAt ?? latest.job.createdAt ?? null,
+    } : null,
+  };
+}
+
+export function recoveryJobSummary(options) {
+  return summarizeRecoveryJobs(store.read().jobs, options);
+}
+
 export function getJob(id) {
   return store.read().jobs.find((job) => job.id === id) ?? null;
 }

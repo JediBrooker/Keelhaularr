@@ -639,12 +639,18 @@ function proveQbittorrentClient(record, downloadClients) {
   return matches.length === 1 ? matches[0] : null;
 }
 
+// A code alongside the message, so the settings screen can say in plain words why a
+// stuck torrent is being left alone.
+function ownershipError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
 export async function resolveQbittorrentRecoveryOwnership(config, torrent) {
   const hash = normalizedHash(torrent?.hash);
   if (!hash) throw new Error('The qBittorrent torrent hash is missing or malformed.');
 
   const configuredApps = arrInstances(config).filter((instance) => instance.configured).map((instance) => instance.id);
-  if (!configuredApps.length) throw new Error('Neither Radarr nor Sonarr is configured.');
+  if (!configuredApps.length) throw ownershipError('no-arr', 'Neither Radarr nor Sonarr is configured.');
   const inventories = await Promise.all(configuredApps.map(async (app) => ({
     app,
     connection: config[app],
@@ -656,7 +662,10 @@ export async function resolveQbittorrentRecoveryOwnership(config, torrent) {
       && normalizedHash(record?.downloadId) === hash)
     .map((record) => ({ ...inventory, record })));
   if (matches.length !== 1) {
-    throw new Error(`Expected exactly one Radarr/Sonarr queue match for torrent ${torrent.hash}; found ${matches.length}.`);
+    throw ownershipError(
+      matches.length ? 'several-queue-matches' : 'not-in-queue',
+      `Expected exactly one Radarr/Sonarr queue match for torrent ${torrent.hash}; found ${matches.length}.`,
+    );
   }
 
   const match = matches[0];
@@ -664,12 +673,17 @@ export async function resolveQbittorrentRecoveryOwnership(config, torrent) {
   if (!queueId) throw new Error('The matching Arr queue record has an invalid id.');
   const downloadClient = proveQbittorrentClient(match.record, match.downloadClients);
   if (!downloadClient) {
-    throw new Error('The matching Arr queue record does not resolve to exactly one enabled qBittorrent download client.');
+    throw ownershipError(
+      'not-qbittorrent-client',
+      'The matching Arr queue record does not resolve to exactly one enabled qBittorrent download client.',
+    );
   }
 
   const history = (await listArrHistoryByDownloadId(match.connection, match.record.downloadId))
     .filter((record) => String(record?.eventType ?? '').toLowerCase() === 'grabbed');
-  if (!history.length) throw new Error('Arr has no grabbed history for the matching torrent, so it cannot be blocklisted safely.');
+  if (!history.length) {
+    throw ownershipError('no-grab-history', 'Arr has no grabbed history for the matching torrent, so it cannot be blocklisted safely.');
+  }
 
   let searchIds;
   let seriesId = null;

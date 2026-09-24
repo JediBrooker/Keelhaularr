@@ -8,6 +8,7 @@ const testRoot = await mkdtemp(path.join(os.tmpdir(), 'keelhaularr-qbit-recovery
 process.env.CONFIG_DIR = path.join(testRoot, 'config');
 const {
   qbittorrentRecoveryPolicyIdentity,
+  qbittorrentRecoveryStatus,
   tickQbittorrentRecovery,
 } = await import('./qbittorrent-recovery.mjs');
 const {
@@ -25,6 +26,7 @@ const {
   retryJob,
   startJobWorker,
   stopJobWorker,
+  summarizeRecoveryJobs,
 } = await import('./jobs.mjs');
 
 after(async () => {
@@ -249,11 +251,21 @@ test('ownership resolution fails closed for no, ambiguous, and non-qBittorrent m
     return Response.json({ records: [], totalRecords: 0 });
   });
 
-  await assert.rejects(resolveQbittorrentRecoveryOwnership(value, target), /found 0/);
+  // Each refusal carries a code, so the settings screen can say why in plain words.
+  await assert.rejects(
+    resolveQbittorrentRecoveryOwnership(value, target),
+    (error) => /found 0/.test(error.message) && error.code === 'not-in-queue',
+  );
   scenario = 'ambiguous';
-  await assert.rejects(resolveQbittorrentRecoveryOwnership(value, target), /found 2/);
+  await assert.rejects(
+    resolveQbittorrentRecoveryOwnership(value, target),
+    (error) => /found 2/.test(error.message) && error.code === 'several-queue-matches',
+  );
   scenario = 'non-qbittorrent';
-  await assert.rejects(resolveQbittorrentRecoveryOwnership(value, target), /does not resolve.*qBittorrent/i);
+  await assert.rejects(
+    resolveQbittorrentRecoveryOwnership(value, target),
+    (error) => /does not resolve.*qBittorrent/i.test(error.message) && error.code === 'not-qbittorrent-client',
+  );
 });
 
 test('Sonarr ownership expands all grabbed episodes and Arr deletion uses the exact safe query', { concurrency: false }, async (context) => {
@@ -720,4 +732,119 @@ test('metadata has an independent continuous timeout, including forced metadata'
   await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + 240_000 });
   assert.equal(captured.length, 1);
   assert.notEqual(qbittorrentRecoveryPolicyIdentity(value), qbittorrentRecoveryPolicyIdentity(config('metadata-window', { metadataMinutes: 3 })));
+});
+
+test('the status says what recovery is watching and why an overdue torrent is left alone', { concurrency: false }, async () => {
+  const value = config('status', { metadataMinutes: 1 }, {
+    radarr: { configured: true, url: 'http://radarr.invalid', apiKey: 'r', kind: 'radarr' },
+  });
+  const base = Date.UTC(2026, 5, 1);
+  const metadata = { state: 'metaDL', progress: 0, amount_left: 0, dlspeed: 0 };
+  const owned = torrent('aa01', metadata);
+  const handAdded = torrent('bb02', { ...metadata, name: 'Added by hand' });
+  const captured = [];
+  const options = {
+    listTorrents: async () => [owned, handAdded],
+    resolveOwnership: async (_config, value) => {
+      if (value.hash === 'bb02') {
+        throw Object.assign(new Error('Expected exactly one Radarr/Sonarr queue match for torrent bb02; found 0.'), { code: 'not-in-queue' });
+      }
+      return ownershipFor(value);
+    },
+  };
+
+  let status = await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base });
+  assert.equal(status.blockedBy, null);
+  assert.deepEqual(status.watching, { metadata: 2, stalled: 0, slow: 0 });
+  assert.equal(status.overdueCount, 0);
+  assert.deepEqual(status.skipped, []);
+
+  status = await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + 60_000 });
+  // One handed to a replacement job; the other past its limit but refused, with why.
+  assert.equal(status.queuedCount, 1);
+  assert.deepEqual(status.watching, { metadata: 1, stalled: 0, slow: 0 });
+  assert.equal(status.overdueCount, 1);
+  assert.equal(status.skippedCount, 1);
+  assert.equal(status.skipped.length, 1);
+  assert.deepEqual(
+    { ...status.skipped[0], detail: undefined },
+    { name: 'Added by hand', category: 'movies', reason: 'metadata', code: 'not-in-queue', detail: undefined },
+  );
+  assert.match(status.skipped[0].detail, /Not in Radarr's or Sonarr's queue, so it was probably added by hand/);
+  assert.deepEqual(status.thresholds, { metadataMinutes: 1, stalledMinutes: 1, slowMinutes: 1, slowSpeedKibPerSecond: 100 });
+  assert.equal(status.perPoll, 3);
+
+  // A refusal without a known reason still says what went wrong.
+  const unknown = torrent('cc03', { ...metadata, name: 'Odd one' });
+  const withUnknown = {
+    listTorrents: async () => [unknown],
+    resolveOwnership: async () => { throw new Error('Radarr answered HTTP 500.'); },
+  };
+  const other = config('status-unknown', { metadataMinutes: 1 }, {
+    radarr: { configured: true, url: 'http://radarr.invalid', apiKey: 'r', kind: 'radarr' },
+  });
+  await tickQbittorrentRecovery(other, acceptingEnqueue([]), { ...withUnknown, now: base });
+  status = await tickQbittorrentRecovery(other, acceptingEnqueue([]), { ...withUnknown, now: base + 60_000 });
+  assert.equal(status.skipped[0].code, null);
+  assert.equal(status.skipped[0].detail, 'Radarr answered HTTP 500.');
+});
+
+test('the status names what is stopping recovery', { concurrency: false }, () => {
+  const arr = { radarr: { configured: true, url: 'http://radarr.invalid', apiKey: 'r', kind: 'radarr' } };
+  assert.equal(qbittorrentRecoveryStatus(config('why-off', { enabled: false }, arr)).blockedBy, 'off');
+  const noQbittorrent = config('why-qbit', {}, arr);
+  noQbittorrent.qbittorrent.configured = false;
+  assert.equal(qbittorrentRecoveryStatus(noQbittorrent).blockedBy, 'qbittorrent');
+  assert.equal(qbittorrentRecoveryStatus(config('why-arr')).blockedBy, 'arr');
+  assert.equal(qbittorrentRecoveryStatus(config('why-none', {}, arr)).blockedBy, null);
+});
+
+test('the recovery summary counts the last week of replacements and failures', { concurrency: false }, () => {
+  const now = Date.UTC(2026, 5, 10);
+  const day = 86_400_000;
+  const job = (at, items) => ({
+    type: 'qbittorrent-recovery',
+    createdAt: new Date(at).toISOString(),
+    updatedAt: new Date(at + 1000).toISOString(),
+    items,
+  });
+  assert.deepEqual(summarizeRecoveryJobs([
+    job(now - 2 * day, [
+      { status: 'failed', error: 'An older failure.', candidate: { title: 'C' } },
+      { status: 'searching', candidate: { title: 'D' } },
+    ]),
+    job(now - day, [
+      { status: 'complete', candidate: { title: 'A' } },
+      { status: 'failed', error: 'Arr accepted removal, but qBittorrent still lists the torrent.', candidate: { title: 'B' } },
+    ]),
+    // Outside the week, and not a recovery job: neither counts.
+    job(now - 30 * day, [{ status: 'complete', candidate: { title: 'Old' } }]),
+    { type: 'orphans', createdAt: new Date(now).toISOString(), items: [{ status: 'complete' }] },
+  ], { now }), {
+    days: 7,
+    replacedCount: 1,
+    failedCount: 2,
+    inProgressCount: 1,
+    latestFailure: {
+      title: 'B',
+      error: 'Arr accepted removal, but qBittorrent still lists the torrent.',
+      at: new Date(now - day + 1000).toISOString(),
+    },
+  });
+  assert.deepEqual(summarizeRecoveryJobs([], { now }), {
+    days: 7, replacedCount: 0, failedCount: 0, inProgressCount: 0, latestFailure: null,
+  });
+});
+
+test('an unreachable qBittorrent is reported as such, not as "fetch failed"', { concurrency: false }, async () => {
+  const value = config('outage-message', {}, {
+    radarr: { configured: true, url: 'http://radarr.invalid', apiKey: 'r', kind: 'radarr' },
+  });
+  const refused = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect'), { code: 'ECONNREFUSED' }) });
+  const status = await tickQbittorrentRecovery(value, acceptingEnqueue([]), {
+    now: Date.UTC(2026, 5, 2),
+    listTorrents: async () => { throw refused; },
+  });
+  assert.equal(status.lastError, 'qBittorrent could not be reached (ECONNREFUSED). Check its Web UI address under Connections.');
+  assert.deepEqual(status.watching, { metadata: 0, stalled: 0, slow: 0 });
 });

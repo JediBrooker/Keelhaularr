@@ -1029,3 +1029,16 @@ test('the untracked manifest offers identification and import, and colours them 
   // Importing must never claim a permanent-delete confirmation.
   assert.match(appSource, /confirmPermanent: orphanAction === 'permanent'/);
 });
+
+test('the automatic-replacement switch says what recovery is doing', () => {
+  const sectionStart = settingsSource.indexOf('function QBittorrentRecoverySection');
+  const section = settingsSource.slice(sectionStart, settingsSource.indexOf('export function SettingsDialog'));
+  assert.notEqual(sectionStart, -1);
+  // Directly under the switch, from the server's own status.
+  assert.ok(section.indexOf('<RecoveryStatusLine') > section.indexOf('recovery-toggle'));
+  assert.ok(section.indexOf('<RecoveryStatusLine') < section.indexOf('recovery-warning'));
+  assert.match(settingsSource, /api<RecoveryStatus>\('\/api\/qbittorrent\/recovery\/status'\)/);
+  // Read again right after a save, so the line never describes the old settings.
+  assert.match(settingsSource, /setRecoveryStatusRevision\(\(current\) => current \+ 1\)/);
+  assert.match(settingsSource, /\[section, recoveryStatusRevision\]/);
+});
