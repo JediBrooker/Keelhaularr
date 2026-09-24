@@ -90,11 +90,43 @@ export function classifyQbittorrentRecoveryTorrent(torrent, recovery) {
   return { hash: normalizedHash(torrent.hash), reason, category: torrent.category };
 }
 
-function publicStatus(config) {
+const SKIP_EXPLANATIONS = {
+  'not-in-queue': 'Not in Radarr\'s or Sonarr\'s queue, so it was probably added by hand. Only downloads they grabbed are replaced.',
+  'several-queue-matches': 'Listed in more than one Radarr/Sonarr queue, so which one owns it is unclear.',
+  'not-qbittorrent-client': 'Its queue entry is not tied to exactly one enabled qBittorrent download client in Radarr/Sonarr.',
+  'no-grab-history': 'Radarr/Sonarr has no record of grabbing it, so it cannot be blocklisted safely.',
+  'no-arr': 'Neither Radarr nor Sonarr is connected.',
+};
+
+// Why a torrent past its time limit is being left alone, in words; anything without a
+// known reason keeps the underlying message rather than being hidden.
+function skipExplanation(code, message) {
+  return SKIP_EXPLANATIONS[code] ?? String(message ?? '').slice(0, 500);
+}
+
+function publicStatus(config, nowMs = Date.now()) {
   const document = store.read();
+  const recovery = recoveryConfig(config);
   const observations = Object.values(document.observations ?? {});
+  const pending = observations.filter((observation) => !observation.queuedAt);
+  const watching = { metadata: 0, stalled: 0, slow: 0 };
+  for (const observation of pending) {
+    if (Object.hasOwn(watching, observation.reason)) watching[observation.reason] += 1;
+  }
+  const overdue = pending.filter((observation) => {
+    const threshold = observationThresholdMs(observation.reason, recovery);
+    return threshold !== null && nowMs - Date.parse(observation.observedSince) >= threshold;
+  });
+  const skipped = overdue.filter((observation) => observation.ownershipError);
+  const arrConfigured = Boolean(config?.radarr?.configured || config?.sonarr?.configured
+    || (Array.isArray(config?.instances) && config.instances.some((instance) => instance?.configured)));
+  let blockedBy = null;
+  if (recovery.enabled !== true) blockedBy = 'off';
+  else if (config?.qbittorrent?.configured !== true) blockedBy = 'qbittorrent';
+  else if (!arrConfigured) blockedBy = 'arr';
   return {
-    enabled: recoveryConfig(config).enabled === true && config?.qbittorrent?.configured === true,
+    enabled: recovery.enabled === true && config?.qbittorrent?.configured === true,
+    blockedBy,
     running: schedulerRunning,
     tickRunning: Boolean(activeTick),
     nextPollAt,
@@ -103,18 +135,48 @@ function publicStatus(config) {
     lastError: document.lastError,
     observedCount: observations.length,
     queuedCount: observations.filter((observation) => observation.queuedAt).length,
+    watching,
+    overdueCount: overdue.length,
+    skippedCount: skipped.length,
+    skipped: skipped
+      .sort((left, right) => left.observedSince.localeCompare(right.observedSince))
+      .slice(0, 20)
+      .map((observation) => ({
+        name: observation.name,
+        category: observation.category,
+        reason: observation.reason,
+        code: observation.ownershipCode ?? null,
+        detail: skipExplanation(observation.ownershipCode, observation.ownershipError),
+      })),
+    thresholds: {
+      metadataMinutes: finiteNumber(recovery.metadataMinutes ?? 15),
+      stalledMinutes: finiteNumber(recovery.stalledMinutes),
+      slowMinutes: finiteNumber(recovery.slowMinutes),
+      slowSpeedKibPerSecond: finiteNumber(recovery.slowSpeedKibPerSecond),
+    },
+    perPoll: MAX_ENQUEUES_PER_TICK,
   };
 }
 
-export function qbittorrentRecoveryStatus(config = {}) {
-  return publicStatus(config);
+export function qbittorrentRecoveryStatus(config = {}, { now = Date.now() } = {}) {
+  return publicStatus(config, timestamp(now));
+}
+
+// Node reports every network failure as "fetch failed"; the reason is in `cause`.
+function outageMessage(error) {
+  const code = error?.cause?.code ?? error?.code;
+  if (error?.message === 'fetch failed' || (typeof code === 'string' && /^E[A-Z]+$/.test(code))) {
+    return `qBittorrent could not be reached${typeof code === 'string' ? ` (${code})` : ''}. Check its Web UI address under Connections.`;
+  }
+  if (error?.name === 'TimeoutError') return 'qBittorrent did not answer in time.';
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function recordOutage(config, nowIso, error) {
   await store.update((document) => {
     document.policyIdentity = qbittorrentRecoveryPolicyIdentity(config);
     document.lastPollAt = nowIso;
-    document.lastError = error instanceof Error ? error.message : String(error);
+    document.lastError = outageMessage(error);
     document.observations = {};
   });
 }
@@ -135,7 +197,7 @@ async function runTick(config, enqueue, options) {
       document.lastError = null;
       document.observations = {};
     });
-    return publicStatus(config);
+    return publicStatus(config, nowMs);
   }
 
   const listTorrents = options.listTorrents ?? listQbittorrentTorrents;
@@ -145,7 +207,7 @@ async function runTick(config, enqueue, options) {
     if (!Array.isArray(torrents)) throw new Error('qBittorrent returned an invalid torrent inventory.');
   } catch (error) {
     await recordOutage(config, nowIso, error);
-    return publicStatus(config);
+    return publicStatus(config, nowMs);
   }
 
   const eligible = new Map();
@@ -177,6 +239,7 @@ async function runTick(config, enqueue, options) {
         lastObservedAt: nowIso,
         queuedAt: sameWindow ? previous.queuedAt ?? null : null,
         ownershipError: sameWindow ? previous.ownershipError ?? null : null,
+        ownershipCode: sameWindow ? previous.ownershipCode ?? null : null,
       };
     }
     document.policyIdentity = identity;
@@ -211,12 +274,16 @@ async function runTick(config, enqueue, options) {
         policyIdentity: identity,
       });
       await store.update((document) => {
-        if (document.observations?.[observation.hash]) document.observations[observation.hash].ownershipError = null;
+        if (document.observations?.[observation.hash]) {
+          document.observations[observation.hash].ownershipError = null;
+          document.observations[observation.hash].ownershipCode = null;
+        }
       });
     } catch (error) {
       await store.update((document) => {
         if (document.observations?.[observation.hash]) {
           document.observations[observation.hash].ownershipError = error instanceof Error ? error.message : String(error);
+          document.observations[observation.hash].ownershipCode = typeof error?.code === 'string' ? error.code : null;
         }
       });
     }
@@ -239,7 +306,7 @@ async function runTick(config, enqueue, options) {
       });
     }
   }
-  return publicStatus(config);
+  return publicStatus(config, nowMs);
 }
 
 export async function tickQbittorrentRecovery(config, enqueue, options = {}) {

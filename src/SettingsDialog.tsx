@@ -640,10 +640,114 @@ function QBittorrentConnectionSection({
   );
 }
 
-function QBittorrentRecoverySection({ form, categoryDiscovery, canRefreshCategories, onChange, onRefreshCategories }: {
+type RecoveryReason = 'metadata' | 'stalled' | 'slow';
+
+interface RecoveryStatus {
+  enabled: boolean;
+  blockedBy: 'off' | 'qbittorrent' | 'arr' | null;
+  lastPollAt: string | null;
+  lastSuccessfulPollAt: string | null;
+  lastError: string | null;
+  queuedCount: number;
+  watching: Record<RecoveryReason, number>;
+  overdueCount: number;
+  skippedCount: number;
+  skipped: Array<{ name: string; category: string; reason: RecoveryReason; code: string | null; detail: string }>;
+  perPoll: number;
+  history?: {
+    days: number;
+    replacedCount: number;
+    failedCount: number;
+    inProgressCount: number;
+    latestFailure: { title: string | null; error: string | null; at: string | null } | null;
+  };
+}
+
+const recoveryReasonLabels: Record<RecoveryReason, string> = {
+  metadata: 'fetching metadata',
+  stalled: 'stalled',
+  slow: 'slow',
+};
+
+function plural(count: number, singular: string, pluralForm = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : pluralForm}`;
+}
+
+function timeAgo(iso: string | null) {
+  const elapsed = iso ? Date.now() - Date.parse(iso) : Number.NaN;
+  if (!Number.isFinite(elapsed)) return '';
+  const minutes = Math.round(elapsed / 60_000);
+  if (minutes < 2) return 'just now';
+  if (minutes < 90) return `${minutes} minutes ago`;
+  return `${plural(Math.round(minutes / 60), 'hour')} ago`;
+}
+
+// What automatic replacement is doing right now, from the server's own record of its
+// last check: why it is not running, what it is watching, what it replaced lately,
+// and why any stuck torrent is being left alone.
+function RecoveryStatusLine({ status, error, formEnabled }: {
+  status: RecoveryStatus | null;
+  error: string;
+  formEnabled: boolean;
+}) {
+  if (error) return <div className="recovery-status warning" role="status">Could not read the replacement status: {error}</div>;
+  if (!status) return <div className="recovery-status" role="status">Checking what automatic replacement is doing…</div>;
+  const savedOn = status.blockedBy !== 'off';
+  if (formEnabled !== savedOn) {
+    return <div className="recovery-status" role="status">{formEnabled
+      ? 'Switched on here. Save the settings to start watching qBittorrent.'
+      : 'Switched off here. Save the settings to stop.'}</div>;
+  }
+  if (status.blockedBy === 'off') return <div className="recovery-status" role="status">Off: stuck downloads are left alone.</div>;
+  if (status.blockedBy === 'qbittorrent') {
+    return <div className="recovery-status warning" role="status">On, but there is no saved qBittorrent connection to watch.</div>;
+  }
+  if (status.blockedBy === 'arr') {
+    return <div className="recovery-status warning" role="status">On, but neither Radarr nor Sonarr is connected, so nothing can be replaced.</div>;
+  }
+
+  const reasons = (Object.keys(recoveryReasonLabels) as RecoveryReason[]).filter((reason) => status.watching[reason] > 0);
+  const watchingTotal = reasons.reduce((total, reason) => total + status.watching[reason], 0);
+  const waiting = Math.max(0, status.overdueCount - status.skippedCount);
+  const history = status.history;
+  const latestFailure = history?.latestFailure;
+  return (
+    <div className={`recovery-status ${status.lastError ? 'warning' : ''}`} role="status">
+      {/* A failed check sees nothing, so it must not read as "nothing is stuck". */}
+      {status.lastError ? <p>
+        <strong>Not watching: the last check {timeAgo(status.lastPollAt)} failed.</strong> {status.lastError} Stuck
+        downloads are only replaced while qBittorrent can be checked.
+      </p> : <p>
+        <strong>{watchingTotal
+          ? `Watching ${plural(watchingTotal, 'stuck torrent')}: ${reasons.map((reason) => `${status.watching[reason]} ${recoveryReasonLabels[reason]}`).join(', ')}.`
+          : 'Watching qBittorrent: nothing is stuck right now.'}</strong>
+        {waiting > 0 && ` ${plural(waiting, 'is', 'are')} past the time limit; up to ${status.perPoll} are replaced each minute.`}
+        {status.queuedCount > 0 && ` ${plural(status.queuedCount, 'is', 'are')} being replaced now.`}
+      </p>}
+      {history && <p>
+        Replaced {history.replacedCount} in the last {history.days} days
+        {history.failedCount > 0 && `; ${history.failedCount} failed`}
+        {latestFailure?.error && ` (latest${latestFailure.title ? `, ${latestFailure.title}` : ''}: ${latestFailure.error.replace(/\.$/, '')})`}
+        {history.inProgressCount > 0 && `; ${history.inProgressCount} in progress`}
+        .{status.lastSuccessfulPollAt && ` Last checked ${timeAgo(status.lastSuccessfulPollAt)}.`}
+      </p>}
+      {status.skipped.length > 0 && <details>
+        <summary>{plural(status.skippedCount, 'stuck torrent is', 'stuck torrents are')} not being replaced. Why?</summary>
+        <ul>{status.skipped.map((item, index) => <li key={`${item.name}\u0000${index}`}>
+          <strong>{item.name}</strong> ({recoveryReasonLabels[item.reason] ?? item.reason}): {item.detail}
+        </li>)}</ul>
+        {status.skippedCount > status.skipped.length && <p>…and {status.skippedCount - status.skipped.length} more.</p>}
+      </details>}
+    </div>
+  );
+}
+
+function QBittorrentRecoverySection({ form, categoryDiscovery, canRefreshCategories, status, statusError, onChange, onRefreshCategories }: {
   form: QBittorrentForm;
   categoryDiscovery: QBittorrentCategoryDiscovery;
   canRefreshCategories: boolean;
+  status: RecoveryStatus | null;
+  statusError: string;
   onChange: (next: QBittorrentForm) => void;
   onRefreshCategories: () => void;
 }) {
@@ -674,6 +778,7 @@ function QBittorrentRecoverySection({ form, categoryDiscovery, canRefreshCategor
           <input type="checkbox" checked={form.recovery.enabled} onChange={(event) => updateRecovery('enabled', event.target.checked)} />
           <span><strong>Automatically replace slow, stalled, or metadata-stuck downloads</strong><small>Off by default. Turning this off keeps the thresholds and exclusions below.</small></span>
         </label>
+        <RecoveryStatusLine status={status} error={statusError} formEnabled={form.recovery.enabled} />
         <div className="recovery-warning">
           <strong>Destructive automation</strong>
           <p>For an eligible torrent, Keelhaularr removes the torrent and partial data through its Arr app, blocklists the release, confirms removal, then requests one replacement search.</p>
@@ -719,6 +824,31 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
   const titleRef = useRef<HTMLHeadingElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [section, setSection] = useState<SettingsSectionKey>('connections');
+  const [recoveryStatus, setRecoveryStatus] = useState<RecoveryStatus | null>(null);
+  const [recoveryStatusError, setRecoveryStatusError] = useState('');
+  const [recoveryStatusRevision, setRecoveryStatusRevision] = useState(0);
+
+  // Read while the Automation section is open, again every half minute, and right after
+  // a save, so the line under the switch says what the server is actually doing.
+  useEffect(() => {
+    if (section !== 'automation') return undefined;
+    let cancelled = false;
+    const load = () => api<RecoveryStatus>('/api/qbittorrent/recovery/status')
+      .then((status) => {
+        if (cancelled) return;
+        setRecoveryStatus(status);
+        setRecoveryStatusError('');
+      })
+      .catch((error) => {
+        if (!cancelled) setRecoveryStatusError(error instanceof Error ? error.message : String(error));
+      });
+    void load();
+    const timer = window.setInterval(load, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [section, recoveryStatusRevision]);
   const updateMediaServer = (next: MediaServerForm) => {
     setForm((current) => current ? { ...current, mediaServer: next } : current);
   };
@@ -1169,6 +1299,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
       if (configured) void refreshQbittorrentCategories();
       else setCategoryDiscovery({ categories: [], loading: false, loaded: false, error: '' });
       await onSaved();
+      setRecoveryStatusRevision((current) => current + 1);
       setSaved('Settings saved and applied immediately.');
     } catch (error) {
       setSaveError(error instanceof Error ? error.message : String(error));
@@ -1242,7 +1373,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
                 </>}
 
                 {section === 'automation' && <>
-                  <QBittorrentRecoverySection form={form.qbittorrent} categoryDiscovery={categoryDiscovery} canRefreshCategories={savedQbittorrentConfigured} onChange={updateQbittorrent} onRefreshCategories={refreshQbittorrentCategories} />
+                  <QBittorrentRecoverySection form={form.qbittorrent} categoryDiscovery={categoryDiscovery} canRefreshCategories={savedQbittorrentConfigured} status={recoveryStatus} statusError={recoveryStatusError} onChange={updateQbittorrent} onRefreshCategories={refreshQbittorrentCategories} />
                   <section className="settings-section">
                     <div className="settings-section-head"><div><p className="eyebrow">MAINTENANCE</p><h3>Schedule and notifications</h3></div></div>
                     <div className="settings-grid two">

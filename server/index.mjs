@@ -23,6 +23,7 @@ import {
   createQbittorrentRecoveryJob,
   getJob,
   listJobSummaries,
+  recoveryJobSummary,
   retryJob,
   startJobWorker,
   stopJobWorker,
@@ -466,7 +467,7 @@ app.post('/api/mediaserver/test', async (request, response, next) => {
 });
 
 app.get('/api/qbittorrent/recovery/status', (request, response) => {
-  response.json(qbittorrentRecoveryStatus(currentConfig()));
+  response.json({ ...qbittorrentRecoveryStatus(currentConfig()), history: recoveryJobSummary() });
 });
 
 function longestFirst(mappings) {
