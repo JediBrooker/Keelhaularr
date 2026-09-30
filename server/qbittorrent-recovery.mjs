@@ -92,7 +92,7 @@ export function classifyQbittorrentRecoveryTorrent(torrent, recovery) {
 
 const SKIP_EXPLANATIONS = {
   'not-in-queue': 'Not in Radarr\'s or Sonarr\'s queue, so it was probably added by hand. Only downloads they grabbed are replaced.',
-  'several-queue-matches': 'Listed in more than one Radarr/Sonarr queue, so which one owns it is unclear.',
+  'several-queue-matches': 'Listed in more than one Radarr/Sonarr app\'s queue, so which one owns it is unclear.',
   'not-qbittorrent-client': 'Its queue entry is not tied to exactly one enabled qBittorrent download client in Radarr/Sonarr.',
   'no-grab-history': 'Radarr/Sonarr has no record of grabbing it, so it cannot be blocklisted safely.',
   'no-arr': 'Neither Radarr nor Sonarr is connected.',
@@ -227,14 +227,19 @@ async function runTick(config, enqueue, options) {
     const nextObservations = {};
     for (const [hash, value] of eligible) {
       const previous = document.observations?.[hash];
+      // A torrent removed and re-grabbed under the same hash is a new download, not a
+      // continuation; an older observation without addedOn is trusted as the same one.
+      const addedOn = Number.isInteger(value.torrent.added_on) ? value.torrent.added_on : null;
       const sameWindow = previous
         && previous.reason === value.reason
-        && previous.category === value.category;
+        && previous.category === value.category
+        && (previous.addedOn == null || previous.addedOn === addedOn);
       nextObservations[hash] = {
         hash,
         name: value.torrent.name,
         category: value.category,
         reason: value.reason,
+        addedOn,
         observedSince: sameWindow ? previous.observedSince : nowIso,
         lastObservedAt: nowIso,
         queuedAt: sameWindow ? previous.queuedAt ?? null : null,
@@ -250,9 +255,15 @@ async function runTick(config, enqueue, options) {
   });
 
   const current = store.read();
+  // A torrent still unhealthy a full threshold after it was handed to a job was not
+  // recovered (the job failed, or Arr re-grabbed the same release), so offer it again.
+  // Job creation refuses hashes whose earlier job is still unresolved.
   const matured = Object.values(current.observations)
-    .filter((observation) => !observation.queuedAt
-      && nowMs - Date.parse(observation.observedSince) >= observationThresholdMs(observation.reason, recovery))
+    .filter((observation) => {
+      const threshold = observationThresholdMs(observation.reason, recovery);
+      const since = observation.queuedAt ?? observation.observedSince;
+      return nowMs - Date.parse(since) >= threshold;
+    })
     .sort((left, right) => left.observedSince.localeCompare(right.observedSince) || left.hash.localeCompare(right.hash));
   const resolveOwnership = options.resolveOwnership ?? resolveQbittorrentRecoveryOwnership;
   const ready = [];
@@ -296,8 +307,10 @@ async function runTick(config, enqueue, options) {
       const acceptedAll = job === true;
       await store.update((document) => {
         for (const candidate of ready) {
-          if (!acceptedAll && !acceptedHashes.has(candidate.hash)) continue;
-          if (document.observations?.[candidate.hash]) document.observations[candidate.hash].queuedAt = nowIso;
+          const observation = document.observations?.[candidate.hash];
+          if (!observation) continue;
+          // A retry refused because an earlier job is unresolved waits another threshold.
+          if (acceptedAll || acceptedHashes.has(candidate.hash) || observation.queuedAt) observation.queuedAt = nowIso;
         }
       });
     } catch (error) {

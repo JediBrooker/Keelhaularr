@@ -661,18 +661,25 @@ export async function resolveQbittorrentRecoveryOwnership(config, torrent) {
     .filter((record) => String(record?.protocol ?? '').toLowerCase() === 'torrent'
       && normalizedHash(record?.downloadId) === hash)
     .map((record) => ({ ...inventory, record })));
-  if (matches.length !== 1) {
+  if (!matches.length) {
+    throw ownershipError('not-in-queue', `Expected a Radarr/Sonarr queue match for torrent ${torrent.hash}; found 0.`);
+  }
+  // A season pack or multi-episode release is one download that Sonarr lists once per
+  // episode. Those records share one owner; records spread across apps do not.
+  if (new Set(matches.map((value) => value.app)).size !== 1) {
     throw ownershipError(
-      matches.length ? 'several-queue-matches' : 'not-in-queue',
-      `Expected exactly one Radarr/Sonarr queue match for torrent ${torrent.hash}; found ${matches.length}.`,
+      'several-queue-matches',
+      `Expected one Radarr/Sonarr app to own torrent ${torrent.hash}; found ${matches.length} queue records across apps.`,
     );
   }
 
-  const match = matches[0];
+  const queueIds = matches.map((value) => positiveInteger(value.record.id));
+  if (queueIds.some((id) => !id)) throw new Error('A matching Arr queue record has an invalid id.');
+  const match = matches[queueIds.indexOf(Math.min(...queueIds))];
   const queueId = positiveInteger(match.record.id);
-  if (!queueId) throw new Error('The matching Arr queue record has an invalid id.');
-  const downloadClient = proveQbittorrentClient(match.record, match.downloadClients);
-  if (!downloadClient) {
+  const downloadClients = matches.map((value) => proveQbittorrentClient(value.record, value.downloadClients));
+  const downloadClient = downloadClients[0];
+  if (!downloadClient || downloadClients.some((client) => client?.id !== downloadClient.id)) {
     throw ownershipError(
       'not-qbittorrent-client',
       'The matching Arr queue record does not resolve to exactly one enabled qBittorrent download client.',
@@ -693,8 +700,8 @@ export async function resolveQbittorrentRecoveryOwnership(config, torrent) {
       throw new Error('Radarr grabbed history contains a missing or malformed movie id.');
     }
     const movieIds = [...new Set(historyMovieIds)];
-    const queueMovieId = positiveInteger(match.record.movieId);
-    if (movieIds.length !== 1 || !queueMovieId || movieIds[0] !== queueMovieId) {
+    const queueMovieIds = matches.map((value) => positiveInteger(value.record.movieId));
+    if (movieIds.length !== 1 || queueMovieIds.some((movieId) => movieId !== movieIds[0])) {
       throw new Error('Radarr grabbed history does not identify exactly one movie matching the queue record.');
     }
     searchIds = movieIds;
@@ -707,10 +714,13 @@ export async function resolveQbittorrentRecoveryOwnership(config, torrent) {
     const seriesIds = [...new Set(historySeriesIds)];
     const episodeIds = [...new Set(historyEpisodeIds)]
       .sort((left, right) => left - right);
-    const queueSeriesId = positiveInteger(match.record.seriesId);
-    const queueEpisodeId = positiveInteger(match.record.episodeId);
-    if (seriesIds.length !== 1 || !queueSeriesId || seriesIds[0] !== queueSeriesId || !episodeIds.length
-      || (queueEpisodeId && !episodeIds.includes(queueEpisodeId))) {
+    const queueRecords = matches.map((value) => value.record);
+    if (seriesIds.length !== 1 || !episodeIds.length
+      || queueRecords.some((record) => positiveInteger(record.seriesId) !== seriesIds[0])
+      || queueRecords.some((record) => {
+        const queueEpisodeId = positiveInteger(record.episodeId);
+        return queueEpisodeId && !episodeIds.includes(queueEpisodeId);
+      })) {
       throw new Error('Sonarr grabbed history does not identify episodes from exactly one series matching the queue record.');
     }
     seriesId = seriesIds[0];

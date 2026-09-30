@@ -127,8 +127,41 @@ test('slow and stalled windows must remain continuous and enqueue at most once',
   assert.equal(captured.length, 0);
   await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + 60_000 });
   assert.deepEqual(captured.map((candidate) => candidate.reason).sort(), ['slow', 'stalled']);
-  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + 120_000 });
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + 119_000 });
   assert.equal(captured.length, 2);
+  // Still unhealthy a full threshold after being queued: the job did not recover it, so retry.
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { ...options, now: base + 120_000 });
+  assert.equal(captured.length, 4);
+});
+
+test('a torrent re-grabbed under the same hash, or whose job failed, is offered again', { concurrency: false }, async () => {
+  const base = Date.UTC(2026, 0, 5);
+  const value = config('regrab', { metadataMinutes: 1 });
+  const captured = [];
+  const resolveOwnership = async (_config, candidate) => ownershipFor(candidate);
+  const stuck = torrent('regrabhash', { category: 'tv', state: 'metaDL', dlspeed: 0, added_on: 1000 });
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { now: base, listTorrents: async () => [stuck], resolveOwnership });
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { now: base + 60_000, listTorrents: async () => [stuck], resolveOwnership });
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0].reason, 'metadata');
+
+  // Arr removed it and immediately grabbed the same release again: a fresh window starts.
+  const regrabbed = { ...stuck, added_on: 1070 };
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { now: base + 70_000, listTorrents: async () => [regrabbed], resolveOwnership });
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { now: base + 129_000, listTorrents: async () => [regrabbed], resolveOwnership });
+  assert.equal(captured.length, 1);
+  await tickQbittorrentRecovery(value, acceptingEnqueue(captured), { now: base + 130_000, listTorrents: async () => [regrabbed], resolveOwnership });
+  assert.equal(captured.length, 2);
+
+  // A refused offer (an earlier job still unresolved) backs off a threshold instead of every poll.
+  const refusing = async () => null;
+  let offered = 0;
+  const counting = async (config, candidates) => { offered += candidates.length; return refusing(config, candidates); };
+  await tickQbittorrentRecovery(value, counting, { now: base + 190_000, listTorrents: async () => [regrabbed], resolveOwnership });
+  await tickQbittorrentRecovery(value, counting, { now: base + 220_000, listTorrents: async () => [regrabbed], resolveOwnership });
+  assert.equal(offered, 1);
+  await tickQbittorrentRecovery(value, counting, { now: base + 250_000, listTorrents: async () => [regrabbed], resolveOwnership });
+  assert.equal(offered, 2);
 });
 
 test('recovery, reason, category, policy, outage, and polling gaps reset observation windows', { concurrency: false }, async () => {
@@ -266,6 +299,38 @@ test('ownership resolution fails closed for no, ambiguous, and non-qBittorrent m
     resolveQbittorrentRecoveryOwnership(value, target),
     (error) => /does not resolve.*qBittorrent/i.test(error.message) && error.code === 'not-qbittorrent-client',
   );
+});
+
+test('a Sonarr season pack listed once per episode resolves to one owner', { concurrency: false }, async (context) => {
+  const value = config('season-pack', {}, {
+    sonarr: { configured: true, url: 'http://sonarr.invalid', apiKey: 's', kind: 'sonarr' },
+  });
+  let queue = [
+    { id: 52, seriesId: 8, episodeId: 82, downloadId: 'ABCDEF', protocol: 'torrent', downloadClient: 'qBittorrent TV' },
+    { id: 51, seriesId: 8, episodeId: 81, downloadId: 'ABCDEF', protocol: 'torrent', downloadClient: 'qBittorrent TV' },
+  ];
+  mockArrFetch(context, async (input) => {
+    const url = new URL(input);
+    if (url.pathname === '/api/v3/queue/details') return Response.json(queue);
+    if (url.pathname === '/api/v3/downloadclient') return Response.json([
+      { id: 4, name: 'qBittorrent TV', enable: true, implementation: 'QBittorrent', protocol: 'torrent' },
+    ]);
+    if (url.pathname === '/api/v3/history') return Response.json(historyPage([
+      { id: 1, seriesId: 8, episodeId: 81, downloadId: 'ABCDEF', eventType: 'grabbed' },
+      { id: 2, seriesId: 8, episodeId: 82, downloadId: 'ABCDEF', eventType: 'grabbed' },
+    ]));
+    return Response.json({}, { status: 404 });
+  });
+
+  const owner = await resolveQbittorrentRecoveryOwnership(value, torrent('abcdef', { category: 'tv' }));
+  assert.equal(owner.app, 'sonarr');
+  assert.equal(owner.queueId, 51);
+  assert.equal(owner.seriesId, 8);
+  assert.deepEqual(owner.searchIds, [81, 82]);
+
+  // An episode the grab history does not cover still fails closed.
+  queue = [...queue, { id: 53, seriesId: 8, episodeId: 99, downloadId: 'ABCDEF', protocol: 'torrent', downloadClient: 'qBittorrent TV' }];
+  await assert.rejects(resolveQbittorrentRecoveryOwnership(value, torrent('abcdef', { category: 'tv' })), /exactly one series/);
 });
 
 test('Sonarr ownership expands all grabbed episodes and Arr deletion uses the exact safe query', { concurrency: false }, async (context) => {

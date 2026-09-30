@@ -787,11 +787,17 @@ uploading, completed, malformed, and unknown states are left untouched. The
 server polls once per minute and records the observation durably, but the timer
 must be continuous for the same hash, reason, and category. Recovery being
 disabled, a policy or connection change, a qBittorrent outage, disappearance
-from eligibility, or a changed reason/category resets the observation window.
+from eligibility, a changed reason/category, or the same hash being re-added
+(for example when Arr re-grabs the release it just removed) resets the
+observation window. A torrent that is still unhealthy a full threshold after it
+was handed to a recovery job, because that job failed before acting or Arr
+grabbed the same release again, is offered for recovery again. A hash whose
+earlier job is still unresolved is never queued twice.
 
 After the timer matures, Keelhaularr still requires exact ownership proof. The
-opaque torrent hash must match exactly one torrent queue record across the
-configured Arr apps; that record must resolve to exactly one enabled
+opaque torrent hash must match torrent queue records in exactly one configured
+Arr app (a season pack that Sonarr lists once per episode counts as one
+download); every matching record must resolve to the same single enabled
 qBittorrent download client; and grabbed history must identify exactly one
 Radarr movie or one Sonarr series with explicit episode IDs. The hash, policy,
 category, reason, queue record, download client, and search target are checked
