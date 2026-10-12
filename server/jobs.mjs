@@ -1075,23 +1075,30 @@ async function processJob(job) {
       });
     }
   }
-  const settled = await updateJob(job.id, (value) => {
-    const failed = value.items.some((item) => item.status === 'failed');
-    const cancelled = value.items.some((item) => item.status === 'cancelled');
-    value.status = failed ? 'completed_with_errors' : cancelled ? 'cancelled' : 'completed';
-    value.completedAt = new Date().toISOString();
-    value.updatedAt = value.completedAt;
+  // Record the run in history BEFORE the job reads as settled: anyone who sees the
+  // job finish (the UI polling /api/jobs, then /api/history) must also see its
+  // reclaimed bytes. recordRun ignores a jobId it already holds, so a restart that
+  // settles this job again can't count it twice.
+  const current = getJob(job.id);
+  if (!current) return;
+  const failed = current.items.some((item) => item.status === 'failed');
+  const cancelled = current.items.some((item) => item.status === 'cancelled');
+  const status = failed ? 'completed_with_errors' : cancelled ? 'cancelled' : 'completed';
+  const completedAt = new Date().toISOString();
+  const settled = { ...current, status, completedAt, updatedAt: completedAt };
+  await recordRun({
+    jobId: settled.id,
+    type: settled.type,
+    action: settled.action ?? null,
+    title: settled.title,
+    completedAt,
+    ...summarizeJobOutcome(settled),
+  }).catch((error) => console.error('Could not record job history:', error));
+  await updateJob(job.id, (value) => {
+    value.status = status;
+    value.completedAt = completedAt;
+    value.updatedAt = completedAt;
   });
-  if (settled) {
-    await recordRun({
-      jobId: settled.id,
-      type: settled.type,
-      action: settled.action ?? null,
-      title: settled.title,
-      completedAt: settled.completedAt,
-      ...summarizeJobOutcome(settled),
-    }).catch((error) => console.error('Could not record job history:', error));
-  }
 }
 
 async function runWorker() {
