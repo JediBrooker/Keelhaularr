@@ -304,7 +304,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const settingsUpdate = {
     account: {
       username: 'captain',
-      newPassword: 'yo',
+      newPassword: 'yo ho ho!',
       sessionDays: 14,
       cookieSecure: false,
       rotateSessions: false,
@@ -454,9 +454,11 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const persisted = JSON.parse(await readFile(persistedPath, 'utf8'));
   // The login password is never written in the clear: config/settings.json travels
   // wherever the config volume is backed up, and people reuse this password elsewhere.
-  assert.equal(persisted.values.APP_PASSWORD.includes('yo'), false);
+  // The test password has a space and '!', which never occur in the scrypt record
+  // (base64 and '$'), so this can't match the random salt or hash by chance.
+  assert.equal(persisted.values.APP_PASSWORD.includes('yo ho ho!'), false);
   assert.match(persisted.values.APP_PASSWORD, /^scrypt\$/);
-  assert.equal(await verifyPassword('yo', persisted.values.APP_PASSWORD), true);
+  assert.equal(await verifyPassword('yo ho ho!', persisted.values.APP_PASSWORD), true);
   assert.equal(await verifyPassword('not-yo', persisted.values.APP_PASSWORD), false);
   assert.equal(persisted.values.RADARR_API_KEY, 'updated-radarr-key');
   assert.equal(persisted.values.QBITTORRENT_PASSWORD, 'qbit-secret');
@@ -830,7 +832,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const newPassword = await fetch(`${base}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: 'captain', password: 'yo' }),
+    body: JSON.stringify({ username: 'captain', password: 'yo ho ho!' }),
   });
   assert.equal(newPassword.status, 200);
   const ui = await fetch(base);
@@ -849,7 +851,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   const persistedLogin = await fetch(`${restartedBase}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: 'captain', password: 'yo' }),
+    body: JSON.stringify({ username: 'captain', password: 'yo ho ho!' }),
   });
   assert.equal(persistedLogin.status, 200);
   const persistedCookie = persistedLogin.headers.get('set-cookie')?.split(';', 1)[0];
