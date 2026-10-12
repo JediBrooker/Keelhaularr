@@ -3,6 +3,7 @@ import type { KeyboardEvent, MouseEvent } from 'react';
 import { ModalDialog } from './ModalDialog';
 import { OperationsDialog } from './OperationsDialog';
 import { SettingsDialog } from './SettingsDialog';
+import { FlagAU } from './FlagAU';
 
 // An instance id. 'radarr' and 'sonarr' are always present; further instances add
 // their own ids, so this can no longer be a two-value union.
@@ -1619,7 +1620,7 @@ export default function App() {
         </div>)}
       </section>
 
-      <footer><span>Keelhaularr</span> · Library file changes require confirmation · Every file action is revalidated server-side</footer>
+      <footer><span>Keelhaularr</span> · Library file changes require confirmation · Every file action is revalidated server-side · Made in Australia <FlagAU width={14} /></footer>
       <ConfirmDialog
         stage={confirmationStage}
         tab={tab}
