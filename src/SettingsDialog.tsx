@@ -5,6 +5,7 @@ import {
   AutomationSettings,
   DownloadAutomationSettings,
   NtfyForm,
+  NtfySection,
   NtfySettings,
   automationForm,
   automationPayload,
@@ -15,16 +16,17 @@ import { ModalDialog } from './ModalDialog';
 
 type AppKind = 'radarr' | 'sonarr';
 type TestKind = AppKind | 'qbittorrent' | 'mediaServer';
-type SettingsSectionKey = 'connections' | 'cleanup' | 'automation' | 'account' | 'system';
+type SettingsSectionKey = 'connections' | 'cleanup' | 'downloads' | 'automation' | 'account' | 'system';
 
 const settingsSectionLabels: Record<SettingsSectionKey, string> = {
   connections: 'Connections',
   cleanup: 'Cleanup rules',
-  automation: 'Automation',
+  downloads: 'Downloads',
+  automation: 'Schedule & alerts',
   account: 'Account',
   system: 'System',
 };
-const settingsSectionOrder: SettingsSectionKey[] = ['connections', 'cleanup', 'automation', 'account', 'system'];
+const settingsSectionOrder: SettingsSectionKey[] = ['connections', 'cleanup', 'downloads', 'automation', 'account', 'system'];
 
 interface PathMap {
   from: string;
@@ -852,10 +854,10 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
   const [recoveryStatusError, setRecoveryStatusError] = useState('');
   const [recoveryStatusRevision, setRecoveryStatusRevision] = useState(0);
 
-  // Read while the Automation section is open, again every half minute, and right after
+  // Read while the Downloads section is open, again every half minute, and right after
   // a save, so the line under the switch says what the server is actually doing.
   useEffect(() => {
-    if (section !== 'automation') return undefined;
+    if (section !== 'downloads') return undefined;
     let cancelled = false;
     const load = () => api<RecoveryStatus>('/api/qbittorrent/recovery/status')
       .then((status) => {
@@ -1400,9 +1402,12 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
                   </section>
                 </>}
 
-                {section === 'automation' && <>
+                {section === 'downloads' && <DownloadAutomationSettings form={form.automation} categories={categoryDiscovery.categories.map((category) => category.name)} statusRevision={recoveryStatusRevision} onChange={(next) => updateSection('automation', next)}>
                   <QBittorrentRecoverySection form={form.qbittorrent} categoryDiscovery={categoryDiscovery} canRefreshCategories={savedQbittorrentConfigured} status={recoveryStatus} statusError={recoveryStatusError} onChange={updateQbittorrent} onRefreshCategories={refreshQbittorrentCategories} />
-                  <DownloadAutomationSettings form={form.automation} ntfy={form.ntfy} categories={categoryDiscovery.categories.map((category) => category.name)} statusRevision={recoveryStatusRevision} onChange={(next) => updateSection('automation', next)} onNtfyChange={(next) => updateSection('ntfy', next)} />
+                </DownloadAutomationSettings>}
+
+                {section === 'automation' && <>
+                  <NtfySection ntfy={form.ntfy} onNtfyChange={(next) => updateSection('ntfy', next)} />
                   <section className="settings-section">
                     <div className="settings-section-head"><div><p className="eyebrow">MAINTENANCE</p><h3>Schedule and notifications</h3></div></div>
                     <div className="settings-grid two">
