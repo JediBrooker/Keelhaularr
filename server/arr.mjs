@@ -619,7 +619,7 @@ export async function listArrHistoryByDownloadId(connection, downloadId) {
   throw new Error('Arr history pagination exceeded the safety cap before all records were returned.');
 }
 
-async function arrRecoveryInventory(connection) {
+export async function arrRecoveryInventory(connection) {
   if (!connection?.configured) return { queue: [], downloadClients: [] };
   const [queueResponse, clientsResponse] = await Promise.all([
     arrRequest(connection, 'queue/details'),
@@ -746,9 +746,11 @@ export async function resolveQbittorrentRecoveryOwnership(config, torrent) {
   };
 }
 
-export async function removeQbittorrentRecoveryFromArr(connection, queueId) {
+// `removeFromClient: false` takes a private torrent out of Arr's queue and blocklists
+// it while qBittorrent keeps seeding it, which is what a private tracker's ratio needs.
+export async function removeQbittorrentRecoveryFromArr(connection, queueId, { removeFromClient = true } = {}) {
   const query = new URLSearchParams({
-    removeFromClient: 'true',
+    removeFromClient: removeFromClient ? 'true' : 'false',
     blocklist: 'true',
     skipRedownload: 'true',
     changeCategory: 'false',

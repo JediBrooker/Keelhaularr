@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { resolveQbittorrentRecoveryOwnership } from './arr.mjs';
-import { listQbittorrentTorrents } from './qbittorrent.mjs';
+import { ignoreListIsEmpty, ignoredReason } from './download-ignore.mjs';
+import { listQbittorrentTorrents, withQbittorrent } from './qbittorrent.mjs';
 import { createJsonStore } from './state.mjs';
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000;
@@ -51,6 +52,10 @@ function policyDocument(config) {
     excludedCategories: Array.isArray(recovery.excludedCategories)
       ? [...new Set(recovery.excludedCategories.filter((category) => typeof category === 'string'))].sort()
       : [],
+    // Added only when they differ from what earlier versions did, so upgrading does not
+    // change the identity and restart every observation window.
+    ...(ignoreListIsEmpty(config?.downloadIgnore) ? {} : { globalIgnore: config.downloadIgnore }),
+    ...(recovery.ignoreSlowWhenAltSpeed === false ? { judgeSlowDuringAltSpeed: true } : {}),
   };
 }
 
@@ -70,9 +75,14 @@ export function observationThresholdMs(reason, recovery) {
   return minutes === null ? null : minutes * 60_000;
 }
 
-export function classifyQbittorrentRecoveryTorrent(torrent, recovery) {
+/**
+ * `ignore` is the global ignore list; `altSpeed` says qBittorrent's alternative speed
+ * limits are on, during which every torrent is slow by design and none is judged slow.
+ */
+export function classifyQbittorrentRecoveryTorrent(torrent, recovery, { ignore = null, altSpeed = false } = {}) {
   const excludedCategories = Array.isArray(recovery?.excludedCategories) ? recovery.excludedCategories : [];
   if (typeof torrent?.category === 'string' && excludedCategories.includes(torrent.category)) return null;
+  if (ignore && ignoredReason({ downloadIgnore: ignore }, torrent)) return null;
   if (torrent?.recoveryFieldsValid !== true) return null;
   if (!normalizedHash(torrent.hash) || typeof torrent.name !== 'string' || typeof torrent.category !== 'string') return null;
   if (!(torrent.amount_left > 0 || torrent.progress < 1)) return null;
@@ -82,7 +92,7 @@ export function classifyQbittorrentRecoveryTorrent(torrent, recovery) {
     reason = 'metadata';
   } else if (torrent.state === 'stalledDL') {
     reason = 'stalled';
-  } else if (torrent.state === 'downloading') {
+  } else if (torrent.state === 'downloading' && !(altSpeed && recovery?.ignoreSlowWhenAltSpeed === true)) {
     const slowSpeedKibPerSecond = finiteNumber(recovery?.slowSpeedKibPerSecond);
     if (slowSpeedKibPerSecond !== null && torrent.dlspeed < slowSpeedKibPerSecond * 1024) reason = 'slow';
   }
@@ -210,9 +220,18 @@ async function runTick(config, enqueue, options) {
     return publicStatus(config, nowMs);
   }
 
+  // Read only when it can matter. A failed read counts as "on": not judging a torrent
+  // slow for one poll only ever preserves it.
+  let altSpeed = false;
+  if (recovery.ignoreSlowWhenAltSpeed === true && finiteNumber(recovery.slowSpeedKibPerSecond) > 0) {
+    const readAltSpeed = options.alternativeSpeedActive
+      ?? (() => withQbittorrent(config.qbittorrent, (client) => client.alternativeSpeedActive()));
+    altSpeed = await readAltSpeed().catch(() => true);
+  }
+
   const eligible = new Map();
   for (const torrent of torrents) {
-    const classification = classifyQbittorrentRecoveryTorrent(torrent, recovery);
+    const classification = classifyQbittorrentRecoveryTorrent(torrent, recovery, { ignore: config.downloadIgnore, altSpeed });
     if (!classification || eligible.has(classification.hash)) continue;
     eligible.set(classification.hash, { torrent, ...classification });
   }

@@ -1,5 +1,16 @@
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import { DirectoryInput } from './DirectoryInput';
+import {
+  AutomationForm,
+  AutomationSettings,
+  DownloadAutomationSettings,
+  NtfyForm,
+  NtfySettings,
+  automationForm,
+  automationPayload,
+  ntfyForm,
+  ntfyPayload,
+} from './DownloadAutomationSettings';
 import { ModalDialog } from './ModalDialog';
 
 type AppKind = 'radarr' | 'sonarr';
@@ -27,6 +38,7 @@ interface QBittorrentRecoverySettings {
   stalledMinutes: number;
   metadataMinutes: number;
   excludedCategories: string[];
+  ignoreSlowWhenAltSpeed?: boolean;
 }
 
 interface QBittorrentCategory {
@@ -94,7 +106,10 @@ interface SettingsData {
     notificationType: 'generic' | 'discord' | 'gotify';
     webhookConfigured: boolean;
     notifyWhenClear: boolean;
+    downloadEvents: boolean;
   };
+  automation: AutomationSettings;
+  ntfy: NtfySettings;
   server: {
     port: number;
     portManagedByDocker: boolean;
@@ -162,6 +177,7 @@ interface QBittorrentForm {
     stalledMinutes: string;
     metadataMinutes: string;
     excludedCategories: string[];
+    ignoreSlowWhenAltSpeed: boolean;
   };
 }
 
@@ -200,7 +216,10 @@ interface SettingsForm {
     webhookConfigured: boolean;
     clearWebhook: boolean;
     notifyWhenClear: boolean;
+    downloadEvents: boolean;
   };
+  automation: AutomationForm;
+  ntfy: NtfyForm;
   server: SettingsData['server'];
 }
 
@@ -399,6 +418,7 @@ function qbittorrentForm(settings: QBittorrentSettings): QBittorrentForm {
       stalledMinutes: settings.recovery.stalledMinutes.toString(),
       metadataMinutes: (settings.recovery.metadataMinutes ?? 15).toString(),
       excludedCategories: [...settings.recovery.excludedCategories],
+      ignoreSlowWhenAltSpeed: settings.recovery.ignoreSlowWhenAltSpeed !== false,
     },
   };
 }
@@ -439,7 +459,10 @@ function formFromSettings(settings: SettingsData): SettingsForm {
       webhookConfigured: settings.schedule.webhookConfigured,
       clearWebhook: false,
       notifyWhenClear: settings.schedule.notifyWhenClear,
+      downloadEvents: settings.schedule.downloadEvents === true,
     },
+    automation: automationForm(settings.automation),
+    ntfy: ntfyForm(settings.ntfy),
     server: settings.server,
   };
 }
@@ -789,6 +812,7 @@ function QBittorrentRecoverySection({ form, categoryDiscovery, canRefreshCategor
           <label className="field">Stalled for (minutes)<input type="number" min="1" max="10080" step="1" inputMode="numeric" value={form.recovery.stalledMinutes} onChange={(event) => updateRecovery('stalledMinutes', event.target.value)} /></label>
           <label className="field">Fetching metadata for (minutes)<input type="number" min="1" max="10080" step="1" inputMode="numeric" value={form.recovery.metadataMinutes} onChange={(event) => updateRecovery('metadataMinutes', event.target.value)} /></label>
         </div>
+        <label className="check-row"><input type="checkbox" checked={form.recovery.ignoreSlowWhenAltSpeed} onChange={(event) => updateRecovery('ignoreSlowWhenAltSpeed', event.target.checked)} />Do not judge downloads slow while qBittorrent's alternative speed limits are on</label>
         <div className="category-picker" aria-labelledby="qbittorrent-recovery-categories-title">
           <div className="category-picker-head">
             <div><strong id="qbittorrent-recovery-categories-title">Exclude categories</strong><span>Downloads in selected categories are never removed automatically. Matching is exact.</span></div>
@@ -957,7 +981,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
     }
   }
 
-  function updateSection<K extends 'account' | 'defaults' | 'orphan' | 'schedule'>(section: K, next: SettingsForm[K]) {
+  function updateSection<K extends 'account' | 'defaults' | 'orphan' | 'schedule' | 'automation' | 'ntfy'>(section: K, next: SettingsForm[K]) {
     setForm((current) => current ? { ...current, [section]: next } : current);
   }
 
@@ -1263,8 +1287,11 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
               stalledMinutes: numeric(form.qbittorrent.recovery.stalledMinutes, 'qBittorrent stalled duration'),
               metadataMinutes: numeric(form.qbittorrent.recovery.metadataMinutes, 'qBittorrent metadata duration'),
               excludedCategories: [...form.qbittorrent.recovery.excludedCategories],
+              ignoreSlowWhenAltSpeed: form.qbittorrent.recovery.ignoreSlowWhenAltSpeed,
             },
           },
+          automation: automationPayload(form.automation),
+          ntfy: ntfyPayload(form.ntfy),
           mediaServer: {
             kind: form.mediaServer.kind,
             url: form.mediaServer.url,
@@ -1290,6 +1317,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
             webhookUrl: form.schedule.webhookUrl,
             clearWebhook: form.schedule.clearWebhook,
             notifyWhenClear: form.schedule.notifyWhenClear,
+            downloadEvents: form.schedule.downloadEvents,
           },
         }),
       });
@@ -1374,6 +1402,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
 
                 {section === 'automation' && <>
                   <QBittorrentRecoverySection form={form.qbittorrent} categoryDiscovery={categoryDiscovery} canRefreshCategories={savedQbittorrentConfigured} status={recoveryStatus} statusError={recoveryStatusError} onChange={updateQbittorrent} onRefreshCategories={refreshQbittorrentCategories} />
+                  <DownloadAutomationSettings form={form.automation} ntfy={form.ntfy} categories={categoryDiscovery.categories.map((category) => category.name)} statusRevision={recoveryStatusRevision} onChange={(next) => updateSection('automation', next)} onNtfyChange={(next) => updateSection('ntfy', next)} />
                   <section className="settings-section">
                     <div className="settings-section-head"><div><p className="eyebrow">MAINTENANCE</p><h3>Schedule and notifications</h3></div></div>
                     <div className="settings-grid two">
@@ -1384,6 +1413,7 @@ export function SettingsDialog({ onboarding = false, onClose, onSaved, onConnect
                       <p className="field-hint wide-field">After maintenance, Keelhaularr sends the selected payload format to this URL. Webhook failures are recorded in the maintenance report.</p>
                       {form.schedule.webhookConfigured && <label className="check-row"><input type="checkbox" checked={form.schedule.clearWebhook} onChange={(event) => updateSection('schedule', { ...form.schedule, clearWebhook: event.target.checked })} />Remove saved webhook</label>}
                       <label className="check-row"><input type="checkbox" checked={form.schedule.notifyWhenClear} onChange={(event) => updateSection('schedule', { ...form.schedule, notifyWhenClear: event.target.checked })} />Notify when no files are found</label>
+                      <label className="check-row"><input type="checkbox" checked={form.schedule.downloadEvents} onChange={(event) => updateSection('schedule', { ...form.schedule, downloadEvents: event.target.checked })} />Also send download removals and blocks to this webhook</label>
                     </div>
                   </section>
                 </>}

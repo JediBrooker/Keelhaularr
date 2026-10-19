@@ -1,4 +1,12 @@
 import path from 'node:path';
+import {
+  contentBlockerPolicy,
+  failedImportPolicy,
+  ignoreListPolicy,
+  parsePolicyJson,
+  seedingCleanupPolicy,
+  unlinkedCleanupPolicy,
+} from './automation-config.mjs';
 
 const DEFAULT_MEDIA_EXTENSIONS = [
   '.avi', '.divx', '.iso', '.m2ts', '.m4v', '.mkv', '.mov', '.mp4',
@@ -181,7 +189,8 @@ const RESERVED_INSTANCE_IDS = new Set([
   'extensions', 'customIgnoreDirectories', 'ignoreDirectories', 'maxFiles',
   'hardlinkMinAgeHours', 'quarantineRetentionDays', 'oversizeRequireReplacement',
   'orphanAutoIdentify', 'orphanAutoIdentifyLimit',
-  'storageRoots',
+  'storageRoots', 'downloadIgnore', 'strikes', 'failedImports', 'contentBlocker',
+  'seedingCleanup', 'unlinkedCleanup', 'ntfy',
 ]);
 
 function defaultInstanceLabel(id, kind) {
@@ -308,8 +317,36 @@ function qbittorrentConnection(overrides) {
       excludedCategories: readExactStringArray(
         'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON', overrides,
       ),
+      // Cleanuparr's slow rule paused while qBittorrent's alternative (scheduled) speed
+      // limits were on, because every torrent is slow then by design.
+      ignoreSlowWhenAltSpeed: readStrictBoolean(
+        'QBITTORRENT_RECOVERY_IGNORE_SLOW_ALT_SPEED', true, overrides,
+      ),
     },
   };
+}
+
+const NTFY_PRIORITIES = [1, 2, 3, 4, 5];
+
+function ntfyConnection(overrides) {
+  const url = (envValue('NTFY_URL', overrides) ?? '').trim().replace(/\/+$/, '');
+  const priority = readBoundedInteger('NTFY_PRIORITY', 3, 1, 5, overrides);
+  if (!NTFY_PRIORITIES.includes(priority)) throw new Error('NTFY_PRIORITY must be 1 to 5');
+  return {
+    // The URL is the server plus topic, e.g. https://ntfy.sh/my-topic. On a public server
+    // the topic name is the only thing keeping messages private, so it is handled like
+    // a secret: write-only in the GUI and never sent back to the browser.
+    url,
+    token: envValue('NTFY_TOKEN', overrides) ?? '',
+    priority,
+    configured: Boolean(url),
+    downloadEvents: readBoolean('NTFY_DOWNLOAD_EVENTS', true, overrides),
+    scanReports: readBoolean('NTFY_SCAN_REPORTS', false, overrides),
+  };
+}
+
+function readPolicy(name, parser, overrides) {
+  return parsePolicyJson(name, envValue(name, overrides), parser);
 }
 
 export function getConfig(overrides = {}) {
@@ -381,6 +418,24 @@ export function getConfig(overrides = {}) {
   if (qbittorrent.recovery.enabled && !instances.some((instance) => instance.configured)) {
     throw new Error('qBittorrent automatic recovery requires at least one configured Arr connection');
   }
+  const failedImports = readPolicy('FAILED_IMPORT_JSON', failedImportPolicy, overrides);
+  const contentBlocker = readPolicy('CONTENT_BLOCKER_JSON', contentBlockerPolicy, overrides);
+  const seedingCleanup = readPolicy('SEEDING_CLEANUP_JSON', seedingCleanupPolicy, overrides);
+  const unlinkedCleanup = readPolicy('UNLINKED_CLEANUP_JSON', unlinkedCleanupPolicy, overrides);
+  // Every one of these acts on qBittorrent torrents, and the two that remove through
+  // Arr need Arr to own the download, so each is refused rather than silently idle.
+  for (const [label, policy, needsArr] of [
+    ['Failed-import cleanup', failedImports, true],
+    ['The content blocker', contentBlocker, true],
+    ['Seeding cleanup', seedingCleanup, false],
+    ['Unlinked-torrent cleanup', unlinkedCleanup, true],
+  ]) {
+    if (!policy.enabled) continue;
+    if (!qbittorrent.configured) throw new Error(`${label} requires a configured qBittorrent connection`);
+    if (needsArr && !instances.some((instance) => instance.configured)) {
+      throw new Error(`${label} requires at least one configured Arr connection`);
+    }
+  }
 
   return {
     instances,
@@ -420,8 +475,20 @@ export function getConfig(overrides = {}) {
       notificationType,
       webhookUrl: envValue('NOTIFICATION_WEBHOOK_URL', overrides) ?? '',
       notifyWhenClear: readBoolean('NOTIFICATION_WHEN_CLEAR', false, overrides),
+      // Removals and blocks by the download automations, sent as they happen rather
+      // than in the scan report. Off by default so existing webhooks see no new events.
+      downloadEvents: readBoolean('NOTIFICATION_DOWNLOAD_EVENTS', false, overrides),
     },
     storageRoots: readRoots('STORAGE_ROOTS', overrides),
+    downloadIgnore: readPolicy('DOWNLOAD_IGNORE_JSON', (value) => ignoreListPolicy(value, 'Global ignore list'), overrides),
+    strikes: {
+      inactivityHours: readBoundedInteger('STRIKE_INACTIVITY_HOURS', 24, 1, 8760, overrides),
+    },
+    failedImports,
+    contentBlocker,
+    seedingCleanup,
+    unlinkedCleanup,
+    ntfy: ntfyConnection(overrides),
   };
 }
 
@@ -464,6 +531,12 @@ export function publicConfig(config) {
       intervalHours: config.schedule.intervalHours,
       notificationType: config.schedule.notificationType,
       webhookConfigured: Boolean(config.schedule.webhookUrl),
+    },
+    automation: {
+      failedImports: { enabled: config.failedImports?.enabled === true, dryRun: config.failedImports?.dryRun !== false },
+      contentBlocker: { enabled: config.contentBlocker?.enabled === true, dryRun: config.contentBlocker?.dryRun !== false },
+      seedingCleanup: { enabled: config.seedingCleanup?.enabled === true, dryRun: config.seedingCleanup?.dryRun !== false },
+      unlinkedCleanup: { enabled: config.unlinkedCleanup?.enabled === true, dryRun: config.unlinkedCleanup?.dryRun !== false },
     },
     protected: Boolean(config.password),
   };

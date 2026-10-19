@@ -64,6 +64,8 @@ const itemPhaseLabels: Record<string, string> = {
   removed_confirmed: 'Removal confirmed',
   search_requested: 'Replacement search requested',
   search_queued: 'Replacement search queued',
+  skipping_files: 'Skipping blocked files',
+  files_skipped: 'Blocked files skipped',
 };
 const replacementStatusLabels: Record<string, string> = {
   pending: 'Search pending',
@@ -93,11 +95,14 @@ interface JobItem {
   outcome: string | null;
   candidate: {
     title: string;
-    app: 'radarr' | 'sonarr';
+    app: 'radarr' | 'sonarr' | 'qbittorrent';
     path?: string;
     sizeBytes?: number;
     category?: string;
     reason?: string;
+    // Set on download-cleanup items: which automation acted, e.g. "Seeding cleanup".
+    rule?: string;
+    subtitle?: string;
   };
   replacement: null | { status: string; detail: string | null };
 }
@@ -188,10 +193,11 @@ function JobItemRow({ item, recovery }: { item: JobItem; recovery: boolean }) {
   const category = item.candidate.category === ''
     ? 'Uncategorized'
     : item.candidate.category === undefined ? 'Unknown category' : `Category ${JSON.stringify(item.candidate.category)}`;
-  const reason = item.candidate.reason === 'slow'
-    ? 'Slow download'
-    : item.candidate.reason === 'stalled' ? 'Stalled download'
-      : item.candidate.reason === 'metadata' ? 'Metadata timeout' : 'Automatic replacement candidate';
+  const cleanup = Boolean(item.candidate.rule);
+  const reason = cleanup ? item.candidate.subtitle ?? 'Download automation'
+    : item.candidate.reason === 'slow' ? 'Slow download'
+      : item.candidate.reason === 'stalled' ? 'Stalled download'
+        : item.candidate.reason === 'metadata' ? 'Metadata timeout' : 'Automatic replacement candidate';
   const terminal = ['failed', 'cancelled', 'skipped'].includes(item.status);
   let badgeValue = item.status;
   let badgeLabel = statusLabel(item.status, itemStatusLabels);
@@ -207,7 +213,10 @@ function JobItemRow({ item, recovery }: { item: JobItem; recovery: boolean }) {
     badgeValue = item.replacement.status;
     badgeLabel = statusLabel(item.replacement.status, replacementStatusLabels);
   }
+  // A cleanup item's outcome carries its reason and strike count, which matters more
+  // than the search's progress.
   const detail = item.error
+    || (cleanup ? item.outcome ?? item.candidate.reason : null)
     || item.replacement?.detail
     || (item.outcome ? outcomeLabels[item.outcome] ?? item.outcome : null)
     || statusLabel(item.status, itemStatusLabels);
@@ -423,7 +432,7 @@ export function OperationsDialog({ initialTab = 'jobs', onClose, onChanged, onJo
                   {activeJobStatuses.has(job.status) && <button type="button" className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`cancel-${job.id}`, async () => { await api(`/api/jobs/${job.id}/cancel`, { method: 'POST', body: '{}' }); }, () => loadJobs(openJobIds))}>Cancel remaining</button>}
                   {job.failedCount > 0 && !activeJobStatuses.has(job.status) && <button type="button" className="ghost-button compact" disabled={Boolean(busy)} onClick={() => action(`retry-${job.id}`, async () => { const result = await api<{ job: { id: string } }>(`/api/jobs/${job.id}/retry`, { method: 'POST', body: '{}' }); onJobQueued(result.job.id); }, () => loadJobs(openJobIds))}>Retry failures</button>}
                 </div>
-                <details onToggle={(event) => setJobDetailsOpen(job.id, event.currentTarget.open)}><summary>{items ? 'Item progress' : 'Load item progress'}</summary>{items && <div className="job-items">{items.map((item) => <JobItemRow item={item} recovery={job.type === 'qbittorrent-recovery'} key={item.id} />)}</div>}</details>
+                <details onToggle={(event) => setJobDetailsOpen(job.id, event.currentTarget.open)}><summary>{items ? 'Item progress' : 'Load item progress'}</summary>{items && <div className="job-items">{items.map((item) => <JobItemRow item={item} recovery={job.type === 'qbittorrent-recovery' || job.type === 'download-cleanup'} key={item.id} />)}</div>}</details>
               </article>;
             })}
           </div>}

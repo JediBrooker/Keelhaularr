@@ -20,14 +20,18 @@ import {
   cancelJob,
   createOrphanJob,
   createOversizeJob,
+  createDownloadCleanupJob,
   createQbittorrentRecoveryJob,
   getJob,
+  listJobs,
   listJobSummaries,
   recoveryJobSummary,
   retryJob,
   startJobWorker,
   stopJobWorker,
 } from './jobs.mjs';
+import { automationStatus, previewAutomation, startAutomation, stopAutomation } from './automation.mjs';
+import { sendNtfy } from './notify.mjs';
 import { summarizeDuplicates, verifyDuplicates } from './duplicates.mjs';
 import { auditImports } from './hardlink-audit.mjs';
 import { historySummary } from './history.mjs';
@@ -339,7 +343,14 @@ app.get('/api/settings', (request, response) => {
 app.put('/api/settings', async (request, response, next) => {
   try {
     const nextOverrides = buildSettingsOverrides(request.body, getSettingsOverrides());
-    const nextConfig = getConfig(nextOverrides);
+    let nextConfig;
+    try {
+      nextConfig = getConfig(nextOverrides);
+    } catch (error) {
+      // Whatever makes the saved settings unloadable came from this request.
+      error.statusCode ??= 400;
+      throw error;
+    }
     const forwardedProtocol = (request.get('x-forwarded-proto') ?? '').split(',')[0].trim().toLowerCase();
     if (nextConfig.cookieSecure && !request.secure && forwardedProtocol !== 'https') {
       const error = new Error('Secure cookies can only be enabled while accessing Keelhaularr through HTTPS.');
@@ -461,6 +472,58 @@ app.post('/api/mediaserver/test', async (request, response, next) => {
         .map((location) => safeConnectionText(location, 4096, [connection.token]))
         .filter(Boolean),
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/automation/status', (request, response) => {
+  response.json({ features: automationStatus(currentConfig(), { jobs: listJobs() }) });
+});
+
+// Read-only: judges every download automation as if it were in dry run, without adding
+// a strike, trying an import, or starting a job.
+app.post('/api/automation/preview', async (request, response, next) => {
+  try {
+    response.json(await previewAutomation(currentConfig()));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/notifications/ntfy/test', async (request, response, next) => {
+  try {
+    const saved = currentConfig().ntfy;
+    const url = typeof request.body?.url === 'string' && request.body.url.trim() ? request.body.url.trim() : saved.url;
+    if (!url) {
+      const error = new Error('Enter an ntfy URL, or save one, before sending a test.');
+      error.statusCode = 400;
+      throw error;
+    }
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      const error = new Error('The ntfy URL is not a valid URL.');
+      error.statusCode = 400;
+      throw error;
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+      const error = new Error('The ntfy URL must use HTTP(S) without embedded credentials.');
+      error.statusCode = 400;
+      throw error;
+    }
+    const token = typeof request.body?.token === 'string' && request.body.token ? request.body.token
+      : url === saved.url ? saved.token : '';
+    await sendNtfy({ ...saved, url, token, configured: true }, {
+      title: 'Keelhaularr test',
+      message: 'Notifications from Keelhaularr will arrive here.',
+      tags: ['anchor'],
+    }).catch((error) => {
+      error.statusCode = 502;
+      throw error;
+    });
+    response.json({ status: 'sent' });
   } catch (error) {
     next(error);
   }
@@ -1088,6 +1151,7 @@ migrateStoredPassword()
 startJobWorker(currentConfig);
 startScheduler(currentConfig);
 startQbittorrentRecovery(currentConfig, createQbittorrentRecoveryJob);
+startAutomation(currentConfig, createDownloadCleanupJob);
 reconcileQuarantine().catch((error) => console.error('Quarantine reconciliation failed:', error));
 
 // A file action is not interruptible, so shutdown stops taking new work and then waits
@@ -1102,6 +1166,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     if (shuttingDown) process.exit(1);
     shuttingDown = true;
     stopQbittorrentRecovery();
+    stopAutomation();
     stopScheduler();
     server.close();
     const forced = setTimeout(() => {

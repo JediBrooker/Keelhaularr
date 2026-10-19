@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { scanArr, allArrCandidates, arrScanResults } from './arr.mjs';
 import { filterExcluded, refreshExclusionOverages } from './exclusions.mjs';
 import { scanOrphans } from './orphans.mjs';
+import { sendNtfy } from './notify.mjs';
 import { cleanupExpiredQuarantine } from './quarantine.mjs';
 import { createJsonStore } from './state.mjs';
 
@@ -79,6 +80,14 @@ export async function runScheduledScan(config, trigger = 'manual') {
       report.notification = await sendNotification(config, report);
     } catch (error) {
       report.notification = { status: 'failed', error: error instanceof Error ? error.message : String(error) };
+    }
+    const clear = report.oversizedCount === 0 && report.orphanCount === 0 && !report.warnings.length;
+    if (config.ntfy?.configured && config.ntfy.scanReports && (!clear || config.schedule.notifyWhenClear)) {
+      try {
+        report.ntfy = await sendNtfy(config.ntfy, { title: 'Keelhaularr scan', message: messageFor(report), tags: ['anchor'] });
+      } catch (error) {
+        report.ntfy = { status: 'failed', error: error instanceof Error ? error.message : String(error) };
+      }
     }
     const nextRunAt = config.schedule.enabled
       ? new Date(Date.now() + config.schedule.intervalHours * 3600000).toISOString()
