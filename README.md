@@ -12,7 +12,9 @@ before anything is removed, and can be moved to the recoverable Brig instead of
 being deleted outright.
 Optional Brig retention can purge already-quarantined files, and the separate
 qBittorrent recovery policy can remove eligible partial torrents through Arr.
-Both destructive automations are opt-in and disabled by default.
+The download automations - failed-import cleanup, the content blocker, seeding
+cleanup and unlinked-torrent cleanup - take over what Cleanuparr did. Every
+destructive automation is opt-in, disabled by default, and starts in dry run.
 
 ## Features
 
@@ -32,7 +34,16 @@ Both destructive automations are opt-in and disabled by default.
 - Import auditing that reports a copy-instead-of-hardlink misconfiguration on the first import rather than after terabytes
 - A check of each application's own "Use Hardlinks instead of Copy" setting against whether the storage could hardlink at all
 - Optional qBittorrent guard that withholds every incomplete torrent from orphan actions
-- Opt-in automatic recovery for continuously slow, stalled, or metadata-stuck qBittorrent downloads
+- Opt-in automatic recovery for continuously slow, stalled, or metadata-stuck qBittorrent downloads, paused for slow downloads while qBittorrent's alternative speed limits are on
+- Opt-in failed-import cleanup: forced import first, then strikes, then removal, blocklisting and a fresh search
+- Opt-in content blocker that sets executables, shortcuts, archives and samples in new torrents to "do not download", using Cleanuparr's blocklist by default
+- Opt-in seeding cleanup with per-category ratio, seed-time, inactivity and swarm-size rules
+- Opt-in unlinked-torrent cleanup that removes finished torrents no longer hardlinked into any library
+- Strikes shared by the download automations, with an inactivity window so problems that cleared themselves are forgotten
+- A global ignore list (categories, tags, hashes) honoured by every download automation, plus one per feature
+- Dry-run mode and a read-only preview for every download automation, with the reason and strike count for each decision
+- Optional blocklist sync into qBittorrent's own excluded file names
+- ntfy notifications for removals and blocked content, and optionally for scan reports
 - Recoverable orphan quarantine or confirmed permanent deletion per selected batch
 - Built-in login with the password stored as a salted scrypt hash, never in the clear
 - HttpOnly, SameSite=Strict signed sessions, all of which end the moment the password changes
@@ -828,6 +839,252 @@ is doing, from the server's own record of its last check:
 It refreshes every 30 seconds while the section is open and immediately after a
 save.
 
+Two things also leave a torrent alone:
+
+- **Alternative speed limits.** While qBittorrent's alternative (scheduled) speed
+  limits are on, every torrent is slow by design, so no download is judged slow and
+  slow windows restart. Stalled and metadata detection carry on. Turn this off with
+  `QBITTORRENT_RECOVERY_IGNORE_SLOW_ALT_SPEED=false`. If the mode cannot be read, it is
+  treated as on.
+- **The global ignore list** described under [Download automation](#download-automation).
+
+Recovery keeps its continuous minute windows rather than strikes. A window polled
+once a minute is the same as one strike per minute that resets on any healthy
+reading, so it is stricter than Cleanuparr's slow and stalled strikes. Those could
+add up across a day of on-and-off slowness and remove a torrent that was usually
+fine. The only behaviour lost is Cleanuparr's "slow strikes survive progress", and
+losing it only ever keeps more torrents.
+
+## Download automation
+
+Four further automations act on qBittorrent downloads. They are configured in
+**Settings → Automation**, and each one:
+
+- is **off by default**, and when switched on starts in **dry run**, which records
+  what it would do and why while changing nothing
+- needs a saved qBittorrent connection, and all except seeding cleanup need Radarr
+  or Sonarr too
+- hands everything it decides to act on to a durable **download-cleanup job** under
+  **Operations → Jobs**. The job re-reads qBittorrent and Arr and judges the download
+  again immediately before acting. If the feature was switched off or into dry run,
+  or its settings changed in the meantime, the download is preserved.
+- records each decision with its reason: the rule, the strike count, the matching
+  file and pattern, or the ratio that was reached
+- leaves a download alone if it is on the global or the feature's ignore list
+
+**Preview all** evaluates every feature against qBittorrent and Arr as they are now,
+as if each were on and in dry run, using the saved settings. It adds no strike,
+attempts no import and starts no job, so it is how to see what a feature would do
+before switching it on. The status line under each feature shows its last check,
+what it has done in the last seven days, and its recent decisions.
+
+Every removal that goes through Radarr or Sonarr uses the same pipeline as
+automatic recovery:
+
+1. remove the queue item
+2. blocklist the release
+3. confirm the torrent is gone
+4. queue exactly one replacement search
+
+An interrupted removal is proven from Arr's history and never repeated blindly.
+
+### Strikes
+
+A strike is one failing check. A rule acts only once a download reaches its limit,
+so one bad reading never removes anything. Strikes are stored in
+`config/strikes.json` and survive restarts. They expire after a download goes a
+whole inactivity window without a new one (24 hours by default), so a problem that
+cleared itself is forgotten. A feature in dry run keeps separate strikes, so
+switching dry run off starts every count from zero.
+
+```dotenv
+STRIKE_INACTIVITY_HOURS=24
+```
+
+### Ignore lists
+
+The global ignore list applies to every download automation, including automatic
+recovery. Each feature also has its own. A download is ignored when its hash, its
+exact category, or any of its tags is listed. Categories match exactly, and
+`""` is Uncategorized. Tags ignore case.
+
+```dotenv
+DOWNLOAD_IGNORE_JSON={"categories":["books"],"tags":[],"hashes":[]}
+```
+
+### Failed-import cleanup
+
+This handles downloads that Radarr or Sonarr has finished but cannot import (queue
+state `importPending`, `importBlocked` or `failedPending` with a warning or error),
+for example "no files found are eligible for import". Every check (every 5 minutes
+by default) does one of three things:
+
+1. **Forced import**, up to the configured number of attempts. Keelhaularr asks the
+   application which files it can identify and imports only those it rejected for
+   temporary reasons. A permanent rejection (not an upgrade, a sample, the wrong
+   episode) is never overridden.
+2. **A strike**, once there is nothing left to try.
+3. **Removal** at the last strike: blocklisted and searched for again.
+
+A download is only acted on when every one of its queue records is stuck and one
+application owns all of them. qBittorrent must also report it complete. It must
+pass the same ownership proof as recovery: one qBittorrent download client and
+grabbed history.
+
+Private-tracker torrents are ignored by default. A torrent whose private flag cannot
+be read counts as private. If private torrents are not ignored, they are removed
+from Arr and blocklisted but keep seeding in qBittorrent, unless deleting them is
+also turned on. Messages containing any of the ignored phrases are left alone.
+
+```dotenv
+FAILED_IMPORT_JSON={"enabled":false,"dryRun":true,"intervalMinutes":5,"maxStrikes":3,"forceImportAttempts":3,"ignorePrivate":true,"deletePrivate":false,"ignoredMessages":[],"ignore":{}}
+```
+
+### Content blocker
+
+The content blocker checks every unfinished torrent that Radarr or Sonarr is
+downloading as soon as qBittorrent knows its files. The check runs every 60 seconds
+by default, and each torrent is looked at once per version of the list. Files whose
+names match the blocklist are set to **do not download**, and the rest of the
+torrent carries on. A torrent whose every file is blocked is removed, blocklisted,
+and searched for again.
+
+The list is Cleanuparr's by default, fetched from its URL and refreshed every six
+hours. A failed refresh keeps the last good copy, and without any copy the blocker
+acts on nothing. Each line is a wildcard pattern (`*.exe`, `*sample.mkv`, `Trailer.*`)
+matched against the file name without its folders and ignoring case, or `regex:`
+followed by a regular expression. Extra patterns can be added in Settings. In
+allowlist mode, every file that matches nothing is blocked instead.
+
+Only names can be checked: an archive's contents are unknown until it has
+downloaded, which is why the default list blocks archive types outright. Downloads
+added by hand (in no Arr queue) are never inspected, and private torrents are
+ignored by default.
+
+**Blocklist sync** is optional and off by default. It copies the wildcard patterns
+into qBittorrent's own **Excluded file names** preference, so qBittorrent skips
+matching files in new torrents before downloading a byte. `regex:` lines are not
+copied, because qBittorrent does not understand them. This changes a qBittorrent
+setting, which is why it has its own switch.
+
+```dotenv
+CONTENT_BLOCKER_JSON={"enabled":false,"dryRun":true,"intervalSeconds":60,"mode":"blocklist","listUrl":"https://cleanuparr.pages.dev/static/blacklist","refreshHours":6,"patterns":[],"ignorePrivate":true,"removeWhenAllBlocked":true,"syncExcludedFileNames":false,"ignore":{}}
+```
+
+### Seeding cleanup
+
+This removes finished torrents from qBittorrent by per-category rule. A torrent is
+removed once it has seeded the minimum time and then reaches any of these:
+
+- its maximum ratio
+- its maximum seeding time
+- its maximum number of days without upload activity
+
+A limit of `-1` (blank in Settings) is off, and a maximum ratio of `0` removes a
+torrent as soon as it is finished and imported. A minimum seeder count keeps a
+torrent the swarm still needs. Categories without a rule are never touched.
+
+An incomplete torrent is never touched, and neither is one Radarr or Sonarr still
+lists in its queue, because its import has not happened yet.
+
+**Delete files** is on by default and normally costs nothing, because the library
+holds its own hardlink. Before deleting, every file is found on disk through the
+qBittorrent path mappings. A media file that is its own last link is deleted only
+if Radarr or Sonarr recorded importing that download; otherwise it may be the only
+copy, and the torrent is kept with that reason. A file that cannot be found locally
+keeps the whole torrent. **Reclaimed** history counts only bytes that really were
+the last copy.
+
+```dotenv
+SEEDING_CLEANUP_JSON={"enabled":false,"dryRun":true,"intervalMinutes":15,"rules":[{"category":"tv-sonarr","maxRatio":0,"minSeedHours":0,"maxSeedHours":-1,"maxInactiveDays":-1,"minSeeders":0,"deleteFiles":true}],"ignore":{}}
+```
+
+### Unlinked-torrent cleanup
+
+This removes finished torrents whose media files have no other hardlink: Radarr or
+Sonarr upgraded the file, or it was deleted from the library, and the torrent is now
+only taking space. It builds on the same inode checks as the hardlink audit.
+
+Link counts cannot tell "replaced in the library" from "never imported", so a
+torrent is removed only when Radarr or Sonarr recorded importing it. Optional
+filters:
+
+- categories (none means all)
+- tags
+- a minimum age since the torrent finished (24 hours by default)
+- ignored folders
+
+Deleting the files is what frees the space, so it is on by default.
+
+```dotenv
+UNLINKED_CLEANUP_JSON={"enabled":false,"dryRun":true,"intervalMinutes":60,"categories":[],"tags":[],"ignoredRoots":[],"minCompletedHours":24,"deleteFiles":true,"ignore":{}}
+```
+
+### ntfy
+
+Removals and blocked content can be sent to [ntfy](https://ntfy.sh) as they happen.
+Enter the server and topic as one URL. On a public server the topic name is what
+keeps the messages private, so it is write-only like the webhook URL and never sent
+back to the browser. **Send test notification** checks it before saving. A failed
+notification is logged and never fails or repeats the action it describes.
+
+```dotenv
+NTFY_URL=https://ntfy.sh/your-topic
+NTFY_TOKEN=
+NTFY_PRIORITY=3
+NTFY_DOWNLOAD_EVENTS=true
+NTFY_SCAN_REPORTS=false
+# Also send download events to the generic/Discord/Gotify webhook:
+NOTIFICATION_DOWNLOAD_EVENTS=false
+```
+
+## Coming from Cleanuparr
+
+Every Cleanuparr feature has a Keelhaularr equivalent, and each one starts off and
+in dry run. A sensible order:
+
+1. Set the global ignore list.
+2. Press **Preview all**.
+3. Switch features on in dry run, read their decisions for a day, then turn dry run
+   off.
+
+**Use Cleanuparr values** in Settings fills in the values below.
+
+| Cleanuparr | Keelhaularr |
+|---|---|
+| Queue cleaner: failed import, max strikes 3, every 5 min | Failed-import cleanup: strikes before removal 3, check every 5 minutes |
+| Failed import: ignore private / delete private | Ignore private-tracker torrents (on) / also delete private torrents (off) |
+| Failed import: ignored patterns | Ignore imports whose message contains |
+| Forced import attempts | Forced import attempts first (3) |
+| Stalled: max strikes, reset strikes on progress | Automatic replacement: stalled for N minutes, a continuous window that resets on any progress |
+| Slow: min speed, max strikes, ignore above size | Automatic replacement: slow below N KiB/s for N minutes (a continuous window; see [why](#automatic-qbittorrent-recovery)) |
+| Slow: ignore while alternative speed limits are on | Do not judge downloads slow while alternative speed limits are on (on) |
+| Downloading metadata: max strikes | Automatic replacement: fetching metadata for N minutes |
+| Strike inactivity window 24 h | Strikes expire after 24 hours |
+| Content blocker (blacklist mode, Cleanuparr list) for Sonarr and Radarr | Content blocker, "Block files that match", the same list URL |
+| Content blocker (whitelist mode) | Content blocker, "Block files that do not match" |
+| Content blocker: ignore private | Ignore private-tracker torrents (on) |
+| Content blocker: delete when all files are blocked | Remove and blocklist a torrent when every file is blocked (on) |
+| Malware blocker / known-malware deletion | Content blocker patterns; add names or `regex:` lines to Extra patterns |
+| Search after removal (search enabled) | Always on: every Arr removal queues exactly one replacement search |
+| Search round-robin, search delay | Not needed: one search per removed download, at most 10 removals started per run, and 3 per minute for recovery |
+| Download cleaner: per-category max ratio / min seed time / max seed time | Seeding cleanup: one rule per category (`-1` or blank is off; `0` ratio removes once finished and imported) |
+| Download cleaner: delete source files | Seeding rule "Delete files", refused for a last copy nobody imported |
+| Unlinked download handling: categories, tag, ignored root dirs | Unlinked-torrent cleanup: categories, tags, ignored folders |
+| Ignored downloads (hashes, tags, categories) | Global ignore list, plus one list per feature |
+| Arr blocklist on removal | Always on for removals through Arr |
+| Notifications (ntfy, Apprise, Notifiarr) | ntfy, plus the existing generic/Discord/Gotify webhook |
+| Blocklist sync | Content blocker "Blocklist sync" (off by default) |
+| Dry run | Per-feature dry run, plus Preview all |
+
+Cleanuparr only had settings for these; Keelhaularr adds checks:
+
+- a final revalidation before any action, preserving the download if anything
+  changed
+- ownership proof before anything is removed through Arr
+- refusing to delete a media file's last copy unless Radarr or Sonarr recorded
+  importing it
+
 ## The Brig
 
 Open **Operations → Brig** to restore a quarantined file to its original path
@@ -883,6 +1140,9 @@ Webhook types are `generic` (JSON event and report), `discord` (Discord webhook
 URL), and `gotify` (a Gotify message endpoint including its application token).
 Webhook URLs are stored server-side and never returned to the browser. Leave
 the field blank when saving to keep the current URL, or use its removal switch.
+Scan reports can also go to ntfy (`NTFY_SCAN_REPORTS=true`), and download
+removals and blocks can go to the webhook (`NOTIFICATION_DOWNLOAD_EVENTS=true`);
+see [ntfy](#ntfy).
 
 ## Watch guard
 
@@ -1032,8 +1292,8 @@ and set:
 APP_COOKIE_SECURE=true
 ```
 
-Radarr and Sonarr API keys and the qBittorrent password entered in Settings are
-never returned to the browser. Unlike the login password, they have to be
+Radarr and Sonarr API keys, the qBittorrent password, and the ntfy topic and token
+entered in Settings are never returned to the browser. Unlike the login password, they have to be
 replayed to those services, so they are stored unencrypted in the private
 `config/settings.json` file (mode `0600`). Do not commit or casually copy
 `.env` or `config/settings.json`.

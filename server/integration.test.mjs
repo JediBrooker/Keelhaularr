@@ -263,6 +263,7 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
     stalledMinutes: 30,
     metadataMinutes: 15,
     excludedCategories: [],
+    ignoreSlowWhenAltSpeed: true,
   });
   assert.deepEqual(initialSettings.server.storageRoots, [moviesRoot, tvRoot]);
   assert.equal((await fetch(`${base}/api/connections/status`)).status, 401);
@@ -390,10 +391,12 @@ test('authenticated scan, replacement search, and orphan quarantine', async (con
   assert.equal(savedSettings.settings.sonarr.maxMbPerMinuteOverride, 75);
   assert.equal(savedSettings.settings.radarr.useArrQualityDefinitions, true);
   assert.equal(savedSettings.settings.qbittorrent.passwordConfigured, true);
-  assert.deepEqual(savedSettings.settings.qbittorrent.recovery, settingsUpdate.qbittorrent.recovery);
+  // The update omits the alternative-speed switch, which keeps its default.
+  const expectedRecovery = { ...settingsUpdate.qbittorrent.recovery, ignoreSlowWhenAltSpeed: true };
+  assert.deepEqual(savedSettings.settings.qbittorrent.recovery, expectedRecovery);
   assert.equal(savedSettings.config.radarr.maxMbPerMinute, 70);
   assert.equal(savedSettings.config.sonarr.maxMbPerMinute, 75);
-  assert.deepEqual(savedSettings.config.qbittorrent.recovery, settingsUpdate.qbittorrent.recovery);
+  assert.deepEqual(savedSettings.config.qbittorrent.recovery, expectedRecovery);
 
   const recoveryStatusResponse = await fetch(`${base}/api/qbittorrent/recovery/status`, {
     headers: { Cookie: cookie },

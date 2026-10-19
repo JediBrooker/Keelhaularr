@@ -43,11 +43,16 @@ import {
   observationThresholdMs,
   qbittorrentRecoveryPolicyIdentity,
 } from './qbittorrent-recovery.mjs';
-import { listQbittorrentTorrents } from './qbittorrent.mjs';
+import { listQbittorrentTorrents, withQbittorrent } from './qbittorrent.mjs';
+import { FEATURE_BY_RULE, automationPolicyIdentity, loadQueues } from './automation.mjs';
+import { notifyDownloadEvent } from './notify.mjs';
 import { createJsonStore } from './state.mjs';
 
 const store = createJsonStore('jobs.json', { version: 1, jobs: [] });
 const ACTIVE_STATUSES = new Set(['queued', 'running', 'cancelling']);
+// Job types that act on qBittorrent downloads. A hash with an unresolved item in any of
+// them is never handed to another job, whichever feature noticed it.
+const DOWNLOAD_JOB_TYPES = new Set(['qbittorrent-recovery', 'download-cleanup']);
 const POST_MUTATION_RECOVERY_PHASES = new Set([
   'delete_requested',
   'arr_removed',
@@ -83,7 +88,7 @@ function recoveryItemBlocksNewJob(job, item, policyIdentity) {
 function trimJobs(document) {
   if (document.jobs.length <= 100) return;
   const retained = document.jobs.filter((job) => ACTIVE_STATUSES.has(job.status)
-    || (job.type === 'qbittorrent-recovery' && job.items.some(recoveryItemNeedsPermanentResolution)));
+    || (DOWNLOAD_JOB_TYPES.has(job.type) && job.items.some(recoveryItemNeedsPermanentResolution)));
   const retainedIds = new Set(retained.map((job) => job.id));
   const finished = document.jobs.filter((job) => !retainedIds.has(job.id))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
@@ -312,13 +317,80 @@ export async function createOrphanJob(config, requestedIds, action) {
   });
 }
 
+function cleanupItemBlocksNewJob(job, item) {
+  if (recoveryItemNeedsPermanentResolution(item)) return true;
+  return ACTIVE_STATUSES.has(job.status) && !['complete', 'cancelled'].includes(item.status);
+}
+
 function unresolvedRecoveryHashes(jobs, policyIdentity) {
   return new Set(jobs
-    .filter((job) => job.type === 'qbittorrent-recovery')
+    .filter((job) => DOWNLOAD_JOB_TYPES.has(job.type))
     .flatMap((job) => job.items
-      .filter((item) => recoveryItemBlocksNewJob(job, item, policyIdentity))
+      .filter((item) => (job.type === 'qbittorrent-recovery'
+        ? recoveryItemBlocksNewJob(job, item, policyIdentity)
+        : cleanupItemBlocksNewJob(job, item)))
       .map((item) => String(item.candidate?.hash ?? '').trim().toLowerCase()))
     .filter(Boolean));
+}
+
+const CLEANUP_TITLES = {
+  'failed-import': (count) => `Remove ${count} stuck import${count === 1 ? '' : 's'}`,
+  'content-blocked': (count) => `Block unwanted content in ${count} torrent${count === 1 ? '' : 's'}`,
+  seeding: (count) => `Remove ${count} torrent${count === 1 ? '' : 's'} that finished seeding`,
+  unlinked: (count) => `Remove ${count} torrent${count === 1 ? '' : 's'} no longer in the library`,
+};
+
+/**
+ * Queues downloads the automations decided to act on. Each candidate must have been
+ * judged under the policy that is in force now, by a feature that is on and out of dry
+ * run, and no hash already being handled by another job is taken twice.
+ */
+export async function createDownloadCleanupJob(config, candidates) {
+  if (config?.qbittorrent?.configured !== true) return null;
+  let createdJob = null;
+  await store.update((document) => {
+    const alreadyQueued = unresolvedRecoveryHashes(document.jobs, qbittorrentRecoveryPolicyIdentity(config));
+    const seen = new Set();
+    const selected = [];
+    for (const candidate of Array.isArray(candidates) ? candidates : []) {
+      const feature = FEATURE_BY_RULE[candidate?.rule];
+      const hash = String(candidate?.hash ?? '').trim().toLowerCase();
+      if (!feature || !hash || seen.has(hash) || alreadyQueued.has(hash)) continue;
+      const policy = config[feature.key];
+      if (policy?.enabled !== true || policy.dryRun !== false) continue;
+      if (candidate.policyIdentity !== automationPolicyIdentity(config, feature.key)) continue;
+      seen.add(hash);
+      selected.push({ ...candidate, hash });
+      if (selected.length >= 10) break;
+    }
+    if (!selected.length) return;
+    const counts = new Map();
+    for (const candidate of selected) counts.set(candidate.rule, (counts.get(candidate.rule) ?? 0) + 1);
+    const title = [...counts].map(([rule, count]) => CLEANUP_TITLES[rule](count)).join('; ');
+    const now = new Date().toISOString();
+    createdJob = {
+      id: randomUUID(),
+      type: 'download-cleanup',
+      title,
+      status: 'queued',
+      createdAt: now,
+      updatedAt: now,
+      startedAt: null,
+      completedAt: null,
+      cancelRequested: false,
+      connectionUrls: {
+        qbittorrent: config.qbittorrent?.url,
+        ...arrInstanceUrls(config),
+      },
+      connectionIdentities: recoveryConnectionIdentities(config),
+      items: makeItems(selected),
+    };
+    document.jobs.push(createdJob);
+    trimJobs(document);
+  });
+  if (!createdJob) return null;
+  kickWorker();
+  return getJob(createdJob.id);
 }
 
 export async function createQbittorrentRecoveryJob(config, candidates) {
@@ -804,7 +876,7 @@ function assertRecoveryObservationMature(config, candidate) {
 }
 
 function assertRecoveryTorrentEligible(config, candidate, torrent) {
-  const classification = classifyQbittorrentRecoveryTorrent(torrent, config.qbittorrent.recovery);
+  const classification = classifyQbittorrentRecoveryTorrent(torrent, config.qbittorrent.recovery, { ignore: config.downloadIgnore });
   if (!classification || classification.reason !== candidate.reason || torrent.category !== candidate.category) {
     throw new Error('The torrent recovered, changed category, or no longer matches the approved slow/stalled/metadata policy.');
   }
@@ -818,9 +890,7 @@ async function currentRecoveryTorrent(config, candidate) {
   return matches[0] ?? null;
 }
 
-async function revalidateRecoveryCandidate(config, candidate, torrent) {
-  assertRecoveryTorrentEligible(config, candidate, torrent);
-  const ownership = await resolveQbittorrentRecoveryOwnership(config, torrent);
+function assertSameOwnership(ownership, candidate) {
   if (ownership.app !== candidate.app
     || Number(ownership.queueId) !== Number(candidate.queueId)
     || normalizedHash(ownership.downloadId) !== normalizedHash(candidate.downloadId)
@@ -830,6 +900,16 @@ async function revalidateRecoveryCandidate(config, candidate, torrent) {
     || Number(ownership.seriesId ?? 0) !== Number(candidate.seriesId ?? 0)) {
     throw new Error('The torrent ownership changed after detection; it was preserved.');
   }
+}
+
+async function revalidateRecoveryCandidate(config, candidate, torrent) {
+  assertRecoveryTorrentEligible(config, candidate, torrent);
+  if (candidate.reason === 'slow' && config.qbittorrent.recovery.ignoreSlowWhenAltSpeed === true
+    && await withQbittorrent(config.qbittorrent, (client) => client.alternativeSpeedActive())) {
+    throw new Error('qBittorrent\'s alternative speed limits are on, so a slow torrent is not judged; it was preserved.');
+  }
+  const ownership = await resolveQbittorrentRecoveryOwnership(config, torrent);
+  assertSameOwnership(ownership, candidate);
   const immediateTorrent = await currentRecoveryTorrent(config, candidate);
   if (!immediateTorrent) {
     throw new Error('The torrent disappeared during final ownership revalidation; it was preserved for manual review.');
@@ -838,7 +918,21 @@ async function revalidateRecoveryCandidate(config, candidate, torrent) {
   return ownership;
 }
 
-async function finishRecoverySearch(job, item, config) {
+function removedEvent(candidate, extra = {}) {
+  return {
+    kind: 'removed',
+    rule: candidate.rule ?? candidate.reason,
+    title: candidate.title,
+    app: candidate.app,
+    reason: candidate.rule ? candidate.reason : null,
+    blocklisted: true,
+    searched: true,
+    ...extra,
+  };
+}
+
+async function finishRecoverySearch(job, item, config,
+  outcome = 'Unhealthy torrent removed, blocklisted, and replacement search queued.') {
   let latest = getJob(job.id)?.items.find((value) => value.id === item.id);
   if (!latest) return;
   const connection = config[latest.candidate.app];
@@ -856,7 +950,7 @@ async function finishRecoverySearch(job, item, config) {
     await updateItem(job.id, item.id, (value) => {
       value.status = 'complete';
       value.phase = 'search_queued';
-      value.outcome = 'Unhealthy torrent removed, blocklisted, and replacement search queued.';
+      value.outcome = outcome;
       value.replacement = {
         status: 'searching',
         commandId: existing.id ?? null,
@@ -881,7 +975,7 @@ async function finishRecoverySearch(job, item, config) {
   await updateItem(job.id, item.id, (value) => {
     value.status = 'complete';
     value.phase = 'search_queued';
-    value.outcome = 'Unhealthy torrent removed, blocklisted, and replacement search queued.';
+    value.outcome = outcome;
     value.replacement = {
       status: 'searching',
       commandId: command?.id ?? null,
@@ -889,6 +983,7 @@ async function finishRecoverySearch(job, item, config) {
       checkedAt: new Date().toISOString(),
     };
   });
+  await notifyDownloadEvent(config, removedEvent(latest.candidate));
 }
 
 async function processQbittorrentRecoveryItem(job, item, config) {
@@ -982,6 +1077,228 @@ async function processQbittorrentRecoveryItem(job, item, config) {
   await finishRecoverySearch(job, latest, continuationConfig);
 }
 
+function currentItem(job, item) {
+  return getJob(job.id)?.items.find((value) => value.id === item.id) ?? null;
+}
+
+/**
+ * The settings a cleanup item was approved under must still hold before anything
+ * destructive happens: the feature on, out of dry run, and its rules unchanged.
+ * After the destructive step only the replacement search remains, which is finished
+ * whatever the settings say now.
+ */
+function assertCleanupPolicyCurrent(config, candidate) {
+  const feature = FEATURE_BY_RULE[candidate.rule];
+  if (!feature) throw new Error(`Unknown download cleanup rule ${candidate.rule}.`);
+  const policy = config[feature.key];
+  if (policy?.enabled !== true) throw new Error(`${feature.label} was turned off before this download was acted on, so it was preserved.`);
+  if (policy.dryRun !== false) throw new Error(`${feature.label} was switched to dry run before this download was acted on, so it was preserved.`);
+  if (automationPolicyIdentity(config, feature.key) !== candidate.policyIdentity) {
+    throw new Error(`${feature.label}'s settings changed after this download was judged, so it was preserved. The next check decides again.`);
+  }
+  return feature;
+}
+
+function assertCleanupConnectionsUnchanged(job, config, app) {
+  const expected = job.connectionIdentities;
+  const fresh = recoveryConnectionIdentities(config);
+  if (!expected || expected.qbittorrent !== fresh.qbittorrent) {
+    throw new Error('The qBittorrent connection changed after detection, so the download was preserved.');
+  }
+  if (app !== 'qbittorrent' && (!config[app]?.configured || job.connectionUrls?.[app] !== config[app].url
+    || (expected[app] !== undefined && expected[app] !== fresh[app]))) {
+    throw new Error(`The ${app} API connection changed after detection, so the download was preserved.`);
+  }
+}
+
+async function cleanupContext(config, client) {
+  return { client, queueByHash: await loadQueues(config), now: Date.now(), commit: false, inspected: null };
+}
+
+async function freshTorrent(client, hash) {
+  const matches = (await client.torrents([hash])).filter((torrent) => normalizedHash(torrent.hash) === normalizedHash(hash));
+  if (matches.length > 1) throw new Error('qBittorrent returned duplicate torrents for one hash.');
+  return matches[0] ?? null;
+}
+
+function removalOutcome(candidate) {
+  return candidate.keepInClient
+    ? `${candidate.reason} Removed from ${candidate.app} and blocklisted (still seeding in qBittorrent); replacement search queued.`
+    : `${candidate.reason} Removed, blocklisted, and replacement search queued.`;
+}
+
+async function cleanupStillListed(config, candidate) {
+  if (candidate.keepInClient) return (await loadQueues(config)).has(normalizedHash(candidate.hash));
+  return Boolean(await currentRecoveryTorrent(config, candidate));
+}
+
+// Removal through Arr, for failed imports and fully blocked torrents. The phases and
+// their crash reconciliation are recovery's, so an interrupted removal is proven from
+// Arr's history and never simply repeated.
+async function processCleanupArrRemoval(job, item, config, feature) {
+  let latest = item;
+  const { candidate } = latest;
+  const connection = config[candidate.app];
+  if (!connection?.configured) throw new Error(`${candidate.app} is no longer configured.`);
+  const outcome = removalOutcome(candidate);
+  const where = candidate.keepInClient ? `${candidate.app}'s queue` : 'qBittorrent';
+
+  if (latest.phase === 'search_requested' || latest.phase === 'removed_confirmed') {
+    await finishRecoverySearch(job, latest, config, outcome);
+    return;
+  }
+  if (latest.phase === 'delete_requested') {
+    if (!latest.deleteStartedAt) throw new Error('The interrupted Arr removal has no reconciliation timestamp. It was not repeated.');
+    if (await cleanupStillListed(config, candidate)) {
+      throw new Error(`The interrupted Arr removal is unresolved and ${where} still lists the download. It was not repeated.`);
+    }
+    if (!await hasArrDownloadFailedSince(connection, candidate.downloadId, latest.deleteStartedAt)) {
+      throw new Error('The interrupted Arr removal has no matching blocklist evidence. It was not repeated.');
+    }
+    latest = await updateItem(job.id, item.id, (value) => {
+      value.status = 'removed';
+      value.phase = 'arr_removed';
+    }).then((value) => value.items.find((entry) => entry.id === item.id));
+  }
+
+  if (latest.phase !== 'arr_removed') {
+    const torrent = await currentRecoveryTorrent(config, candidate);
+    if (!torrent) throw new Error('The torrent disappeared before Keelhaularr acted on it, so nothing was removed or searched.');
+    await withQbittorrent(config.qbittorrent, async (client) => {
+      await feature.revalidate(config, candidate, torrent, await cleanupContext(config, client));
+    });
+    assertSameOwnership(await resolveQbittorrentRecoveryOwnership(config, torrent), candidate);
+    const freshConfig = configProvider?.() ?? config;
+    assertCleanupPolicyCurrent(freshConfig, candidate);
+    assertCleanupConnectionsUnchanged(job, freshConfig, candidate.app);
+    const deleteStartedAt = new Date().toISOString();
+    await updateItem(job.id, item.id, (value) => {
+      value.status = 'deleting';
+      value.phase = 'delete_requested';
+      value.deleteStartedAt = deleteStartedAt;
+      value.error = null;
+    });
+    try {
+      await removeQbittorrentRecoveryFromArr(freshConfig[candidate.app], candidate.queueId, {
+        removeFromClient: !candidate.keepInClient,
+      });
+    } catch (error) {
+      if (error.statusCode !== 404) throw error;
+      const settled = !await cleanupStillListed(freshConfig, candidate)
+        && await hasArrDownloadFailedSince(freshConfig[candidate.app], candidate.downloadId, deleteStartedAt);
+      if (!settled) throw error;
+    }
+    await updateItem(job.id, item.id, (value) => {
+      value.status = 'removed';
+      value.phase = 'arr_removed';
+      value.outcome = 'Arr removed and blocklisted the download.';
+    });
+  }
+
+  if (await cleanupStillListed(config, candidate)) {
+    throw new Error(`Arr accepted the removal, but ${where} still lists the download. No replacement search was queued.`);
+  }
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'removed';
+    value.phase = 'removed_confirmed';
+    value.outcome = 'Removal confirmed; preparing replacement search.';
+  });
+  await finishRecoverySearch(job, currentItem(job, item), config, outcome);
+}
+
+// Sets blocked files to "do not download". Repeating it is harmless, so an interrupted
+// item simply runs again from the start.
+async function processCleanupSkipFiles(job, item, config, feature, client) {
+  const { candidate } = item;
+  const torrent = await freshTorrent(client, candidate.hash);
+  await feature.revalidate(config, candidate, torrent, await cleanupContext(config, client));
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'processing';
+    value.phase = 'skipping_files';
+    value.error = null;
+  });
+  await client.setFilePriority(candidate.hash, candidate.fileIndexes, 0);
+  const files = await client.files(candidate.hash);
+  const missed = candidate.fileIndexes.filter((index) => files.find((file) => file.index === index)?.priority !== 0);
+  if (missed.length) throw new Error(`qBittorrent did not apply "do not download" to ${missed.length} blocked file(s).`);
+  const names = (candidate.blockedFiles ?? []).slice(0, 3).map((file) => `${file.name.split('/').pop()} (${file.pattern})`);
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'complete';
+    value.phase = 'files_skipped';
+    value.outcome = `${candidate.reason} Set to do not download: ${names.join(', ')}${candidate.fileIndexes.length > names.length ? ` and ${candidate.fileIndexes.length - names.length} more` : ''}.`;
+  });
+  await notifyDownloadEvent(config, {
+    kind: 'files-skipped', rule: candidate.rule, title: candidate.title, reason: candidate.reason, fileCount: candidate.fileIndexes.length,
+  });
+}
+
+const CLIENT_REMOVAL_CONFIRM_ATTEMPTS = 5;
+
+// Removes a finished torrent from qBittorrent. Re-judged on the spot - including whether
+// deleting its files could lose a last copy - and confirmed gone afterwards.
+async function processCleanupClientRemoval(job, item, config, feature, client) {
+  const { candidate } = item;
+  let torrent = await freshTorrent(client, candidate.hash);
+  if (!torrent) {
+    if (item.phase === 'delete_requested') {
+      await updateItem(job.id, item.id, (value) => {
+        value.status = 'complete';
+        value.phase = 'removed_confirmed';
+        value.outcome = `${candidate.reason} Removal confirmed after interruption.`;
+      });
+      return;
+    }
+    throw new Error('The torrent disappeared before Keelhaularr acted on it, so nothing was removed.');
+  }
+  const verdict = await feature.revalidate(config, candidate, torrent, await cleanupContext(config, client));
+  const freshConfig = configProvider?.() ?? config;
+  assertCleanupPolicyCurrent(freshConfig, candidate);
+  assertCleanupConnectionsUnchanged(job, freshConfig, 'qbittorrent');
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'deleting';
+    value.phase = 'delete_requested';
+    value.deleteStartedAt = new Date().toISOString();
+    value.candidate.sizeBytes = verdict.freedBytes ?? 0;
+    value.error = null;
+  });
+  await client.deleteTorrent(candidate.hash, candidate.deleteFiles);
+  for (let attempt = 0; attempt < CLIENT_REMOVAL_CONFIRM_ATTEMPTS; attempt += 1) {
+    torrent = await freshTorrent(client, candidate.hash);
+    if (!torrent) break;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  if (torrent) throw new Error('qBittorrent accepted the removal but still lists the torrent.');
+  const freed = candidate.deleteFiles ? verdict.freedBytes ?? 0 : 0;
+  await updateItem(job.id, item.id, (value) => {
+    value.status = 'complete';
+    value.phase = 'removed_confirmed';
+    value.removal = freed > 0 ? 'deleted' : null;
+    value.outcome = `${candidate.reason} Removed from qBittorrent${candidate.deleteFiles
+      ? ` with its files${freed > 0 ? `, freeing ${formatGib(freed)}` : '; the library keeps its own hardlinks, so no space changed hands'}`
+      : ', files kept'}.`;
+  });
+  await notifyDownloadEvent(config, removedEvent(candidate, { blocklisted: false, searched: false }));
+}
+
+async function processDownloadCleanupItem(job, item, config) {
+  const latest = currentItem(job, item);
+  if (!latest || latest.status === 'complete') return;
+  const { candidate } = latest;
+  const feature = POST_MUTATION_RECOVERY_PHASES.has(latest.phase)
+    ? FEATURE_BY_RULE[candidate.rule]
+    : assertCleanupPolicyCurrent(config, candidate);
+  if (!feature) throw new Error(`Unknown download cleanup rule ${candidate.rule}.`);
+  if (candidate.action === 'arr-remove') {
+    await processCleanupArrRemoval(job, latest, config, feature);
+    return;
+  }
+  await withQbittorrent(config.qbittorrent, async (client) => {
+    if (candidate.action === 'skip-files') await processCleanupSkipFiles(job, latest, config, feature, client);
+    else if (candidate.action === 'client-remove') await processCleanupClientRemoval(job, latest, config, feature, client);
+    else throw new Error(`Unsupported download cleanup action ${candidate.action}.`);
+  });
+}
+
 async function processJob(job) {
   await updateJob(job.id, (value) => {
     value.status = value.cancelRequested ? 'cancelling' : 'running';
@@ -1012,6 +1329,10 @@ async function processJob(job) {
         if (job.policyIdentity !== qbittorrentRecoveryPolicyIdentity(config)) {
           throw new Error('The qBittorrent recovery policy changed after detection. A fresh observation window is required.');
         }
+        eligibleIds = new Set(job.items.map((item) => item.candidate.id));
+        break;
+      case 'download-cleanup':
+        // Every item is judged again on its own, immediately before it is acted on.
         eligibleIds = new Set(job.items.map((item) => item.candidate.id));
         break;
       default:
@@ -1064,6 +1385,9 @@ async function processJob(job) {
         case 'qbittorrent-recovery':
           if (validationError) throw new Error(validationError);
           await processQbittorrentRecoveryItem(currentJob, item, config);
+          break;
+        case 'download-cleanup':
+          await processDownloadCleanupItem(currentJob, item, config);
           break;
         default:
           throw new Error(`Unsupported job type: ${currentJob.type}`);

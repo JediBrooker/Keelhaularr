@@ -3,6 +3,13 @@ import { readFileSync } from 'node:fs';
 import { chmod, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
+import {
+  contentBlockerPolicy,
+  failedImportPolicy,
+  ignoreListPolicy,
+  seedingCleanupPolicy,
+  unlinkedCleanupPolicy,
+} from './automation-config.mjs';
 import { hashPassword, isHashedPassword } from './passwords.mjs';
 import { rootAccessProblem } from './root-access.mjs';
 
@@ -20,6 +27,11 @@ const SETTINGS_KEYS = new Set([
   'QBITTORRENT_RECOVERY_ENABLED', 'QBITTORRENT_RECOVERY_SLOW_KIB_PER_SECOND',
   'QBITTORRENT_RECOVERY_SLOW_MINUTES', 'QBITTORRENT_RECOVERY_STALLED_MINUTES',
   'QBITTORRENT_RECOVERY_METADATA_MINUTES', 'QBITTORRENT_RECOVERY_EXCLUDED_CATEGORIES_JSON',
+  'QBITTORRENT_RECOVERY_IGNORE_SLOW_ALT_SPEED',
+  'DOWNLOAD_IGNORE_JSON', 'STRIKE_INACTIVITY_HOURS', 'FAILED_IMPORT_JSON', 'CONTENT_BLOCKER_JSON',
+  'SEEDING_CLEANUP_JSON', 'UNLINKED_CLEANUP_JSON',
+  'NTFY_URL', 'NTFY_TOKEN', 'NTFY_PRIORITY', 'NTFY_DOWNLOAD_EVENTS', 'NTFY_SCAN_REPORTS',
+  'NOTIFICATION_DOWNLOAD_EVENTS',
   'ORPHAN_ACTION', 'ORPHAN_TRASH_DIR', 'ALLOW_PERMANENT_ORPHAN_DELETE',
   'ORPHAN_IGNORE_DIRECTORIES', 'ORPHAN_MAX_FILES', 'MEDIA_EXTENSIONS', 'HARDLINK_MIN_AGE_HOURS',
   'QUARANTINE_RETENTION_DAYS', 'OVERSIZE_REQUIRE_REPLACEMENT', 'ORPHAN_AUTO_IDENTIFY',
@@ -301,7 +313,62 @@ function qbittorrentOverrides(input, output) {
       recovery.excludedCategories,
       'qBittorrent recovery excluded categories',
     ));
+    if (recovery.ignoreSlowWhenAltSpeed !== undefined) {
+      output.QBITTORRENT_RECOVERY_IGNORE_SLOW_ALT_SPEED = String(booleanValue(
+        recovery.ignoreSlowWhenAltSpeed, 'Ignore slow downloads while alternative speed limits are on',
+      ));
+    }
   }
+}
+
+// Each automation is validated by the same function that reads it back, so nothing can
+// be saved that would fail to load.
+const AUTOMATION_POLICIES = [
+  ['failedImports', 'FAILED_IMPORT_JSON', failedImportPolicy],
+  ['contentBlocker', 'CONTENT_BLOCKER_JSON', contentBlockerPolicy],
+  ['seedingCleanup', 'SEEDING_CLEANUP_JSON', seedingCleanupPolicy],
+  ['unlinkedCleanup', 'UNLINKED_CLEANUP_JSON', unlinkedCleanupPolicy],
+];
+
+function automationOverrides(input, output) {
+  if (input === undefined) return;
+  const settings = requiredObject(input, 'Download automation');
+  if (settings.downloadIgnore !== undefined) {
+    output.DOWNLOAD_IGNORE_JSON = JSON.stringify(ignoreListPolicy(settings.downloadIgnore, 'Global ignore list'));
+  }
+  if (settings.strikeInactivityHours !== undefined) {
+    output.STRIKE_INACTIVITY_HOURS = numberValue(
+      settings.strikeInactivityHours, 'Strike inactivity window', { min: 1, max: 8760, integer: true },
+    ).toString();
+  }
+  for (const [field, key, parser] of AUTOMATION_POLICIES) {
+    if (settings[field] !== undefined) output[key] = JSON.stringify(parser(settings[field]));
+  }
+  const needsQbittorrent = AUTOMATION_POLICIES.some(([field]) => settings[field]?.enabled === true);
+  if (needsQbittorrent && !configuredString('QBITTORRENT_URL', output).trim()) {
+    inputError('The download automations need a configured qBittorrent connection.');
+  }
+}
+
+function ntfyOverrides(input, output) {
+  if (input === undefined) return;
+  const settings = requiredObject(input, 'ntfy');
+  const url = urlValue(settings.url ?? '', 'ntfy URL');
+  const clearUrl = booleanValue(settings.clearUrl ?? false, 'Clear ntfy URL');
+  if (url && clearUrl) inputError('The ntfy URL cannot be replaced and cleared at the same time.');
+  if (url && new URL(url).pathname.split('/').filter(Boolean).length === 0) {
+    inputError('The ntfy URL must include the topic, for example https://ntfy.sh/my-topic.');
+  }
+  const token = secretValue(settings.token ?? '', 'ntfy access token', { allowEmpty: true, max: 1024 });
+  const clearToken = booleanValue(settings.clearToken ?? false, 'Clear ntfy access token');
+  if (token && clearToken) inputError('The ntfy token cannot be replaced and cleared at the same time.');
+  if (url) output.NTFY_URL = url;
+  if (clearUrl) output.NTFY_URL = '';
+  if (token) output.NTFY_TOKEN = token;
+  if (clearToken) output.NTFY_TOKEN = '';
+  output.NTFY_PRIORITY = numberValue(settings.priority ?? 3, 'ntfy priority', { min: 1, max: 5, integer: true }).toString();
+  output.NTFY_DOWNLOAD_EVENTS = String(booleanValue(settings.downloadEvents ?? true, 'ntfy download notifications'));
+  output.NTFY_SCAN_REPORTS = String(booleanValue(settings.scanReports ?? false, 'ntfy scan reports'));
 }
 
 export function getSettingsOverrides() {
@@ -453,6 +520,23 @@ export function settingsView(config) {
       notificationType: config.schedule.notificationType,
       webhookConfigured: Boolean(config.schedule.webhookUrl),
       notifyWhenClear: config.schedule.notifyWhenClear,
+      downloadEvents: config.schedule.downloadEvents === true,
+    },
+    automation: {
+      downloadIgnore: config.downloadIgnore,
+      strikeInactivityHours: config.strikes?.inactivityHours ?? 24,
+      failedImports: config.failedImports,
+      contentBlocker: config.contentBlocker,
+      seedingCleanup: config.seedingCleanup,
+      unlinkedCleanup: config.unlinkedCleanup,
+    },
+    ntfy: {
+      // Write-only, like the webhook: the topic is what keeps a public ntfy topic private.
+      urlConfigured: Boolean(config.ntfy?.url),
+      tokenConfigured: Boolean(config.ntfy?.token),
+      priority: config.ntfy?.priority ?? 3,
+      downloadEvents: config.ntfy?.downloadEvents !== false,
+      scanReports: config.ntfy?.scanReports === true,
     },
     server: {
       port: config.port,
@@ -495,6 +579,8 @@ export function buildSettingsOverrides(input, currentOverrides) {
   const sonarrPaths = connectionOverrides('sonarr', root.sonarr, output);
   qbittorrentOverrides(root.qbittorrent, output);
   mediaServerOverrides(root.mediaServer, output);
+  automationOverrides(root.automation, output);
+  ntfyOverrides(root.ntfy, output);
   if (configuredBoolean('QBITTORRENT_RECOVERY_ENABLED', output)) {
     if (!configuredString('QBITTORRENT_URL', output).trim()) {
       inputError('qBittorrent automatic recovery requires a configured qBittorrent connection.');
@@ -571,6 +657,9 @@ export function buildSettingsOverrides(input, currentOverrides) {
   if (!['generic', 'discord', 'gotify'].includes(notificationType)) inputError('Notification type must be generic, Discord, or Gotify.');
   output.NOTIFICATION_TYPE = notificationType;
   output.NOTIFICATION_WHEN_CLEAR = String(booleanValue(schedule.notifyWhenClear, 'Notify when clear'));
+  if (schedule.downloadEvents !== undefined) {
+    output.NOTIFICATION_DOWNLOAD_EVENTS = String(booleanValue(schedule.downloadEvents, 'Webhook download notifications'));
+  }
   const webhookUrl = urlValue(schedule.webhookUrl ?? '', 'Notification webhook URL');
   const clearWebhook = booleanValue(schedule.clearWebhook ?? false, 'Clear notification webhook');
   if (webhookUrl && clearWebhook) inputError('Notification webhook cannot be replaced and cleared at the same time.');

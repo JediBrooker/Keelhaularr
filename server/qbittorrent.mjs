@@ -6,6 +6,9 @@ const MAX_TORRENT_HASH_LENGTH = 128;
 const MAX_TORRENT_STATE_LENGTH = 64;
 const MAX_TORRENT_PATH_LENGTH = 4096;
 const METADATA_PENDING_STATES = new Set(['metaDL', 'forcedMetaDL']);
+const COMPLETE_STATES = new Set([
+  'uploading', 'stalledUP', 'pausedUP', 'stoppedUP', 'queuedUP', 'forcedUP',
+]);
 
 const REQUEST_TIMEOUT_MS = 15000;
 
@@ -60,7 +63,7 @@ async function login(connection) {
 
 async function withSession(connection, work) {
   const cookie = await login(connection);
-  const request = async (endpoint, { method = 'GET', accept = 'application/json' } = {}) => {
+  const request = async (endpoint, { method = 'GET', accept = 'application/json', body } = {}) => {
     const response = await fetch(endpointUrl(connection, endpoint), {
       method,
       redirect: 'error',
@@ -69,8 +72,10 @@ async function withSession(connection, work) {
         Accept: accept,
         Origin: new URL(connection.url).origin,
         Referer: `${connection.url}/`,
+        ...(body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
         ...(cookie ? { Cookie: cookie } : {}),
       },
+      ...(body ? { body: new URLSearchParams(body) } : {}),
     });
     if (!response.ok) {
       const detail = (await response.text()).slice(0, 300);
@@ -117,6 +122,16 @@ function normalizeRecoveryTorrent(torrent) {
   const amountLeft = validNumber(raw.amount_left, { integer: true });
   const addedOn = validNumber(raw.added_on, { integer: true });
   const lastActivity = validNumber(raw.last_activity, { integer: true });
+  const ratio = validNumber(raw.ratio);
+  const seedingTime = validNumber(raw.seeding_time, { integer: true });
+  const completionOn = typeof raw.completion_on === 'number' && Number.isInteger(raw.completion_on)
+    ? raw.completion_on : null;
+  const contentPath = typeof raw.content_path === 'string' && raw.content_path.length <= MAX_TORRENT_PATH_LENGTH
+    ? raw.content_path : null;
+  // Newer qBittorrent reports `private` in the list itself; older versions only in each
+  // torrent's properties, so null here means "not known yet", never "public".
+  const privateFlag = typeof raw.private === 'boolean' ? raw.private
+    : typeof raw.is_private === 'boolean' ? raw.is_private : null;
 
   return {
     hash,
@@ -131,6 +146,15 @@ function normalizeRecoveryTorrent(torrent) {
     addedOn,
     last_activity: lastActivity,
     lastActivity,
+    ratio,
+    seedingTime,
+    completionOn,
+    numComplete: validNumber(raw.num_complete, { integer: true }),
+    sizeBytes: validNumber(raw.total_size, { integer: true }) ?? validNumber(raw.size, { integer: true }),
+    tags: typeof raw.tags === 'string' ? raw.tags.split(',').map((tag) => tag.trim()).filter(Boolean) : [],
+    contentPath,
+    savePath: typeof raw.save_path === 'string' && raw.save_path.length <= MAX_TORRENT_PATH_LENGTH ? raw.save_path : null,
+    private: privateFlag,
     recoveryFieldsValid: hash !== null
       && name !== null
       && category !== null
@@ -141,6 +165,97 @@ function normalizeRecoveryTorrent(torrent) {
       && addedOn !== null
       && lastActivity !== null,
   };
+}
+
+export function normalizeQbittorrentTorrent(torrent) {
+  return normalizeRecoveryTorrent(torrent);
+}
+
+/**
+ * Whether a torrent is finished in every way that matters for removing it: nothing left
+ * to download and a state that only a finished torrent can be in. Anything malformed or
+ * unknown answers false, so the cleanup rules leave it alone.
+ */
+export function torrentIsComplete(torrent) {
+  return torrent?.recoveryFieldsValid === true
+    && torrent.amount_left === 0
+    && torrent.progress === 1
+    && COMPLETE_STATES.has(torrent.state);
+}
+
+function fileEntries(payload) {
+  if (!Array.isArray(payload)) throw apiError('qBittorrent returned an invalid file list.');
+  return payload.map((file, position) => {
+    const index = Number.isInteger(file?.index) && file.index >= 0 ? file.index : position;
+    const name = typeof file?.name === 'string' ? file.name : null;
+    const size = validNumber(file?.size, { integer: true });
+    const priority = Number.isInteger(file?.priority) ? file.priority : null;
+    const progress = validNumber(file?.progress, { maximum: 1 });
+    if (name === null || size === null || priority === null) throw apiError('qBittorrent returned a malformed file entry.');
+    return { index, name, size, priority, progress };
+  });
+}
+
+/**
+ * One authenticated qBittorrent session for a batch of reads and writes. The automation
+ * features read the torrent list, file lists and flags together, so they share a login
+ * rather than paying for one per request.
+ */
+export async function withQbittorrent(connection, work) {
+  assertConfigured(connection);
+  return withSession(connection, async (request) => {
+    const client = {
+      async torrents(hashes = null) {
+        const query = hashes?.length ? `?hashes=${encodeURIComponent(hashes.join('|'))}` : '';
+        return (await readTorrentList(request, query)).map(normalizeRecoveryTorrent);
+      },
+      async files(hash) {
+        const response = await request(`torrents/files?hash=${encodeURIComponent(hash)}`);
+        return fileEntries(await response.json());
+      },
+      async isPrivate(torrent) {
+        if (typeof torrent?.private === 'boolean') return torrent.private;
+        try {
+          const response = await request(`torrents/properties?hash=${encodeURIComponent(torrent.hash)}`);
+          const properties = await response.json();
+          return typeof properties?.is_private === 'boolean' ? properties.is_private : null;
+        } catch {
+          return null;
+        }
+      },
+      async setFilePriority(hash, indexes, priority) {
+        if (!indexes.length) return;
+        await request('torrents/filePrio', {
+          method: 'POST',
+          accept: 'text/plain',
+          body: { hash, id: indexes.join('|'), priority: String(priority) },
+        });
+      },
+      async deleteTorrent(hash, deleteFiles) {
+        await request('torrents/delete', {
+          method: 'POST',
+          accept: 'text/plain',
+          body: { hashes: hash, deleteFiles: deleteFiles ? 'true' : 'false' },
+        });
+      },
+      async alternativeSpeedActive() {
+        const response = await request('transfer/speedLimitsMode', { accept: 'text/plain' });
+        return (await response.text()).trim() === '1';
+      },
+      async preferences() {
+        const response = await request('app/preferences');
+        return response.json();
+      },
+      async setPreferences(values) {
+        await request('app/setPreferences', {
+          method: 'POST',
+          accept: 'text/plain',
+          body: { json: JSON.stringify(values) },
+        });
+      },
+    };
+    return work(client);
+  });
 }
 
 export async function listQbittorrentTorrents(connection) {
