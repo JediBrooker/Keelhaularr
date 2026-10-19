@@ -829,7 +829,7 @@ This policy does not make guesses from names, paths, categories, or a generic
 the hash and qBittorrent-backed Arr ownership proof remain mandatory for every
 non-excluded candidate.
 
-A status line under the switch in **Settings → Automation** says what recovery
+A status line under the switch in **Settings → Downloads** says what recovery
 is doing, from the server's own record of its last check:
 - whether it is off, waiting for a saved qBittorrent or Arr connection, or unable to reach qBittorrent
 - how many torrents it is watching, by reason, and how many are past their limit or being replaced
@@ -858,7 +858,8 @@ losing it only ever keeps more torrents.
 ## Download automation
 
 Four further automations act on qBittorrent downloads. They are configured in
-**Settings → Automation**, and each one:
+**Settings → Downloads**, next to automatic recovery; links at the top of that tab
+jump to each feature. Each one:
 
 - is **off by default**, and when switched on starts in **dry run**, which records
   what it would do and why while changing nothing
@@ -1120,7 +1121,7 @@ automatically imported or purged.
 
 ## Scheduled reports and notifications
 
-Configure these in **Settings → Scans & notifications**, then view the latest
+Configure these, and ntfy, in **Settings → Schedule & alerts**, then view the latest
 result or run a report now under **Operations → Schedule**:
 
 ```dotenv

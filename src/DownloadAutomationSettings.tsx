@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { ReactNode, useEffect, useState } from 'react';
 
 // Settings and status for the download automations that took over from Cleanuparr:
 // failed-import cleanup, the content blocker, seeding cleanup, unlinked-torrent cleanup,
@@ -373,20 +373,37 @@ function FeatureHead({ chip, title, enabled, dryRun, description, onEnabled, onD
   </>;
 }
 
-export function DownloadAutomationSettings({ form, ntfy, categories, statusRevision, onChange, onNtfyChange }: {
+// The sections of the Downloads tab, in page order, for the jump links at the top: the
+// tab is several screens long, and a feature below the fold is easy to miss entirely.
+const SECTION_LINKS: Array<[string, string]> = [
+  ['downloads-recovery', 'Automatic replacement'],
+  ['downloads-failed-imports', 'Failed imports'],
+  ['downloads-content-blocker', 'Content blocker'],
+  ['downloads-seeding', 'Seeding cleanup'],
+  ['downloads-unlinked', 'Unlinked torrents'],
+];
+
+function jumpTo(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+/**
+ * The Downloads tab: shared rules first, because the global ignore list governs
+ * everything after it, then automatic replacement (passed in as `children`, since it
+ * lives with the qBittorrent form), then the four download automations.
+ */
+export function DownloadAutomationSettings({ form, categories, statusRevision, onChange, children }: {
   form: AutomationForm;
-  ntfy: NtfyForm;
   categories: string[];
   statusRevision: number;
   onChange: (next: AutomationForm) => void;
-  onNtfyChange: (next: NtfyForm) => void;
+  children?: ReactNode;
 }) {
   const [status, setStatus] = useState<Partial<Record<FeatureKey, FeatureStatus>>>({});
   const [statusError, setStatusError] = useState('');
   const [preview, setPreview] = useState<{ previewedAt: string; features: Partial<Record<FeatureKey, { error: string | null; decisions: Decision[] }>> } | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [previewError, setPreviewError] = useState('');
-  const [ntfyMessage, setNtfyMessage] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -407,16 +424,6 @@ export function DownloadAutomationSettings({ form, ntfy, categories, statusRevis
       setPreviewError(error instanceof Error ? error.message : String(error));
     } finally {
       setPreviewing(false);
-    }
-  }
-
-  async function testNtfy() {
-    setNtfyMessage('Sending…');
-    try {
-      await request('/api/notifications/ntfy/test', { method: 'POST', body: JSON.stringify({ url: ntfy.url.trim(), token: ntfy.token }) });
-      setNtfyMessage('Test notification sent.');
-    } catch (error) {
-      setNtfyMessage(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -444,6 +451,11 @@ export function DownloadAutomationSettings({ form, ntfy, categories, statusRevis
           <button type="button" className="ghost-button compact" onClick={runPreview} disabled={previewing}>{previewing ? 'Previewing…' : 'Preview all'}</button>
         </div>
       </div>
+      <nav className="automation-jump" aria-label="Download automation sections">
+        {SECTION_LINKS.filter(([id]) => id !== 'downloads-recovery' || children).map(([id, label]) => (
+          <button type="button" className="ghost-button compact" key={id} onClick={() => jumpTo(id)}>{label}</button>
+        ))}
+      </nav>
       <p className="field-hint">Preview judges every feature below against qBittorrent and Radarr/Sonarr right now, as if each were on and in dry run, using the saved settings. It adds no strikes and changes nothing.</p>
       {previewError && <p className="notice error" role="alert">{previewError}</p>}
       {statusError && <p className="notice error" role="alert">Could not read the automation status: {statusError}</p>}
@@ -453,7 +465,9 @@ export function DownloadAutomationSettings({ form, ntfy, categories, statusRevis
       <IgnoreEditor title="Global ignore list: never touched by any automation, including automatic replacement" value={form.downloadIgnore} categories={categories} onChange={(next) => onChange({ ...form, downloadIgnore: next })} />
     </section>
 
-    <section className="settings-section">
+    {children && <div id="downloads-recovery" className="automation-anchor">{children}</div>}
+
+    <section className="settings-section automation-anchor" id="downloads-failed-imports">
       <FeatureHead chip="Arr" title="Failed-import cleanup" enabled={failed.enabled} dryRun={failed.dryRun}
         description="Removes finished downloads that Radarr/Sonarr cannot import, after a forced import and a number of strikes. Each is blocklisted and searched for again."
         onEnabled={(enabled) => set('failedImports', { enabled })} onDryRun={(dryRun) => set('failedImports', { dryRun })} />
@@ -470,7 +484,7 @@ export function DownloadAutomationSettings({ form, ntfy, categories, statusRevis
       <IgnoreEditor title="Failed-import ignore list" value={failed.ignore} categories={categories} onChange={(ignore) => set('failedImports', { ignore })} />
     </section>
 
-    <section className="settings-section">
+    <section className="settings-section automation-anchor" id="downloads-content-blocker">
       <FeatureHead chip="qBittorrent" title="Content blocker" enabled={blocker.enabled} dryRun={blocker.dryRun}
         description="Sets blocked files in new Radarr/Sonarr torrents to do not download. A torrent whose every file is blocked is removed, blocklisted, and searched for again."
         onEnabled={(enabled) => set('contentBlocker', { enabled })} onDryRun={(dryRun) => set('contentBlocker', { dryRun })} />
@@ -489,7 +503,7 @@ export function DownloadAutomationSettings({ form, ntfy, categories, statusRevis
       <IgnoreEditor title="Content blocker ignore list" value={blocker.ignore} categories={categories} onChange={(ignore) => set('contentBlocker', { ignore })} />
     </section>
 
-    <section className="settings-section">
+    <section className="settings-section automation-anchor" id="downloads-seeding">
       <FeatureHead chip="qBittorrent" title="Seeding cleanup" enabled={seeding.enabled} dryRun={seeding.dryRun}
         description="Removes finished torrents once their category's rule says they have seeded enough. Never touches an incomplete torrent or one Radarr/Sonarr has not imported yet."
         onEnabled={(enabled) => set('seedingCleanup', { enabled })} onDryRun={(dryRun) => set('seedingCleanup', { dryRun })} />
@@ -518,7 +532,7 @@ export function DownloadAutomationSettings({ form, ntfy, categories, statusRevis
       <IgnoreEditor title="Seeding cleanup ignore list" value={seeding.ignore} categories={categories} onChange={(ignore) => set('seedingCleanup', { ignore })} />
     </section>
 
-    <section className="settings-section">
+    <section className="settings-section automation-anchor" id="downloads-unlinked">
       <FeatureHead chip="qBittorrent" title="Unlinked-torrent cleanup" enabled={unlinked.enabled} dryRun={unlinked.dryRun}
         description="Removes finished torrents whose media files are no longer hardlinked into any library, once Radarr/Sonarr has recorded importing them."
         onEnabled={(enabled) => set('unlinkedCleanup', { enabled })} onDryRun={(dryRun) => set('unlinkedCleanup', { dryRun })} />
@@ -534,7 +548,25 @@ export function DownloadAutomationSettings({ form, ntfy, categories, statusRevis
       <label className="check-row"><input type="checkbox" checked={unlinked.deleteFiles} onChange={(event) => set('unlinkedCleanup', { deleteFiles: event.target.checked })} />Delete the files too (this is what frees the space)</label>
       <IgnoreEditor title="Unlinked cleanup ignore list" value={unlinked.ignore} categories={categories} onChange={(ignore) => set('unlinkedCleanup', { ignore })} />
     </section>
+  </>;
+}
 
+// ntfy lives with the webhook on the Schedule & alerts tab: it sends scan reports as well
+// as download events, so it belongs with the other notifications.
+export function NtfySection({ ntfy, onNtfyChange }: { ntfy: NtfyForm; onNtfyChange: (next: NtfyForm) => void }) {
+  const [ntfyMessage, setNtfyMessage] = useState('');
+
+  async function testNtfy() {
+    setNtfyMessage('Sending…');
+    try {
+      await request('/api/notifications/ntfy/test', { method: 'POST', body: JSON.stringify({ url: ntfy.url.trim(), token: ntfy.token }) });
+      setNtfyMessage('Test notification sent.');
+    } catch (error) {
+      setNtfyMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  return (
     <section className="settings-section">
       <div className="settings-section-head"><div><p className="eyebrow">NOTIFICATIONS</p><h3>ntfy</h3></div></div>
       <div className="settings-grid three">
@@ -548,5 +580,5 @@ export function DownloadAutomationSettings({ form, ntfy, categories, statusRevis
       {ntfy.tokenConfigured && <label className="check-row"><input type="checkbox" checked={ntfy.clearToken} onChange={(event) => onNtfyChange({ ...ntfy, clearToken: event.target.checked })} />Remove saved access token</label>}
       <div className="automation-actions"><button type="button" className="ghost-button compact" onClick={testNtfy} disabled={!ntfy.url.trim() && !ntfy.urlConfigured}>Send test notification</button>{ntfyMessage && <span role="status">{ntfyMessage}</span>}</div>
     </section>
-  </>;
+  );
 }
