@@ -9,6 +9,7 @@ import {
   discoverMediaServerLibraries,
   inspectMediaServer,
   mapMediaServerPath,
+  mediaServerProblem,
   watchedPathMatch,
 } from './mediaserver.mjs';
 
@@ -195,7 +196,7 @@ test('the watch guard withholds a watched file and permits an unwatched one', as
   await assertNotRecentlyWatched(config, { path: '/movies/Untouched/Untouched.mkv' });
 });
 
-test('media-server connection failures say what went wrong and what to change', async (context) => {
+test('media-server connection failures say what went wrong and what to change', () => {
   const failure = (code) => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(code), { code }) });
 
   // localhost inside the container is Keelhaularr, the most common Plex mistake.
@@ -206,12 +207,70 @@ test('media-server connection failures say what went wrong and what to change', 
   assert.match(describeFetchFailure(failure('DEPTH_ZERO_SELF_SIGNED_CERT'), 'https://192.168.1.20:32400/'), /plex\.direct/);
   assert.match(describeFetchFailure(Object.assign(new Error('timed out'), { name: 'TimeoutError' }), 'http://10.0.0.5:32400/'), /did not answer/);
 
-  // A rejected token is named as such rather than as a bare status code.
+});
+
+test('a refused token says why and how to replace it, on every file it blocks', async (context) => {
   const rejecting = await stubServer((request, response) => response.writeHead(401).end());
   context.after(() => rejecting.close());
+  // Stands in for plex.tv, which is the only one that can say whether the token was
+  // signed out or belongs to someone who is not the owner.
+  const accountTokens = [];
+  const plexTv = await stubServer((request, response) => {
+    accountTokens.push(request.headers['x-plex-token']);
+    if (request.headers['x-plex-token'] === 'shared-user') return json(response, { id: 1 });
+    response.writeHead(401).end();
+  });
+  context.after(() => plexTv.close());
+  const plex = (token, plexAccountUrl) => ({
+    configured: true, kind: 'plex', url: rejecting.url, token, watchedWithinDays: 30, pathMaps: [], plexAccountUrl,
+  });
+
+  await assert.rejects(inspectMediaServer(plex('revoked', plexTv.url)), (error) => {
+    assert.equal(error.connectionFailure, true);
+    assert.match(error.message, /Plex no longer accepts the X-Plex-Token \(HTTP 401\): plex\.tv reports it has been signed out/);
+    assert.match(error.message, /Get Info → View XML/);
+    assert.match(error.message, /Settings → Connections → Media server/);
+    assert.match(error.message, /Retry failures/);
+    return true;
+  });
+  await assert.rejects(inspectMediaServer(plex('shared-user', plexTv.url)), /not this server's owner or an administrator/);
+  // plex.tv out of reach: both causes are named rather than guessing one.
+  await assert.rejects(inspectMediaServer(plex('revoked', 'http://127.0.0.1:1')), /Either it has been signed out.*or it belongs to an account/);
+  assert.deepEqual(accountTokens, ['revoked', 'shared-user']);
+
+  // The job item shows the same explanation behind its own prefix.
   await assert.rejects(
-    inspectMediaServer({ configured: true, kind: 'plex', url: rejecting.url, token: 'bad', watchedWithinDays: 30, pathMaps: [] }),
-    /rejected the token \(HTTP 401\)/,
+    assertNotRecentlyWatched({ mediaServer: plex('revoked', plexTv.url) }, { path: '/data/movies/Any/Any.mkv' }),
+    /file preserved: Plex no longer accepts the X-Plex-Token/,
+  );
+
+  await assert.rejects(
+    inspectMediaServer({ configured: true, kind: 'jellyfin', url: rejecting.url, token: 'x', watchedWithinDays: 30, pathMaps: [] }),
+    /Jellyfin refused the API key \(HTTP 401\).*Dashboard → API Keys/,
+  );
+  await assert.rejects(
+    inspectMediaServer({ configured: true, kind: 'emby', url: rejecting.url, token: 'x', watchedWithinDays: 30, pathMaps: [] }),
+    /Emby refused the API key \(HTTP 401\).*Settings → Advanced → API Keys/,
+  );
+});
+
+test('a scan warns up front when the watch check cannot run', async (context) => {
+  const rejecting = await stubServer((request, response) => response.writeHead(401).end());
+  context.after(() => rejecting.close());
+  const plexTv = await stubServer((request, response) => response.writeHead(401).end());
+  context.after(() => plexTv.close());
+  const answering = await stubServer((request, response) => json(response, { MediaContainer: { Directory: [] } }));
+  context.after(() => answering.close());
+
+  assert.equal(await mediaServerProblem({ configured: false }), null);
+  assert.equal(await mediaServerProblem({ configured: true, kind: 'plex', url: answering.url, token: 't' }), null);
+  assert.match(
+    await mediaServerProblem({ configured: true, kind: 'plex', url: rejecting.url, token: 't', plexAccountUrl: plexTv.url }),
+    /^Deleting or quarantining files will fail until this is fixed.*Plex no longer accepts the X-Plex-Token/,
+  );
+  assert.match(
+    await mediaServerProblem({ configured: true, kind: 'jellyfin', url: 'http://127.0.0.1:1', token: 't' }),
+    /watch check cannot run/,
   );
 });
 
@@ -268,8 +327,8 @@ test('a media server that cannot be reached, or refuses the token, is marked as 
   const refusing = await stubServer((request, response) => response.writeHead(401).end());
   context.after(() => refusing.close());
   await assert.rejects(
-    discoverMediaServerLibraries({ kind: 'plex', url: refusing.url, token: 'bad' }),
-    (error) => error.connectionFailure === true && /rejected the token/.test(error.message),
+    discoverMediaServerLibraries({ kind: 'plex', url: refusing.url, token: 'bad', plexAccountUrl: refusing.url }),
+    (error) => error.connectionFailure === true && /Plex no longer accepts the X-Plex-Token/.test(error.message),
   );
   await assert.rejects(
     discoverMediaServerLibraries({ kind: 'jellyfin', url: 'http://127.0.0.1:1', token: 'x' }),
