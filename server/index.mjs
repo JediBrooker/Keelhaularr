@@ -37,7 +37,7 @@ import { auditImports } from './hardlink-audit.mjs';
 import { historySummary } from './history.mjs';
 import { identifyOrphansForCandidates, identifyScanCandidates } from './imports.mjs';
 import { createLoginThrottle } from './login-throttle.mjs';
-import { discoverMediaServerLibraries, inspectMediaServer } from './mediaserver.mjs';
+import { discoverMediaServerLibraries, inspectMediaServer, mediaServerProblem } from './mediaserver.mjs';
 import { locateReportedPath, quarantineSuggestion, relativeSamples, rootAccessProblem } from './root-access.mjs';
 import {
   discoverArrSettings,
@@ -795,12 +795,14 @@ app.post('/api/scan', async (request, response, next) => {
     // scan. It only ever separates "different sizes, so definitely not the same file"
     // from "worth a closer look"; reading contents is left to an explicit check.
     const duplicates = await verifyDuplicates(orphanCandidates, identifications, { mode: 'size' });
-    // Both of these explain why untracked files keep appearing, so they belong on the
-    // scan rather than on a page nobody opens. Neither is allowed to fail a scan: a
-    // diagnostic that breaks the tool it is diagnosing is worse than no diagnostic.
-    const [hardlinkWarnings, importAudit] = await Promise.all([
+    // The first two explain why untracked files keep appearing, and the media-server
+    // check why removing them would fail, so they belong on the scan rather than on a
+    // page nobody opens. None is allowed to fail a scan: a diagnostic that breaks the
+    // tool it is diagnosing is worse than no diagnostic.
+    const [hardlinkWarnings, importAudit, mediaServerAdvisory] = await Promise.all([
       hardlinkConfigurationWarnings(config).catch(() => []),
       auditImports(config).catch(() => ({ checkedAt: null, instances: [], warnings: [] })),
+      mediaServerProblem(config.mediaServer).catch(() => null),
     ]);
     response.json({
       scannedAt: new Date().toISOString(),
@@ -821,7 +823,7 @@ app.post('/api/scan', async (request, response, next) => {
       // Deliberately not folded into `warnings`. A warning there means the scan could
       // not see everything, so its results may be incomplete. These say the opposite:
       // the results are accurate, and here is why they keep looking like this.
-      advisories: [...hardlinkWarnings, ...importAudit.warnings],
+      advisories: [...(mediaServerAdvisory ? [mediaServerAdvisory] : []), ...hardlinkWarnings, ...importAudit.warnings],
       ignoreSummary: exclusionSummary(),
     });
   } catch (error) {

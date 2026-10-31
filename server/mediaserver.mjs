@@ -89,9 +89,10 @@ async function request(url, headers) {
     throw Object.assign(apiError(describeFetchFailure(error, url)), { connectionFailure: true });
   }
   if (response.status === 401 || response.status === 403) {
+    // Reworded with the server's kind and the fix by explainingRejectedTokens.
     throw Object.assign(
-      apiError(`The media server rejected the token (HTTP ${response.status}). Check the X-Plex-Token or API key, and that it belongs to the server owner or an administrator.`),
-      { connectionFailure: true },
+      apiError(`The media server rejected the token (HTTP ${response.status}).`),
+      { connectionFailure: true, tokenRejected: true, upstreamStatus: response.status },
     );
   }
   if (!response.ok) {
@@ -103,6 +104,70 @@ async function request(url, headers) {
     return JSON.parse(text);
   } catch {
     throw apiError('The media server returned an invalid response.');
+  }
+}
+
+// ---------------------------------------------------------------- rejected tokens
+
+const PLEX_ACCOUNT_URL = 'https://plex.tv/api/v2/user';
+const PLEX_ACCOUNT_TIMEOUT_MS = 5000;
+const PLEX_TOKEN_STEPS = 'To get a new one, sign in to Plex Web as the server owner, open any movie, choose ⋯ → Get Info → View XML, and copy the value after X-Plex-Token= in the address of the page that opens.';
+const SAVE_AND_RETRY = 'Paste it under Settings → Connections → Media server and press Test, then use Retry failures on any job it blocked.';
+
+// A local Plex server answers 401 both for a token that has been signed out and for a
+// good token from an account that is not the owner or an administrator. plex.tv, which
+// issued the token, can tell the two apart. It is only asked once the local server has
+// already refused, and the token only ever goes to plex.tv itself.
+async function plexTokenState(connection) {
+  try {
+    const response = await fetch(connection.plexAccountUrl ?? PLEX_ACCOUNT_URL, {
+      signal: AbortSignal.timeout(PLEX_ACCOUNT_TIMEOUT_MS),
+      redirect: 'error',
+      headers: {
+        Accept: 'application/json',
+        'X-Plex-Token': connection.token,
+        'X-Plex-Client-Identifier': 'keelhaularr',
+        'X-Plex-Product': 'Keelhaularr',
+      },
+    });
+    if (response.status === 401) return 'signed-out';
+    if (response.ok) return 'valid';
+  } catch {
+    // plex.tv could not be asked; the message then covers both causes.
+  }
+  return 'unknown';
+}
+
+/**
+ * Says which credential was refused, the likely reason, and the steps to replace it.
+ * This text is what every blocked file shows, so it has to be enough on its own.
+ */
+export async function tokenRejectionMessage(connection, status = 401) {
+  const code = `HTTP ${status}`;
+  if (connection.kind === 'plex') {
+    const state = await plexTokenState(connection);
+    if (state === 'signed-out') {
+      return `Plex no longer accepts the X-Plex-Token (${code}): plex.tv reports it has been signed out. Plex does this when the account's password is changed or someone chooses "Sign out of all devices". ${PLEX_TOKEN_STEPS} ${SAVE_AND_RETRY}`;
+    }
+    if (state === 'valid') {
+      return `Plex refused the X-Plex-Token (${code}) although plex.tv still accepts it, so it belongs to an account that is not this server's owner or an administrator. ${PLEX_TOKEN_STEPS} ${SAVE_AND_RETRY}`;
+    }
+    return `Plex refused the X-Plex-Token (${code}). Either it has been signed out, which Plex does when the account's password is changed or someone chooses "Sign out of all devices", or it belongs to an account that is not this server's owner. ${PLEX_TOKEN_STEPS} ${SAVE_AND_RETRY}`;
+  }
+  const label = connection.kind === 'emby' ? 'Emby' : 'Jellyfin';
+  const where = connection.kind === 'emby' ? 'Settings → Advanced → API Keys' : 'Dashboard → API Keys';
+  return `${label} refused the API key (${code}), so it has probably been deleted. Create a new key in ${label} under ${where}. ${SAVE_AND_RETRY}`;
+}
+
+async function explainingRejectedTokens(connection, work) {
+  try {
+    return await work();
+  } catch (error) {
+    if (!error?.tokenRejected) throw error;
+    throw Object.assign(
+      apiError(await tokenRejectionMessage(connection, error.upstreamStatus)),
+      { connectionFailure: true, tokenRejected: true },
+    );
   }
 }
 
@@ -405,7 +470,28 @@ async function jellyfinLibraries(connection) {
  * with a few of the files inside as evidence of where those folders are here.
  */
 export async function discoverMediaServerLibraries(connection) {
-  return connection.kind === 'plex' ? plexLibraries(connection) : jellyfinLibraries(connection);
+  return explainingRejectedTokens(connection, () => (
+    connection.kind === 'plex' ? plexLibraries(connection) : jellyfinLibraries(connection)
+  ));
+}
+
+/**
+ * One authenticated request, so a scan can say up front that the watch check cannot
+ * run - which blocks every file action - instead of that surfacing later as one
+ * identical failure per file. Returns null when the server answers.
+ */
+export async function mediaServerProblem(connection) {
+  if (!connection?.configured) return null;
+  const base = connection.url.replace(/\/+$/, '');
+  try {
+    await explainingRejectedTokens(connection, () => (connection.kind === 'plex'
+      ? request(`${base}/library/sections`, plexHeaders(connection))
+      : request(`${base}/System/Info`, jellyfinHeaders(connection))));
+    return null;
+  } catch (error) {
+    if (!error?.connectionFailure) return null;
+    return `Deleting or quarantining files will fail until this is fixed, because the media-server watch check cannot run. ${error.message}`;
+  }
 }
 
 // ---------------------------------------------------------------- public surface
@@ -424,9 +510,9 @@ export async function inspectMediaServer(connection) {
   }
 
   const cutoffMs = Date.now() - connection.watchedWithinDays * 86400000;
-  const collected = connection.kind === 'plex'
-    ? await collectPlex(connection, cutoffMs)
-    : await collectJellyfin(connection, cutoffMs);
+  const collected = await explainingRejectedTokens(connection, () => (connection.kind === 'plex'
+    ? collectPlex(connection, cutoffMs)
+    : collectJellyfin(connection, cutoffMs)));
 
   const mapped = new Map();
   let unmappedCount = 0;
