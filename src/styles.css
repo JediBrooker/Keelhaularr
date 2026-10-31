@@ -43,6 +43,10 @@ body:has(.modal-dialog[open]){overflow:hidden}
 #root :where(.primary-button,.danger-button,.tabs button.active,.filters button.active):focus-visible{outline-color:#fff;box-shadow:0 0 0 3px var(--deep)}
 .eyebrow:not(.gold):not(.coral),.text-button,.path-line,th,.muted,.limit-note,.field>span,.folder-list-heading span,.advanced-settings summary span{color:#566866}
 .gold{color:#82520b}
+.login-fields{display:grid;gap:15px}
+.login-sso{display:block;box-sizing:border-box;text-align:center;text-decoration:none}
+.login-divider{display:flex;align-items:center;gap:10px;margin:0;color:#566866;font-size:11px;letter-spacing:.08em;text-transform:uppercase}
+.login-divider:before,.login-divider:after{content:"";flex:1;height:1px;background:rgba(16,42,44,.15)}
 .danger-button{background:#b23e31;box-shadow:0 4px 0 #7f2d25}
 .settings-close{color:var(--ink)}
 .hero{align-items:center;padding:36px 0 28px}

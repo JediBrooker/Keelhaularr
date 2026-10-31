@@ -366,11 +366,26 @@ function AppBadge({ app, instances }: { app: AppKind; instances?: InstanceConfig
   return <span className={`app-chip ${kind}`}>{instanceLabel(instances, app)}</span>;
 }
 
-function Login({ setupRequired, onLogin }: { setupRequired: boolean; onLogin: () => void }) {
+type AuthOptions = { sso: { name: string } | null; passwordLogin: boolean };
+
+// A refused single sign-on comes back as ?login_error=...; show it once, then tidy the address bar.
+function takeLoginError() {
+  const params = new URLSearchParams(window.location.search);
+  const message = params.get('login_error') ?? '';
+  if (message) {
+    params.delete('login_error');
+    const query = params.toString();
+    window.history.replaceState(null, '', `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`);
+  }
+  return message;
+}
+
+function Login({ setupRequired, authOptions, onLogin }: { setupRequired: boolean; authOptions: AuthOptions; onLogin: () => void }) {
   const [username, setUsername] = useState('captain');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState(takeLoginError);
+  const { sso, passwordLogin } = authOptions;
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -401,20 +416,30 @@ function Login({ setupRequired, onLogin }: { setupRequired: boolean; onLogin: ()
             Set <code>APP_PASSWORD</code> in the server’s <code>.env</code> file, then restart Keelhaularr.
           </div>
         ) : (
-          <form onSubmit={submit} className="login-form">
-            <label>
-              Username
-              <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required />
-            </label>
-            <label>
-              Password
-              <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required autoFocus />
-            </label>
+          <div className="login-form">
+            {sso && (
+              <a className="primary-button wide login-sso" href="/api/auth/oidc/start">
+                Sign in with {sso.name}
+              </a>
+            )}
+            {sso && passwordLogin && <p className="login-divider"><span>or</span></p>}
+            {passwordLogin && (
+              <form onSubmit={submit} className="login-fields">
+                <label>
+                  Username
+                  <input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required />
+                </label>
+                <label>
+                  Password
+                  <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required autoFocus={!sso} />
+                </label>
+                <button className={sso ? 'ghost-button wide' : 'primary-button wide'} disabled={busy} type="submit">
+                  {busy ? 'Signing in…' : 'Sign in with password'}
+                </button>
+              </form>
+            )}
             {error && <p className="form-error" role="alert">{error}</p>}
-            <button className="primary-button wide" disabled={busy} type="submit">
-              {busy ? 'Signing in…' : 'Sign in'}
-            </button>
-          </form>
+          </div>
         )}
         <p className="login-foot">The *arr cargo control deck</p>
       </section>
@@ -733,6 +758,7 @@ function ConfirmDialog({ stage, tab, count, busy, replacementSummary, identitySu
 export default function App() {
   const [auth, setAuth] = useState<'loading' | 'signed-out' | 'signed-in'>('loading');
   const [setupRequired, setSetupRequired] = useState(false);
+  const [authOptions, setAuthOptions] = useState<AuthOptions>({ sso: null, passwordLogin: true });
   const [config, setConfig] = useState<PublicConfig | null>(null);
   const [scan, setScan] = useState<ScanData | null>(null);
   const [ignoreSummary, setIgnoreSummary] = useState<IgnoreSummary>(emptyIgnoreSummary);
@@ -776,9 +802,10 @@ export default function App() {
   const ignoreOverageRefreshSession = useRef(0);
 
   useEffect(() => {
-    api<{ authenticated: boolean; setupRequired: boolean }>('/api/auth/status')
+    api<{ authenticated: boolean; setupRequired: boolean; sso?: { name: string } | null; passwordLogin?: boolean }>('/api/auth/status')
       .then(async (status) => {
         setSetupRequired(status.setupRequired);
+        setAuthOptions({ sso: status.sso ?? null, passwordLogin: status.passwordLogin ?? true });
         if (!status.authenticated) {
           setAuth('signed-out');
           return;
@@ -1460,7 +1487,7 @@ export default function App() {
   }
 
   if (auth === 'loading') return <main className="loading-page"><div className="wheel">K</div><p>Raising the gangway…</p></main>;
-  if (auth === 'signed-out') return <Login setupRequired={setupRequired} onLogin={signedIn} />;
+  if (auth === 'signed-out') return <Login setupRequired={setupRequired} authOptions={authOptions} onLogin={signedIn} />;
 
   return (
     <>
