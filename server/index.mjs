@@ -37,6 +37,7 @@ import { auditImports } from './hardlink-audit.mjs';
 import { historySummary } from './history.mjs';
 import { identifyOrphansForCandidates, identifyScanCandidates } from './imports.mjs';
 import { createLoginThrottle } from './login-throttle.mjs';
+import { beginOidcLogin, completeOidcLogin, oidcConfig } from './oidc.mjs';
 import { discoverMediaServerLibraries, inspectMediaServer, mediaServerProblem } from './mediaserver.mjs';
 import { locateReportedPath, quarantineSuggestion, relativeSamples, rootAccessProblem } from './root-access.mjs';
 import {
@@ -266,18 +267,81 @@ function sessionCookie(config, token, maxAge) {
   ].filter(Boolean).join('; ');
 }
 
+// Env-only, read once: single sign-on is deployment configuration, like TRUST_PROXY.
+const oidc = oidcConfig();
+if (oidc.configured && !oidc.enabled) {
+  console.warn('Single sign-on is off: OIDC_ISSUER, OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_REDIRECT_URI and an allow list (OIDC_ALLOWED_EMAILS or OIDC_ALLOWED_SUBJECTS) are all needed.');
+}
+
+// Signs the cookie that carries the single sign-on state between leaving and coming back.
+const oidcFlowKey = (config) => createHmac('sha256', config.sessionSecret).update('oidc-flow').digest();
+
+function oidcFlowCookie(config, token, maxAge) {
+  // Lax, not Strict: the provider sends the browser back here with a top-level navigation.
+  return [
+    `keelhaularr_oidc=${encodeURIComponent(token)}`,
+    'HttpOnly',
+    'SameSite=Lax',
+    'Path=/api/auth/oidc',
+    `Max-Age=${maxAge}`,
+    config.cookieSecure ? 'Secure' : '',
+  ].filter(Boolean).join('; ');
+}
+
 app.get('/api/auth/status', (request, response) => {
   const config = currentConfig();
   response.json({
     authenticated: validSession(request, config),
     setupRequired: !config.password,
+    sso: oidc.enabled ? { name: oidc.name } : null,
+    passwordLogin: oidc.passwordLogin,
   });
+});
+
+app.get('/api/auth/oidc/start', async (request, response, next) => {
+  const config = currentConfig();
+  if (!oidc.enabled || !config.password || !config.sessionSecret) {
+    response.status(404).json({ error: 'Single sign-on is not set up.' });
+    return;
+  }
+  try {
+    const { url, flowToken, maxAge } = await beginOidcLogin(oidc, oidcFlowKey(config));
+    response.setHeader('Set-Cookie', oidcFlowCookie(config, flowToken, maxAge));
+    response.redirect(302, url);
+  } catch (error) {
+    console.error('Single sign-on could not start:', error);
+    response.redirect(302, `/?login_error=${encodeURIComponent(`Couldn't reach ${oidc.name}: ${error.message}`)}`);
+  }
+});
+
+app.get('/api/auth/oidc/callback', async (request, response) => {
+  const config = currentConfig();
+  if (!oidc.enabled || !config.password || !config.sessionSecret) {
+    response.status(404).json({ error: 'Single sign-on is not set up.' });
+    return;
+  }
+  const clearFlow = oidcFlowCookie(config, '', 0);
+  try {
+    const user = await completeOidcLogin(oidc, oidcFlowKey(config), request.query, parseCookies(request).keelhaularr_oidc);
+    const maxAge = Math.round(config.sessionDays * 86400);
+    response.setHeader('Set-Cookie', [clearFlow, sessionCookie(config, signSession(config), maxAge)]);
+    console.log(`Signed in through ${oidc.name} as ${user.email ?? user.subject}.`);
+    response.redirect(302, '/');
+  } catch (error) {
+    console.warn(`Single sign-on was refused: ${error.message}`);
+    response.setHeader('Set-Cookie', clearFlow);
+    response.redirect(302, `/?login_error=${encodeURIComponent(error.message)}`);
+  }
 });
 
 app.post('/api/auth/login', async (request, response) => {
   const config = currentConfig();
   if (!config.password) {
     response.status(503).json({ error: 'Set APP_PASSWORD in .env before signing in.' });
+    return;
+  }
+  if (!oidc.passwordLogin) {
+    response.status(403).json({ error: `Password sign-in is turned off. Sign in with ${oidc.name}.` });
     return;
   }
   const key = request.ip ?? request.socket.remoteAddress ?? 'unknown';

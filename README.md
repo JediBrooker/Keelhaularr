@@ -50,6 +50,7 @@ destructive automation is opt-in, disabled by default, and starts in dry run.
 - Failed logins slowed progressively rather than locked out, so nobody can lock you out of your own server
 - Content-Security-Policy, nosniff and referrer headers, plus HSTS once the deployment declares HTTPS
 - Optional TRUST_PROXY so a reverse-proxied deployment still sees real client addresses
+- Optional single sign-on through any OpenID Connect provider (Authelia, Authentik, Keycloak), restricted to an allow list, with the password form switchable off
 - API keys kept server-side
 - Authenticated GUI settings with immediate apply and durable, atomic storage
 - Server-side folder autocomplete for library, completed-download, and quarantine paths
@@ -192,6 +193,32 @@ inside Keelhaularr.
 
 5. Open `http://your-server:8787` and sign in with `APP_USERNAME` and
    `APP_PASSWORD`.
+
+### Single sign-on (OpenID Connect)
+
+Keelhaularr can hand sign-in to an OpenID Connect provider such as Authelia, so the
+provider's two-factor login protects it. Register Keelhaularr with the provider as a
+confidential client that uses the authorization code flow with PKCE, the redirect URI
+`https://<keelhaularr address>/api/auth/oidc/callback`, the scopes `openid email profile`,
+and `client_secret_post` for the token request. Then set, in `.env`:
+
+```bash
+OIDC_ISSUER=https://auth.example.com
+OIDC_CLIENT_ID=keelhaularr
+OIDC_CLIENT_SECRET=the-client-secret
+OIDC_REDIRECT_URI=https://keelhaularr.example.com/api/auth/oidc/callback
+OIDC_ALLOWED_EMAILS=you@example.com
+OIDC_NAME=Authelia
+```
+
+The login page gains a **Sign in with Authelia** button. Only the listed verified email
+addresses (or `OIDC_ALLOWED_SUBJECTS`, the provider's subject identifiers) get in: an
+account at the provider is not enough on its own. Once single sign-on works, set
+`OIDC_PASSWORD_LOGIN=false` to remove the password form; `APP_PASSWORD` and
+`APP_SESSION_SECRET` are still required because they sign the session cookie, so set
+them to long random values. To get back in if the provider is ever down, set
+`OIDC_PASSWORD_LOGIN=true` and restart. Use HTTPS (`APP_COOKIE_SECURE=true`) for any
+address that reaches the provider over the internet.
 
 ## Continuous integration
 
